@@ -50,14 +50,16 @@ This document is the entry point. Detailed specifications live in:
   rejected.
 - **Domain config**: a TOML file committed alongside the ciphertext. It
   holds the format version, the Argon2id parameters, the KDF salt, the
-  **wrapped domain key**, the list of **managed paths**, and the
+  **wrapped key ring**, the list of **managed paths**, and the
   `force_binary` list. Ciphertext is useless without its domain config —
   they must be kept (and committed) together.
-- **Envelope keys**: file keys descend from a random 32-byte domain key;
-  the password (via Argon2id) only wraps that key in the config.
-  `passwd` re-wraps (cheap, no ciphertext change, no revocation);
-  `rekey` rotates the domain key itself (full re-encryption, the
-  compromise response).
+- **Envelope keys**: file keys descend from a random 32-byte domain
+  key; the password (via Argon2id) only wraps domain keys in the
+  config's ordered key ring (entry 0 = current). `passwd` re-wraps the
+  ring (cheap, no ciphertext change, no revocation); `rekey` prepends a
+  fresh key and migrates ciphertext to it in memory (the compromise
+  response), retaining older entries so nothing becomes undecryptable
+  until `rekey --prune`.
 - **Modes**: each file is encrypted in **text mode** (per line) or
   **binary mode** (whole file, chunked, plus a whole-file tag). Files
   whose content contains a NUL byte, and files matched by
@@ -74,18 +76,22 @@ This document is the entry point. Detailed specifications live in:
 ## Key design decisions
 
 1. **Single password + envelope encryption, zero persistence.** The
-   password never touches disk; it wraps a random domain key stored in
-   the config (AES-SIV wrap, whose authentication doubles as the
-   password check — no separate verifier). This makes `passwd` and KDF
-   upgrades free of ciphertext churn and keeps branches mergeable across
-   them, at a documented cost: `passwd` does not revoke old passwords
-   (`rekey` does, forward-only).
-2. **AES-SIV (RFC 5297) as the only cipher.** Deterministic
-   authenticated encryption with a standardized specification and formal
-   analysis, used in its nonce-free mode. One primitive replaces the
-   AEAD + synthetic-nonce + conformance-check composition it was chosen
-   over, and per-unit overhead is 16 bytes. Sub-key derivation uses
-   BLAKE3 with globally unique context strings.
+   password never touches disk; it wraps random domain keys stored in
+   the config as an ordered key ring (AES-SIV wrap, whose
+   authentication doubles as the password check — no separate
+   verifier). This makes `passwd` and KDF upgrades free of ciphertext
+   churn and keeps branches mergeable across them, at a documented
+   cost: `passwd` does not revoke old passwords (`rekey` does,
+   forward-only). Retained ring entries keep pre-`rekey` ciphertext on
+   unmerged branches decryptable until explicitly pruned.
+2. **AES-CMAC-SIV (RFC 5297, AES-256) as the only cipher.**
+   Deterministic authenticated encryption with a standardized
+   specification and formal analysis, used through its nonce-free
+   deterministic interface (implementations must call the raw SIV API,
+   not the nonce-based AEAD wrapper — see [crypto.md](crypto.md)). One
+   primitive replaces the AEAD + synthetic-nonce + conformance-check
+   composition it was chosen over, and per-unit overhead is 16 bytes.
+   Sub-key derivation uses BLAKE3 with globally unique context strings.
 3. **Per-line deterministic encryption for text.** The point of the
    tool. Equal lines produce equal ciphertext lines (within one path),
    so git works naturally. The leakage — exact line lengths and counts,
@@ -109,11 +115,13 @@ This document is the entry point. Detailed specifications live in:
    binary-mode locality, and avoids ciphertext churn from compressor
    version drift. A flags byte is reserved for the future.
 7. **Per-file atomicity only; no transactions.** Each file is replaced
-   via a `0600` temp file + fsync + rename. Multi-file operations stop
-   at the first error and report what was and was not done. `rekey`
-   uses a three-phase flow (decrypt all → swap config → encrypt all)
-   that structurally cannot mix old- and new-key ciphertext among
-   managed files.
+   via a `0600` temp file + fsync + rename (permissions restored only
+   after the rename, so crash remnants are never too permissive), with
+   a pre-rename re-check that the target was not concurrently modified.
+   Multi-file operations stop at the first error and report what was
+   and was not done. `rekey` prepends a fresh key to the ring and
+   migrates each file in memory — plaintext never touches the disk, and
+   an interruption leaves every file decryptable under a ring key.
 8. **Serial execution, advisory locking.** One process per domain,
    enforced by a non-blocking `flock` on the domain root directory (no
    lock file to commit or ignore, and immune to the config's own
@@ -135,7 +143,7 @@ This document is the entry point. Detailed specifications live in:
 | Ciphertext diff/merge | opaque | line-level |
 | Structure leakage | file changed / unchanged only | exact line lengths, equality, positions |
 | Key model | password → per-file Argon2 | password-wrapped domain key (envelope) |
-| Password change | full re-encryption | re-wrap only (`rekey` for rotation) |
+| Password change | full re-encryption | re-wrap only (`rekey` rotates via in-memory migration) |
 | Salt | per file, in header + cache | per domain, in committed config |
 | Password check | HEAD anchor via git | unwrap of the domain key |
 | git dependency | required (subprocess plumbing) | none |
@@ -148,8 +156,8 @@ This document is the entry point. Detailed specifications live in:
   the domain (or losing `.simple-encrypt.toml`) makes it undecryptable.
   In git they live in the same repository, which is the intended
   deployment.
-- **`passwd` is not revocation.** The old wrapped key stays in git
-  history and the domain key is unchanged. Compromise response is
+- **`passwd` is not revocation.** The old wrapped ring stays in git
+  history and the domain keys are unchanged. Compromise response is
   `passwd` + `rekey`, and even that only protects future content — see
   [threat-model.md](threat-model.md).
 - **Renames require plaintext.** Decrypt → move → re-encrypt. Decrypting
@@ -161,8 +169,10 @@ This document is the entry point. Detailed specifications live in:
   directories. Treat a crash during decryption as a potential plaintext
   spill — and note that in-place encryption never securely erases old
   plaintext from disk, snapshots, or git history.
-- **Memory model.** Files are processed whole in memory, with a 1 GiB
-  hard cap. The tool targets small secret files; it is not a streaming
+- **Memory model.** Files are processed whole in memory, with a 256 MiB
+  hard cap and a 2²² cap on lines per text file; peak memory is a small
+  multiple of the file size (input, output, and encoding buffers
+  coexist). The tool targets small secret files; it is not a streaming
   encryptor.
 - **Large line-count files.** Each line costs ~22 bytes plus one third
   of its own length (base64); a file with hundreds of thousands of lines
@@ -187,7 +197,8 @@ This document is the entry point. Detailed specifications live in:
   determinism, tamper rejection, text detection, KDF tier validation),
   property tests (encrypt/decrypt round-trip is lossless for arbitrary
   byte sequences), CLI integration tests (end-to-end flows,
-  `passwd`/`rekey` interruption semantics, locking, `check`/`verify`),
+  `passwd`/`rekey` interruption and migration semantics, locking,
+  `check`/`verify`, git worktree and submodule `.git`-file boundaries),
   and golden fixtures with a fixed password/salt/domain key that pin the
   wire format and the derivation chain, so accidental format breaks fail
   loudly.

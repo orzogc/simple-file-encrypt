@@ -11,7 +11,7 @@ surprised.
 
 - The plaintext content of managed files (tokens, credentials, private
   notes, small binary secrets).
-- The password and the domain key.
+- The password and the domain keys.
 
 ## Adversaries
 
@@ -35,7 +35,8 @@ Two classes, with very different coverage:
   reveals unit equality and exact lengths, and nothing else — which
   protects a unit's content only to the extent that content is
   unpredictable *given* the revealed information. High-entropy content
-  (tokens, keys, prose) is protected by the password and KDF;
+  (random tokens, cryptographic keys, sufficiently long and
+  unpredictable private text) is protected by the password and KDF;
   low-entropy, high-frequency, or format-predictable lines can be
   identified or confirmed without any key (see the leakage inventory).
   Do not read "encrypted" as "hidden" for structure or boilerplate.
@@ -47,8 +48,8 @@ Two classes, with very different coverage:
   whole-file tag binding chunk order, count, lengths, and header;
   recombining chunks from different versions is detected. Only
   whole-file rollback to a complete older ciphertext survives.
-- **Wrong-password detection**: unwrapping the domain key fails fast;
-  mixed-key states cannot arise from typos.
+- **Wrong-password detection**: unwrapping the key ring fails fast,
+  before any file is touched.
 - **Deterministic re-encryption**: unchanged plaintext never churns
   ciphertext; `passwd` and KDF upgrades churn nothing at all.
 
@@ -81,10 +82,10 @@ counts and ciphertext sizes invert uniquely to plaintext sizes.
    proposing config lines) confirms the guess by comparing ciphertext.
    Deterministic encryption cannot prevent this.
 6. **Offline password guessing**: the config's salt, KDF parameters, and
-   wrapped key allow testing password guesses at Argon2id cost — even if
-   no ciphertext leaks at all, the wrapped key alone suffices as a test
-   target. Password entropy and the KDF parameters are the only
-   defenses; there is no server to rate-limit.
+   wrapped key ring allow testing password guesses at Argon2id cost —
+   even if no ciphertext leaks at all, the wrapped ring alone suffices
+   as a test target. Password entropy and the KDF parameters are the
+   only defenses; there is no server to rate-limit.
 
 ## Integrity limits (accepted by design)
 
@@ -97,7 +98,9 @@ counts and ciphertext sizes invert uniquely to plaintext sizes.
   detected by decryption. This is the price of line-level merge; review
   of git history is the countermeasure.
 - **Whole-file rollback** (text and binary): any file can be reverted to
-  a complete older ciphertext undetected by the tool.
+  a complete older ciphertext undetected by the tool — including
+  replaying the authenticated empty-file marker from a version that was
+  legitimately empty.
 - **Git history is a recovery source, not a cryptographic control.**
   History itself can be force-pushed, rewritten, or rolled back together
   with config and ciphertext. Treating it as rollback protection
@@ -113,14 +116,19 @@ counts and ciphertext sizes invert uniquely to plaintext sizes.
 
 ## Password change vs. key rotation
 
-`passwd` re-wraps the domain key and **does not revoke** the old
-password: the old wrapped key stays in git history and the domain key is
-unchanged, so the old password keeps decrypting everything, including
-future commits. Routine "I want to type something else" changes are
-safe; compromise response is `passwd` **then `rekey`** (rotate the
-domain key and re-encrypt). Even `rekey` only protects content committed
-afterwards — nothing retroactively removes what an old password could
-already read from history, short of rewriting that history.
+`passwd` re-wraps the key ring and **does not revoke** the old
+password: the old wrapped ring stays in git history and the domain keys
+are unchanged, so the old password keeps decrypting everything,
+including future commits. Routine "I want to type something else"
+changes are safe; compromise response is `passwd` **then `rekey`**,
+which prepends a fresh domain key and migrates every managed file to it
+in memory — no plaintext is written to disk in the process. Older ring
+entries are retained by default so ciphertext on unmerged branches
+stays decryptable; the trade-off is that the current password unlocks
+every retained epoch, and `rekey --prune` narrows it to the current
+one. Even `rekey` only protects content committed afterwards — nothing
+retroactively removes what an old password could already read from
+history, short of rewriting that history.
 
 ## Out of scope
 
@@ -158,12 +166,14 @@ already read from history, short of rewriting that history.
 | `SIMPLE_ENCRYPT_PASSWORD` in the environment | Visible to same-user processes via `/proc`; prefer the interactive prompt outside CI. |
 | Crash during decryption | May leave a `.simple-encrypt.tmp.*` containing plaintext (mode `0600`) until the next exclusive-lock run sweeps the domain root and all target directories; treat as a plaintext spill. |
 | Concurrent runs on one domain | Guarded by an advisory `flock` on the domain root directory; the second instance fails fast. Advisory locks may not work on network filesystems — avoid concurrent use there. |
+| Another program rewriting a file mid-operation | The advisory lock excludes only other simple-encrypt instances. Before replacing a file the tool re-checks `(device, inode)`, size, and mtime against what it read and fails that file on mismatch; a race inside that window can still lose the concurrent edit. |
+| git EOL or filter conversion | Text ciphertext is byte-exact and LF-framed: mark managed paths `-text` in `.gitattributes`, and never apply clean/smudge filters or `working-tree-encoding` to them. A CRLF checkout fails closed as a format error. |
 | Hard links | `encrypt` refuses files with link count > 1: the other links would keep a readable plaintext alias. Resolve the links first. |
 | Moving/renaming an encrypted file | Decryption fails (path-bound keys). Rename in plaintext state; the auth-failure message hints at this cause. |
-| Hostile config in a cloned repo | KDF cost is bounded (security floor and resource ceiling, with explicit override flags); above-default cost is announced before Argon2 runs; unknown keys and versions are rejected; path entries cannot escape the domain root; file and config size limits bound memory. |
+| Hostile config in a cloned repo | KDF cost is tiered (security floor, flag-gated ceiling, absolute hard caps) with checked arithmetic; above-default cost is announced before Argon2 runs; unknown keys and versions are rejected; path entries cannot escape the domain root; file-size, line-count, file-count, ring-size, and config-size limits bound memory and CPU. |
 | Hand-editing `paths` in the config | Deleting the entry of a still-encrypted file hides it from `rekey`, stranding it under the old domain key after a rotation. Use `remove`, which refuses exactly this. |
-| Plaintext crafted to start with the magic | Probe-only `check` would pass it. `encrypt` errors on such files instead of producing them, so this needs deliberate hand-crafting; use `verify` for authenticated checking. |
-| Staged-but-plaintext content in git | Working-tree `check` cannot see the index; use the `check --stdin` hook recipe in [cli.md](cli.md), which checks staged blobs. |
+| Plaintext crafted to start with the magic | Probe-only `check` would pass it. `encrypt` errors on such files unless the user explicitly passes `--assume-plaintext`; use `verify` for authenticated checking. |
+| Staged-but-plaintext content in git | Working-tree `check` cannot see the index; use the pre-commit recipe in [cli.md](cli.md), which exports the index with `git checkout-index` and runs `check` against the staged tree (staged config included). |
 | macOS case/normalization-insensitive volumes | Arguments are re-spelled from directory listings, so typed case cannot poison key derivation; residual Unicode-normalization mismatches fail closed as authentication errors. ASCII filenames avoid the issue. |
 
 ## Choosing a tool

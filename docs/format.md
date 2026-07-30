@@ -22,20 +22,26 @@ of a file: its path relative to the domain root (the directory containing
 - bytes used exactly as given — no Unicode normalization and no case
   folding.
 
-Canonicalization is purely **lexical**: command-line input (which may be
-relative to the working directory and may contain `.` or `..`) is
-normalized by path arithmetic alone, then required to fall inside the
-domain root; symlinks are never resolved. To defuse case-insensitive
-filesystems (macOS APFS), each component of an explicit argument is
-replaced by the **filesystem-reported spelling** (the name as returned by
-directory enumeration) before it is used for derivation or stored in the
-config; recursion uses directory-reported names by construction.
-Components that do not exist on disk (an `add` of an absent file, a
-`remove` of a deleted one, a `check --stdin` label) keep their typed
-spelling for the missing suffix. Unicode normalization differences can
-still cause mismatches on macOS — always fail-closed as authentication
-errors, never wrong plaintext — and ASCII filenames avoid the issue
-entirely.
+A canonical relative path is **minted** from user input by one pipeline:
+normalize lexically (path arithmetic alone — `.`/`..` resolved against
+the working directory; symlinks are never resolved), require the result
+to fall inside the domain root, then re-spell every component that
+exists on disk with the **filesystem-reported name** (as returned by
+directory enumeration — this defuses case-insensitive filesystems such
+as macOS APFS), keeping the typed spelling for any missing suffix (an
+`add` of a not-yet-created file, a `remove` of a deleted one).
+Recursion uses directory-reported names by construction.
+
+Minting happens when a path enters the system: resolving an explicit
+argument, or storing an entry via `add`/auto-add. Afterwards the
+**stored bytes are authoritative**: config entries are fed to key
+derivation exactly as recorded and are never re-spelled at use time, so
+keys stay stable even if on-disk case later drifts on a
+case-insensitive volume (opening still succeeds there; on
+case-sensitive filesystems the drift is visible as a missing file).
+Unicode normalization differences can still cause mismatches on macOS —
+always fail-closed as authentication errors, never wrong plaintext —
+and ASCII filenames avoid the issue entirely.
 
 Directory entries use the same form as file entries; whether an entry
 denotes a directory is resolved against the filesystem at the moment it is
@@ -53,8 +59,12 @@ version = 1
 # 16 random bytes, lowercase hex.
 salt = "9f86d081884c7d659a2feaa0c55ad015"
 
-# AES-SIV(kek, domain_key): 48 bytes (96 hex chars), lowercase hex.
-wrapped_key = "b5bb…(96 hex chars)…09e2"
+# Key ring: AES-SIV(kek, domain_key), 48 bytes (96 hex chars) each,
+# newest first — entry 0 is the current key. Older entries keep
+# pre-`rekey` ciphertext decryptable until `rekey --prune`.
+wrapped_keys = [
+    "b5bb…(96 hex chars)…09e2",
+]
 
 [kdf]
 algorithm = "argon2id"
@@ -83,8 +93,8 @@ Validation on load (all failures are hard errors):
   tool".
 - Unknown keys anywhere in the file are rejected
   (`deny_unknown_fields`), so typos cannot silently disable protection.
-- `salt`: exactly 32 lowercase hex chars. `wrapped_key`: exactly 96
-  lowercase hex chars.
+- `salt`: exactly 32 lowercase hex chars. `wrapped_keys`: 1 to 64
+  entries, each exactly 96 lowercase hex chars.
 - `algorithm` must be `"argon2id"`. Parameter tiers (validity floor,
   security floor, resource ceiling): see [crypto.md](crypto.md).
 - Every `paths` / `force_binary` entry must be a valid canonical relative
@@ -114,23 +124,27 @@ Probe refinements:
 - A first line that starts with `#simple-encrypt` but is not one of the
   two exact v1 header forms below is "unrecognized": ciphertext from a
   newer tool, or colliding plaintext. Write commands treat it as a hard
-  error — except the `force_binary` encrypt path, which treats it as
-  plaintext ([cli.md](cli.md)). Read-only commands report it without
-  aborting: `status` shows `unrecognized`, `check` counts it as an
-  offender, `verify` records it as a failure.
-- A probe hit does not prove the file is *our* valid ciphertext. Commands
-  that skip "already encrypted" files first authenticate the first unit
-  (or the empty-file marker) with the current keys, and treat a failure
-  as a hard error — foreign ciphertext, corruption, a moved file, or
-  plaintext that collides with the probe. How `encrypt` disambiguates,
-  and how `force_binary` serves as the escape hatch for colliding *text*,
-  is specified in [cli.md](cli.md). Plaintext whose content starts with
-  `BIN_MAGIC` cannot be managed by this tool at all (no in-band escape);
-  the magic bytes were chosen to make this practically impossible.
+  error — version handling is never relaxed implicitly; the explicit
+  `encrypt --assume-plaintext` escape is specified in [cli.md](cli.md).
+  Read-only commands report it without aborting: `status` shows
+  `unrecognized`, `check` counts it as an offender, `verify` records it
+  as a failure.
+- A probe hit does not prove the file is *our* valid ciphertext.
+  Commands that skip "already encrypted" files first authenticate the
+  first unit (or the empty-file marker) against the key ring, and treat
+  a failure as a hard error — foreign ciphertext, corruption, a moved
+  file, or plaintext that collides with the probe. `encrypt`'s
+  disambiguation, migration, and `--assume-plaintext` rules are in
+  [cli.md](cli.md); that flag is also the only way to manage plaintext
+  that genuinely starts with `BIN_MAGIC` (magic bytes chosen to make
+  this practically impossible).
 
 ## Text ciphertext format
 
-A text-mode ciphertext is itself a text file:
+A text-mode ciphertext is itself a text file, framed by exact LF
+bytes — any end-of-line conversion (e.g. git's `autocrlf`) corrupts it,
+so managed paths must be marked `-text` in `.gitattributes`
+(see [cli.md](cli.md)):
 
 ```
 #simple-encrypt v1 text\n                     (non-empty plaintext)
@@ -220,21 +234,25 @@ Hostile inputs must exhaust neither memory nor CPU. Hard limits
 
 | Limit | Value | Enforced by |
 |---|---|---|
-| Plaintext file size | 1 GiB | encrypt (input) and decrypt (output) |
-| Ciphertext file size | 1 GiB | encrypt (output) and decrypt (input) |
+| Plaintext file size | 256 MiB | encrypt (input) and decrypt (output) |
+| Ciphertext file size | 256 MiB | encrypt (output) and decrypt (input) |
 | Single plaintext line | 64 MiB | encrypt (the error suggests `force_binary`) |
 | Single decoded unit | 64 MiB + 16 | decrypt |
+| Units (lines) per text file | 4194304 (2²²) | encrypt and decrypt (the error suggests `force_binary`) |
+| Files per operation (after expansion) | 65536 | all commands |
 | Config file size | 1 MiB | config load |
 | `paths` + `force_binary` entries | 65536 | config load |
+| `wrapped_keys` entries | 64 | config load |
 | Password length | 4096 bytes | all password input |
 
 Both sides of every limit are enforced, so `encrypt` can never produce a
-ciphertext that `decrypt` refuses: a text file whose ciphertext would
-exceed 1 GiB, or a binary plaintext within ~256 KiB of 1 GiB (whose
-chunk overhead would push the ciphertext over), is rejected at
-encryption time. KDF cost limits are separate
-(see [crypto.md](crypto.md)). Files are processed whole in memory by
-design; these limits bound that.
+ciphertext that `decrypt` refuses: a text file whose ciphertext or line
+count would exceed the caps, or a binary plaintext within ~64 KiB of
+256 MiB (whose chunk overhead would push the ciphertext over), is
+rejected at encryption time, before any cryptographic work. KDF cost
+limits are separate (see [crypto.md](crypto.md)). Files are processed
+whole in memory by design; these limits bound that, with peak memory a
+small multiple of the file size (see [design.md](design.md)).
 
 ## Constants
 
@@ -242,7 +260,7 @@ design; these limits bound that.
 |---|---|
 | `SALT_LEN` | 16 bytes (32 hex chars in config) |
 | `DOMAIN_KEY_LEN` | 32 bytes |
-| `WRAPPED_KEY_LEN` | 48 bytes (96 hex chars in config) |
+| `WRAPPED_KEY_LEN` | 48 bytes per ring entry (96 hex chars in config) |
 | `SIV_LEN` | 16 bytes (also the per-unit overhead) |
 | `FILE_TAG_LEN` | 32 bytes |
 | `CHUNK_SIZE` | 65536 bytes (65552 on disk) |
