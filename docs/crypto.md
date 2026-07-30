@@ -1,174 +1,202 @@
 # simple-encrypt — Cryptographic Design
 
 This document specifies every cryptographic operation. Byte-level file
-layouts are in [format.md](format.md); the security rationale and accepted
-leakage are summarized here and treated fully in
+layouts are in [format.md](format.md); accepted leakage is treated fully in
 [threat-model.md](threat-model.md).
+
+Honesty note: this design composes standardized and well-analyzed pieces
+(AES-SIV per RFC 5297, BLAKE3, Argon2id) in a straightforward way, but the
+composition as a whole has not received independent cryptographic review.
 
 ## Primitives
 
 | Role | Primitive | Notes |
 |---|---|---|
-| Password KDF | Argon2id v1.3 | parameters stored in the domain config |
-| AEAD | XChaCha20-Poly1305 | 32-byte key, 24-byte nonce, 16-byte tag |
-| PRF / KDF | BLAKE3 (`keyed_hash`, `derive_key`) | 32-byte outputs |
-| Randomness | OS CSPRNG | only used by `init` and `passwd` (salt) and for temp file names |
+| Password KDF | Argon2id v1.3 | 64-byte output (the wrap key); parameters in the config |
+| Deterministic AEAD | AES-SIV, `AEAD_AES_SIV_CMAC_512` (RFC 5297, AES-256) | 64-byte key, 16-byte SIV; no nonce |
+| PRF / KDF | BLAKE3 (`keyed_hash`, `derive_key`, XOF output where 64 bytes are needed) | |
+| Randomness | OS CSPRNG | only `init`/`passwd`/`rekey` (salt, domain key) and temp-file names |
 
 Constants:
 
 ```
-KEY_LEN   = 32
-SALT_LEN  = 16
-NONCE_LEN = 24
-TAG_LEN   = 16
-CHUNK_SIZE = 65536 (64 KiB, binary mode)
+SALT_LEN       = 16      DOMAIN_KEY_LEN = 32
+KEK_LEN        = 64      UNIT_KEY_LEN   = 64
+SIV_LEN        = 16      (per-unit overhead)
+FILE_TAG_LEN   = 32      (binary mode trailer)
+CHUNK_SIZE     = 65536   (binary mode)
 ```
 
-## Key hierarchy
+## Key hierarchy (envelope encryption)
 
-All derivations are deterministic. There is no per-file or per-operation
-randomness after `init`.
-
-```
-password  (UTF-8 bytes, non-empty, no normalization)
-salt      (16 random bytes, hex in config)
-kdf       (argon2id parameters from config)
-                    |
-                    v
-master_key = Argon2id(password, salt, m = memory_kib, t = iterations,
-                      p = parallelism, out = 32)
-                    |
-        +-----------+---------------------------+
-        v                                       v
-verifier = blake3::derive_key(          file_km = blake3::keyed_hash(
-    "simple-encrypt/v1/verifier",           key   = master_key,
-    master_key)                             input = canonical_relative_path)
-                                            |
-                            +---------------+----------------+
-                            v                                v
-              enc_key = blake3::derive_key(    nonce_key = blake3::derive_key(
-                  "simple-encrypt/v1/enc",         "simple-encrypt/v1/nonce",
-                  file_km)                         file_km)
-```
-
-Notes on construction:
-
-- `blake3::derive_key(context, key_material)` is used only with the static
-  context strings above, per BLAKE3's usage guidance. The dynamic input (the
-  file path) enters through `keyed_hash`, whose input may be arbitrary bytes.
-- `canonical_relative_path` is the exact UTF-8 byte sequence defined in
-  [format.md](format.md) (relative to the domain root, `/` separators, no
-  Unicode normalization). Two files with different canonical paths have
-  independent keys, which removes cross-file ciphertext equality.
-- `enc_key` and `nonce_key` are independent; a nonce (a truncated PRF output
-  under `nonce_key`) reveals nothing about the AEAD keystream.
-- The version string embedded in every context (`/v1/`) ties all derived
-  material to format version 1.
-
-## Password verifier
-
-The domain config stores `verifier = hex(derive_key("simple-encrypt/v1/verifier",
-master_key))`. Every password-requiring command derives the master key and
-compares (constant-time) against the stored value before touching any file.
-
-The verifier is a one-way PRF output: it cannot be inverted to the master
-key, and it enables offline password guessing no better than any ciphertext
-line already does (an attacker with the repository always has AEAD tags to
-test guesses against). Password strength and the Argon2id parameters are the
-sole defense against offline guessing, with or without the verifier.
-
-## Deterministic nonce derivation (SIV style)
-
-For every encrypted unit (a text line or a binary chunk):
+File keys descend from a random **domain key**, not from the password. The
+password only wraps the domain key, so changing the password (`passwd`)
+rewrites one config field and no ciphertext.
 
 ```
-nonce = blake3::keyed_hash(nonce_key, aad || plaintext)[0 .. 24]
-ct_and_tag = XChaCha20-Poly1305::encrypt(enc_key, nonce, plaintext, aad)
-stored_unit = nonce || ct_and_tag
+password  (UTF-8, non-empty)          domain_key  (32 random bytes,
+salt      (16 random bytes, config)                created by init,
+kdf       (argon2id params, config)                rotated only by rekey)
+        |                                   |
+        v                                   |
+kek = Argon2id(password, salt,              |
+              m, t, p, out = 64)            |
+        |                                   |
+        +-----------> wrapped_key = AES-SIV(kek).encrypt(
+                          ad = AD_WRAP, plaintext = domain_key)
+                      (48 bytes = SIV(16) || CT(32), hex in config)
+
+domain_key
+    |
+    v
+file_km      = blake3::keyed_hash(domain_key, canonical_relative_path)
+unit_key     = blake3::derive_key_xof(CTX_UNIT, file_km, 64 bytes)
+file_tag_key = blake3::derive_key(CTX_FILE_TAG, file_km)      # binary only
 ```
 
-Decryption recomputes nothing in advance: it reads the stored nonce, runs
-AEAD decryption (which authenticates `aad` and the ciphertext), and then —
-as a conformance check — recomputes the nonce from the authenticated
-plaintext and errors if it does not match the stored one. This detects
-implementation drift and rules out ciphertexts produced with foreign nonces.
+Context and associated-data strings (globally unique, frozen for v1):
 
-Properties:
+```
+AD_WRAP      = "github.com/orzogc/simple-encrypt v1 domain key wrap"
+CTX_UNIT     = "github.com/orzogc/simple-encrypt v1 unit key"
+CTX_FILE_TAG = "github.com/orzogc/simple-encrypt v1 binary file tag key"
+AD_TEXT      = "github.com/orzogc/simple-encrypt v1 text unit"
+AD_TEXT_EMPTY= "github.com/orzogc/simple-encrypt v1 text empty file"
+AD_BIN_PREFIX= "github.com/orzogc/simple-encrypt v1 binary chunk"
+```
 
-- **Determinism**: equal `(nonce_key, aad, plaintext)` produces equal output
-  bytes. This is the property that makes re-encryption stable for git.
-- **Nonce reuse is harmless by construction**: under one key, the same nonce
-  recurs only for identical `(aad, plaintext)`, i.e. a byte-identical unit.
-  Distinct units collide on a 192-bit truncated PRF output only with
-  negligible probability (birthday bound ≈ 2^-96 even after 2^48 units).
-- **DAE security**: the scheme is deterministic authenticated encryption.
-  It leaks exactly unit equality (under the same key and AAD) and nothing
-  else about the plaintext. At line granularity that leak is significant and
-  is the documented trade-off of this tool.
+Notes:
 
-## Text mode (per line)
+- `derive_key` is used only with the static context strings above, per
+  BLAKE3 guidance; the dynamic input (the path) enters through
+  `keyed_hash`. Per-path keys remove cross-file ciphertext equality.
+- Unwrapping `wrapped_key` doubles as the password check: a wrong password
+  fails the SIV authentication. There is no separate verifier.
+- Ciphertext is a pure function of `(domain_key, canonical path, content)`.
+  The password, salt, and KDF parameters only gate access to `domain_key`,
+  which is why `passwd` and KDF upgrades never churn ciphertext.
 
-- The plaintext is split into lines at `\n` (0x0A). Line content is raw
-  bytes: a `\r` before the `\n` stays in the line (CRLF round-trips), empty
-  lines are ordinary zero-length lines and are encrypted like any other line.
-- Every line is an independent unit with a static AAD:
+## Unit encryption with AES-SIV
 
-  ```
-  aad_text = "simple-encrypt/v1/text"
-  ```
+Every unit (a text line, the empty-file marker, or a binary chunk) is
+encrypted with AES-SIV under the file's `unit_key`, with exactly one
+associated-data component:
 
-  The AAD deliberately excludes the line number and any neighbor state:
-  a line's ciphertext depends only on the file's keys and the line's bytes,
-  so inserting, deleting, or reordering surrounding lines does not change it.
-- Consequences, accepted by design: within one file, equal lines have equal
-  ciphertext; whole-line reordering, deletion, duplication, truncation, and
-  splicing lines from an older version of the same file are not detected.
-  No unit can be *forged* without the key: an attacker cannot inject content
-  that was never legitimately encrypted for that exact file path.
-- The header line and the trailing-newline mirroring rule are specified in
-  [format.md](format.md).
+```
+output = SIV(16 bytes) || ciphertext(len(plaintext))
+```
 
-## Binary mode (whole file, chunked)
+AES-SIV is run in its deterministic mode (RFC 5297 §4: no nonce at all;
+`AEAD_AES_SIV_CMAC_512` here names the key size — 64 bytes, AES-256 —
+not the nonce-based RFC 5116 interface of the same name).
+Decryption recomputes S2V over the associated data and the decrypted
+plaintext and compares it to the stored SIV in constant time — that
+comparison *is* the authentication; there is no separate tag and no
+nonce-conformance step.
 
-- The plaintext is split into consecutive `CHUNK_SIZE` chunks; for a
-  non-empty file the final chunk holds the remainder (1 to 65536 bytes).
-  An empty file is one zero-length chunk — the only position where a
-  zero-length chunk is valid — so even an empty file has an
-  authentication tag. See [format.md](format.md) for the exact rules.
-- Chunk AAD:
+Associated data per unit:
 
-  ```
-  aad_bin(i, last) = "simple-encrypt/v1/bin" || le64(i) || (last ? 0x01 : 0x00)
-  ```
+```
+text line          : AD_TEXT
+empty-file marker  : AD_TEXT_EMPTY
+binary chunk       : AD_BIN_PREFIX || le64(chunk_index) || (last ? 0x01 : 0x00)
+```
 
-  Binding the index rejects chunk reordering; binding the last flag rejects
-  truncation at a chunk boundary and extension. There is deliberately no
-  chain (no previous-tag feedback): a chunk from an older version of the same
-  file can be substituted at the same index undetected, and in exchange a
-  local edit that does not shift data changes only the affected chunks'
-  ciphertext.
+Text-line AD deliberately excludes the line number and any neighbor state:
+a line's ciphertext depends only on the file's keys and the line's bytes,
+so editing surrounding lines does not change it. Binary chunks bind their
+index (rejects reordering) and a last-chunk flag (rejects truncation at a
+chunk boundary and extension).
+
+### Security properties
+
+- **DAE security**: AES-SIV is a standardized deterministic authenticated
+  encryption scheme with a formal security treatment (RFC 5297, building
+  on Rogaway–Shrimpton SIV). Under one key it reveals equality of
+  `(associated data, plaintext)` pairs — plus length — and nothing else
+  about the plaintext.
+- **The determinism caveat applies in full** (RFC 5297 makes it
+  explicitly): deterministic encryption protects content only to the
+  extent the plaintext is unpredictable given everything the ciphertext
+  legitimately leaks. Low-entropy units can be identified or confirmed
+  without any key. See [threat-model.md](threat-model.md).
+- **SIV collisions**: two *distinct* units colliding on the 128-bit SIV
+  under one key would reuse the CTR keystream and leak their XOR. The
+  probability is ≈ q²/2^129 for q units under one key; keys are per
+  path, so q counts every unit ever encrypted for that path across all
+  its versions (q = 2^20 → ≈ 2^-89).
+  This is a negligible-probability failure, not an impossible one.
+- **Unit authenticity only**: an attacker without the key cannot create
+  any unit ciphertext that was never legitimately produced for that exact
+  file path, but recombining *authentic* units is not prevented at the
+  unit level. Text-mode file integrity is deliberately absent (merge
+  support); binary mode adds a whole-file tag (below).
+
+## Binary whole-file tag
+
+Binary ciphertext ends with a 32-byte trailer:
+
+```
+file_tag = blake3::keyed_hash(
+    file_tag_key,
+    header(16) || le64(plaintext_len) || le64(chunk_count)
+               || SIV_0 || SIV_1 || … || SIV_{n-1})
+```
+
+The tag is deterministic (inputs are), covers the header bytes, and binds
+the exact multiset *and order* of chunks. It preserves locality — editing
+one chunk changes that chunk and the trailer only — while rejecting
+substitution of same-index chunks from older versions, which per-chunk AD
+alone cannot detect. Whole-file rollback to a complete older ciphertext
+remains possible (no external state); binary files do not merge in git, so
+the trailer costs nothing in workflow terms. Verified in constant time.
+
+Text mode has no file-level tag: any such tag would conflict on every
+merge and defeat the per-line design. The resulting file-level integrity
+gap is documented, not hidden.
+
+## Empty-file marker (text mode)
+
+The valid ciphertext of an empty text file is a single header line
+carrying an authenticated marker: base64 of
+`AES-SIV(unit_key, AD_TEXT_EMPTY, "")` (16 bytes → 22 characters; layout
+in [format.md](format.md)). A bare header with no units is malformed.
+Without this marker, anyone could truncate a text ciphertext to the bare
+header and have it "decrypt" to an empty file with no key — the marker
+makes emptiness as unforgeable as any other content.
 
 ## KDF parameters
 
-- Defaults written by `init`: `memory_kib = 19456`, `iterations = 2`,
-  `parallelism = 1` (Argon2id, 32-byte output) — the `argon2` crate
-  defaults, matching OWASP guidance.
-- Parameters are read from the config on every run, so domains can choose
-  their own strength. Changing parameters for an existing domain goes
-  through `passwd` (see [cli.md](cli.md)), which rewrites salt, verifier,
-  and parameters together.
-- Because the config can come from a hostile repository, parameters are
-  validated before running Argon2: `8 * parallelism ≤ memory_kib ≤ 4194304`
-  (4 GiB), `1 ≤ iterations ≤ 1000`, `1 ≤ parallelism ≤ 64`. Out-of-range
-  values are a hard error, preventing a malicious config from turning a
-  password prompt into a memory/CPU bomb.
+- Defaults written by `init`: `memory_kib = 65536` (64 MiB) and
+  `iterations = 3` per RFC 9106's memory-constrained recommendation,
+  with `parallelism = 1` (the RFC suggests 4 lanes; one lane is this
+  tool's choice for single-threaded simplicity). Affordable for a CLI
+  that runs Argon2 once per command.
+  With envelope encryption a later upgrade costs one `passwd`, so there is
+  no reason to start low.
+- Parameters live in the config and are validated in three tiers before
+  Argon2 runs (the config may come from a hostile repository):
+
+  | Tier | Rule | On violation |
+  |---|---|---|
+  | Validity | `parallelism ≥ 1`, `memory_kib ≥ 8 × parallelism`, `iterations ≥ 1` | hard error |
+  | Security floor | `memory_kib ≥ 19456` and `iterations ≥ 2` | error unless `--allow-weak-kdf` |
+  | Resource ceiling | `memory_kib ≤ 1048576` (1 GiB) and `memory_kib × iterations ≤ 8388608` and `parallelism ≤ 8` | error unless `--allow-expensive-kdf` |
+
+- Whenever the configured cost exceeds the defaults, the tool prints the
+  memory and pass count it is about to spend before running Argon2, so a
+  hostile or mistyped config cannot silently stall or OOM the machine.
 
 ## Hygiene
 
-- The password, the master key, and all derived keys are held in `Zeroizing`
-  buffers and wiped on drop. This is best-effort: the OS and allocator may
-  still copy memory (see [threat-model.md](threat-model.md)).
-- Verifier comparison is constant-time.
-- Empty passwords are rejected at every input path.
-- Salt generation uses the OS CSPRNG; encryption itself never needs
-  randomness, so a broken RNG cannot compromise ciphertext after `init`.
+- The password, `kek`, `domain_key`, and all derived keys live in
+  `Zeroizing` buffers and are wiped on drop. Best-effort only: the OS,
+  allocator, and swap may still copy memory
+  (see [threat-model.md](threat-model.md)).
+- All authentication comparisons (SIV verification, file tag) are
+  constant-time.
+- Empty passwords are rejected at every input path; passwords must be
+  valid UTF-8.
+- Encryption itself needs no randomness. The OS CSPRNG is used only for
+  the salt and domain key (`init`, `passwd`, `rekey`) and temp-file names,
+  so a weak RNG after `init` cannot compromise ciphertext.

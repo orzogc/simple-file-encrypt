@@ -1,116 +1,178 @@
 # simple-encrypt — Threat Model
 
-This tool makes a deliberate, unusual trade: it encrypts text files line by
-line, deterministically, so that ciphertext diffs and merges like text. That
-buys git ergonomics and costs confidentiality of *structure*. This document
-states exactly what is and is not protected. The README must carry the same
-message; users who skip this page should still not be surprised.
+This tool makes a deliberate, unusual trade: it encrypts text files line
+by line, deterministically, so that ciphertext diffs and merges like
+text. That buys git ergonomics and costs confidentiality of *structure*.
+This document states exactly what is and is not protected. The README
+must carry the same message; users who skip this page should still not be
+surprised.
 
 ## Assets
 
 - The plaintext content of managed files (tokens, credentials, private
   notes, small binary secrets).
-- The password.
+- The password and the domain key.
 
-## In-scope adversary
+## Adversaries
 
-A **passive reader of the ciphertext at rest**: a repository hosting
-provider, someone who leaks or steals a clone or backup, a future reader of
-git history. They can read every committed version of the ciphertext and the
-domain config, and can run offline computation against them. They cannot run
-code on the user's machine and cannot cause the user to encrypt chosen data.
+Two classes, with very different coverage:
 
-## Guarantees (against the in-scope adversary)
+- **Passive reader of ciphertext at rest** (primary): a repository
+  hosting provider, someone who leaks or steals a clone or backup, a
+  future reader of git history. Reads every committed version of the
+  ciphertext and the domain config; runs offline computation. Cannot run
+  code on the user's machine and cannot cause encryptions of chosen data.
+- **Active repository writer** (secondary, limited coverage): can modify
+  ciphertext, config, and history. Against this adversary the tool
+  offers *unit-level* authenticity and the binary file tag, and nothing
+  more — see the integrity limits below. Full protection against a
+  hostile writer is out of scope.
 
-- **Content confidentiality per unit**: recovering the bytes of any line
-  (text mode) or chunk (binary mode) requires the password. The scheme is
-  deterministic authenticated encryption: it reveals unit equality and
-  nothing else about unit contents.
-- **No forgery**: no ciphertext unit that was never legitimately produced
-  for that exact file path can be created without the key. Tampering with a
-  unit's bytes is detected on decryption.
-- **Wrong-password detection**: operations fail fast against the config
-  verifier; mixed-password domains cannot arise from typos.
+## Guarantees
+
+- **Content confidentiality, conditional on unpredictability**: the
+  scheme is deterministic authenticated encryption (AES-SIV). Ciphertext
+  reveals unit equality and exact lengths, and nothing else — which
+  protects a unit's content only to the extent that content is
+  unpredictable *given* the revealed information. High-entropy content
+  (tokens, keys, prose) is protected by the password and KDF;
+  low-entropy, high-frequency, or format-predictable lines can be
+  identified or confirmed without any key (see the leakage inventory).
+  Do not read "encrypted" as "hidden" for structure or boilerplate.
+- **Unit authenticity**: no ciphertext unit (line, empty-file marker, or
+  chunk) that was never legitimately produced for that exact file path
+  can be created without the key; tampering with a unit's bytes is
+  detected. This is *not* file-level integrity — see below.
+- **Binary file integrity**: a binary ciphertext additionally carries a
+  whole-file tag binding chunk order, count, lengths, and header;
+  recombining chunks from different versions is detected. Only
+  whole-file rollback to a complete older ciphertext survives.
+- **Wrong-password detection**: unwrapping the domain key fails fast;
+  mixed-key states cannot arise from typos.
 - **Deterministic re-encryption**: unchanged plaintext never churns
-  ciphertext, so git history stays small and reviewable.
+  ciphertext; `passwd` and KDF upgrades churn nothing at all.
 
 ## Leakage inventory (accepted by design)
 
-Ordered roughly by how much it usually matters:
+All lengths below are **exact**, not approximate — base64 character
+counts and ciphertext sizes invert uniquely to plaintext sizes.
 
-1. **Line equality within a file** (text mode): identical plaintext lines in
-   one file have identical ciphertext lines — also across the git history of
-   that file (reverting a line is visible as the old ciphertext returning).
-   High-frequency short lines (empty lines, `}`, `true`, boilerplate) are
-   realistically identifiable by frequency analysis. Cross-*file* equality
-   is hidden (per-path keys).
-2. **Structure** (text mode): the number of lines, each line's approximate
-   length (base64 of length + 40), and exactly which lines changed between
-   commits. This is the same information the git diff shows — that is the
-   point, and the leak.
-3. **File size** (binary mode): plaintext length is visible within chunk
-   granularity; which 64 KiB regions changed is visible across versions.
-4. **Confirmation attacks**: anyone who can get their own guessed line
-   encrypted under the victim's key *at the same file path* (e.g. a
-   collaborator proposing config lines) can confirm a guess by comparing
-   ciphertext. Deterministic encryption cannot prevent this.
-5. **Offline password guessing**: the config's salt, KDF parameters, and
-   verifier — or any ciphertext unit — allow testing password guesses at
-   Argon2id cost. Defense is password entropy and the KDF parameters; there
-   is no server to rate-limit.
+1. **Structure of text files**: the exact number of lines, the exact
+   byte length of every line, whether the file ends with a newline, and
+   exactly which lines changed between any two committed versions. This
+   is the same information a git diff of the ciphertext shows — that is
+   the point, and the leak.
+2. **Line equality within a file**: identical plaintext lines in one
+   file have identical ciphertext lines — also across the entire git
+   history of that path, across branches, and across clones or forks
+   (they share the config and domain key). Reverting a line is visible
+   as the old ciphertext returning. High-frequency short lines (empty
+   lines, `}`, `true`, boilerplate) are realistically identifiable by
+   frequency analysis alone. Cross-*file* equality is hidden (per-path
+   keys).
+3. **Known-plaintext dictionaries**: if the plaintext of any committed
+   version of a file is known (it was once public, or partially
+   guessable), every one of its lines yields a ciphertext→plaintext
+   dictionary entry valid for all other versions of that path.
+4. **Binary files**: the exact plaintext length, and which 64 KiB
+   regions changed between versions.
+5. **Confirmation attacks**: anyone who can get a guessed line encrypted
+   under the victim's key at the same path (e.g. a collaborator
+   proposing config lines) confirms the guess by comparing ciphertext.
+   Deterministic encryption cannot prevent this.
+6. **Offline password guessing**: the config's salt, KDF parameters, and
+   wrapped key allow testing password guesses at Argon2id cost — even if
+   no ciphertext leaks at all, the wrapped key alone suffices as a test
+   target. Password entropy and the KDF parameters are the only
+   defenses; there is no server to rate-limit.
 
 ## Integrity limits (accepted by design)
 
-- **Text mode**: only individual lines are authenticated. Reordering,
-  deleting, duplicating whole lines, truncating the file, and splicing
-  authentic lines from *older versions of the same file* are undetectable
-  by the tool. Rollback and splice protection comes from git history review,
-  not from the cryptography.
-- **Binary mode**: chunk order and count are authenticated (index + last
-  flag), but a chunk can be replaced by the same-index chunk from an older
-  version of the same file undetectably.
-- **Whole-file rollback**: an attacker with write access can revert any file
-  to an older ciphertext; git history is the defense.
-- **Unauthenticated framing**: the binary header and the text header line
-  carry no tag of their own. Corrupting them makes the file probe as
-  plaintext, which `decrypt` then skips silently — but `check` flags such
-  a file as a plaintext offender, which surfaces the damage.
+- **Text mode has unit integrity only.** An attacker with write access
+  can compose a file that was never legitimately encrypted, out of
+  authentic units: delete security-relevant lines, reorder lines whose
+  meaning is order-dependent, duplicate lines so a later value overrides
+  an earlier one, resurrect a revoked token from history, or mix lines
+  from several historical versions of the same path. None of this is
+  detected by decryption. This is the price of line-level merge; review
+  of git history is the countermeasure.
+- **Whole-file rollback** (text and binary): any file can be reverted to
+  a complete older ciphertext undetected by the tool.
+- **Git history is a recovery source, not a cryptographic control.**
+  History itself can be force-pushed, rewritten, or rolled back together
+  with config and ciphertext. Treating it as rollback protection
+  requires protecting *it*: protected branches, signed commits or tags,
+  or an out-of-band record of trusted commit IDs.
+- **Unauthenticated framing**: the binary header and the text header
+  line carry no tag of their own (the binary header is covered by the
+  file tag once parsing succeeds, but a corrupted magic prevents parsing
+  entirely). Corrupting the magic makes the file probe as plaintext,
+  which `decrypt` skips with only a note — `decrypt --require-encrypted`
+  turns that into an error, and `check` flags such a file as an
+  offender.
+
+## Password change vs. key rotation
+
+`passwd` re-wraps the domain key and **does not revoke** the old
+password: the old wrapped key stays in git history and the domain key is
+unchanged, so the old password keeps decrypting everything, including
+future commits. Routine "I want to type something else" changes are
+safe; compromise response is `passwd` **then `rekey`** (rotate the
+domain key and re-encrypt). Even `rekey` only protects content committed
+afterwards — nothing retroactively removes what an old password could
+already read from history, short of rewriting that history.
 
 ## Out of scope
 
-- **A compromised machine**: malware, a hostile local user, memory scraping.
-  Zeroization of keys and passwords is best-effort hygiene, not a defense.
-- **The decrypted working tree**: while files are decrypted they are ordinary
-  plaintext on disk; the tool does not shorten that window and `check` only
-  warns before commits.
+- **A compromised machine**: malware, a hostile local user, memory
+  scraping. Zeroization of keys and passwords is best-effort hygiene,
+  not a defense.
+- **The decrypted working tree**: while files are decrypted they are
+  ordinary plaintext on disk; the tool does not shorten that window.
+- **Secure deletion.** In-place encryption cannot erase plaintext that
+  ever existed: old filesystem blocks, copy-on-write snapshots,
+  journals, editor swap/backup files, OS page cache and swap, backups,
+  and anything already committed to git history all survive
+  `temp + rename`. If plaintext must never have touched persistent
+  storage, this tool cannot provide that.
+- **Local race conditions (TOCTOU)**: path checks (symlink detection,
+  containment) are lexical checks followed by separate opens; a local
+  attacker racing between them can redirect writes. Closing this needs
+  `openat2`-style descriptor-relative traversal, deliberately not done
+  in v1. This matters only against local active attackers, who are out
+  of scope anyway — stated here so the symlink checks are not mistaken
+  for a security boundary.
 - **Active attackers with an encryption oracle** beyond the confirmation
-  attack above (e.g. adaptive chosen-plaintext games): the deterministic
-  design concedes these.
-- **Traffic/metadata beyond the repository**: filenames, file count, commit
-  times, and commit messages are plainly visible in git regardless.
-- **Availability**: an attacker who can write to the repository can destroy
-  ciphertext; git history is the recovery path.
+  attack above: the deterministic design concedes adaptive
+  chosen-plaintext games.
+- **Metadata beyond file contents**: filenames, file count, sizes,
+  commit times and messages are plainly visible in git regardless.
+- **Availability**: an attacker who can write can destroy ciphertext;
+  git history is the recovery path.
 
 ## Operational risks and mitigations
 
 | Risk | Stance |
 |---|---|
-| Losing `.simple-encrypt.toml` | Ciphertext is undecryptable without it (salt lives there). It is committed next to the ciphertext; git is the backup. |
+| Losing `.simple-encrypt.toml` | Ciphertext is undecryptable without it (salt and wrapped key live there). It is committed next to the ciphertext; git is the backup. |
 | `SIMPLE_ENCRYPT_PASSWORD` in the environment | Visible to same-user processes via `/proc`; prefer the interactive prompt outside CI. |
-| Crash during decryption | May leave a `.simple-encrypt.tmp.*` containing plaintext until the next run cleans it; treat as a plaintext spill. |
-| Concurrent runs on one domain | Unsupported; no lock. Do not do it. |
+| Crash during decryption | May leave a `.simple-encrypt.tmp.*` containing plaintext (mode `0600`) until the next exclusive-lock run sweeps the domain root and all target directories; treat as a plaintext spill. |
+| Concurrent runs on one domain | Guarded by an advisory `flock` on the domain root directory; the second instance fails fast. Advisory locks may not work on network filesystems — avoid concurrent use there. |
+| Hard links | `encrypt` refuses files with link count > 1: the other links would keep a readable plaintext alias. Resolve the links first. |
 | Moving/renaming an encrypted file | Decryption fails (path-bound keys). Rename in plaintext state; the auth-failure message hints at this cause. |
-| Hostile config in a cloned repo | KDF parameters are bounded before running Argon2 (no memory/CPU bomb); unknown keys and versions are rejected; path entries cannot escape the domain root. |
-| Staged-but-plaintext content in git | `check` reads the working tree only; use `git commit -a` or re-stage after encrypting. |
-| Hand-editing `paths` in the config | Deleting the entry of a still-encrypted file hides it from `passwd`, stranding it under the old password after a change. Use `remove`, which refuses exactly this. |
-| Plaintext crafted to start with the magic | Probe-only `check` would pass it. `encrypt` errors on such files instead of producing them, so this needs deliberate hand-crafting; treat `check` as an accident gate, not tamper detection. |
+| Hostile config in a cloned repo | KDF cost is bounded (security floor and resource ceiling, with explicit override flags); above-default cost is announced before Argon2 runs; unknown keys and versions are rejected; path entries cannot escape the domain root; file and config size limits bound memory. |
+| Hand-editing `paths` in the config | Deleting the entry of a still-encrypted file hides it from `rekey`, stranding it under the old domain key after a rotation. Use `remove`, which refuses exactly this. |
+| Plaintext crafted to start with the magic | Probe-only `check` would pass it. `encrypt` errors on such files instead of producing them, so this needs deliberate hand-crafting; use `verify` for authenticated checking. |
+| Staged-but-plaintext content in git | Working-tree `check` cannot see the index; use the `check --stdin` hook recipe in [cli.md](cli.md), which checks staged blobs. |
+| macOS case/normalization-insensitive volumes | Arguments are re-spelled from directory listings, so typed case cannot poison key derivation; residual Unicode-normalization mismatches fail closed as authentication errors. ASCII filenames avoid the issue. |
 
 ## Choosing a tool
 
 - Need line-diffable encrypted files in git, and the leakage above is
-  acceptable for your data (typical: high-entropy tokens, personal configs
-  in a private repo) → **simple-encrypt**.
+  acceptable for your data (typical: high-entropy tokens, personal
+  configs in a private repo) → **simple-encrypt**.
 - Need to hide file structure and change patterns, want whole-file
-  encryption with transactional robustness → **git-simple-encrypt**.
+  encryption with transactional robustness →
+  **git-simple-encrypt**.
 - Need multi-recipient/asymmetric encryption or public-audience threat
   models → **age** / **git-crypt** class tools.
