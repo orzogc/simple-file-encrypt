@@ -279,8 +279,9 @@ pub fn render(cfg: &Config) -> String {
     render_list(&mut out, "paths", &paths_sorted);
     out.push('\n');
     out.push_str(
-        "# Maintained by hand: paths (files or directories) always encrypted in\n\
-         # binary (whole-file) mode, even if their content looks like text.\n",
+        "# Maintained by hand or by `add --binary` / `remove --binary`: paths\n\
+         # (files or directories) always encrypted in binary (whole-file) mode,\n\
+         # even if their content looks like text. The tool only appends/removes.\n",
     );
     render_list(&mut out, "force_binary", &cfg.force_binary);
     out.push('\n');

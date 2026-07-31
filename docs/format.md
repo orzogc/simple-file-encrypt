@@ -76,8 +76,9 @@ paths = [
     "secrets",
 ]
 
-# Maintained by hand: paths (files or directories) always encrypted in
-# binary (whole-file) mode, even if their content looks like text.
+# Maintained by hand or by `add --binary` / `remove --binary`: paths
+# (files or directories) always encrypted in binary (whole-file) mode,
+# even if their content looks like text. The tool only appends/removes.
 force_binary = [
     "secrets/huge-export.csv",
 ]
