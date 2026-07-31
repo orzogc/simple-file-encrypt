@@ -1499,6 +1499,10 @@ fn concurrent_parent_child_init_never_nests() {
     }
 }
 
+// Linux-only: APFS rejects non-UTF-8 file names at creation time
+// (EILSEQ), so the scenario cannot be constructed on macOS (the
+// refusal itself would apply there too, e.g. on mounted volumes).
+#[cfg(target_os = "linux")]
 #[test]
 fn discovered_non_utf8_names_are_refused() {
     use std::ffi::OsStr;
