@@ -24,12 +24,16 @@ Two classes, with very different coverage:
   code on the user's machine and cannot cause encryptions of chosen data.
 - **Active repository writer** (secondary, limited coverage): can modify
   ciphertext, config, and history. Against this adversary the tool
-  offers *unit-level* authenticity, the binary file tag, and an
-  authenticated key-ring order (position-bound wrap AD: config
-  tampering cannot silently redirect future encryption to a retired,
-  possibly compromised key) — and nothing more; see the integrity
-  limits below. Full protection against a hostile writer is out of
-  scope.
+  offers *unit-level* authenticity, the binary file tag, and a
+  tamper-evident key ring (length- and position-bound wrap AD: within
+  one config generation, no reordering, subsetting, or splicing of
+  entries can redirect future encryption to a retired, possibly
+  compromised key). Rolling back the **complete config** to a
+  historically valid generation is not detected — if the password has
+  not changed since, that generation unwraps consistently; countering
+  it needs protected or signed history. Nothing more is offered; see
+  the integrity limits below. Full protection against a hostile writer
+  is out of scope.
 
 ## Guarantees
 
@@ -105,9 +109,11 @@ counts and ciphertext sizes invert uniquely to plaintext sizes.
   authentic units: delete security-relevant lines, reorder lines whose
   meaning is order-dependent, duplicate lines so a later value overrides
   an earlier one, resurrect a revoked token from history, or mix lines
-  from several historical versions of the same path. None of this is
-  detected by decryption. This is the price of line-level merge; review
-  of git history is the countermeasure.
+  from historical versions of the same path **encrypted under the same
+  key epoch** (mixed-epoch files fail authentication; a complete
+  old-epoch file remains replayable while its key is retained). None of
+  this is detected by decryption. This is the price of line-level
+  merge; review of git history is the countermeasure.
 - **Whole-file rollback** (text and binary): any file can be reverted to
   a complete older ciphertext undetected by the tool — including
   replaying the authenticated empty-file marker from a version that was
@@ -177,7 +183,7 @@ history.
 
 | Risk | Stance |
 |---|---|
-| Losing `.simple-encrypt.toml` | Ciphertext is undecryptable without it (salt and wrapped key live there). It is committed next to the ciphertext; git is the backup. |
+| Losing `.simple-encrypt.toml` | Ciphertext is undecryptable without it (salt and the wrapped key ring live there). It is committed next to the ciphertext; git is the backup. |
 | `SIMPLE_ENCRYPT_PASSWORD` in the environment | Visible to same-user processes via `/proc`; prefer the interactive prompt outside CI. |
 | Crash during decryption | May leave a `.simple-encrypt.tmp.*` containing plaintext (mode `0600`) until the next exclusive-lock run sweeps the domain root and all target directories; treat as a plaintext spill. |
 | Concurrent runs on one domain | Guarded by an advisory `flock` on the domain root directory; the second instance fails fast. Advisory locks may not work on network filesystems — avoid concurrent use there. |

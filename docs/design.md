@@ -47,8 +47,8 @@ This document is the entry point. Detailed specifications live in:
 - **Domain**: a directory tree rooted at the directory containing a
   `.simple-encrypt.toml` file (the **domain config**). Every operation
   resolves its targets to exactly one domain by walking up from the
-  target path (like git discovering `.git`). Nested domains are
-  rejected.
+  target path (like git discovering `.git`), stopping at repository
+  boundaries. Nested domains are rejected within one repository.
 - **Domain config**: a TOML file committed alongside the ciphertext. It
   holds the format version, the Argon2id parameters, the KDF salt, the
   **wrapped key ring**, the list of **managed paths**, and the
@@ -98,9 +98,11 @@ This document is the entry point. Detailed specifications live in:
 3. **Per-line deterministic encryption for text.** The point of the
    tool. Equal lines produce equal ciphertext lines (within one path),
    so git works naturally. The leakage — exact line lengths and counts,
-   equality within a path and across its history and clones,
-   change locations — is accepted and documented. Users who cannot
-   accept it force binary mode or use a different tool.
+   equality within a path and across its history and clones (scoped to
+   one key epoch; a `rekey` breaks direct equality, though positional
+   correlation may remain), change locations — is accepted and
+   documented. Users who cannot accept it force binary mode or use a
+   different tool.
 4. **Domain salt in the config, per-file subkeys from paths.** No salt
    cache, no git dependency; per-path keys remove cross-file equality.
    Consequence: renaming a file changes (and, while encrypted, breaks)
@@ -205,8 +207,13 @@ This document is the entry point. Detailed specifications live in:
   byte sequences), CLI integration tests (end-to-end flows,
   `passwd`/`rekey` interruption and migration semantics, locking,
   `check`/`verify`, git worktree and submodule `.git`-file boundaries),
-  and golden fixtures with a fixed password/salt/domain key that pin the
-  wire format and the derivation chain, so accidental format breaks fail
+  a key-ring tamper matrix (swap / drop head, middle, or tail / insert /
+  duplicate / re-attach pre-prune wrappers → all rejected; whole-config
+  rollback → cryptographically accepted by design and pinned as such;
+  intact old-epoch file decrypts and migrates; mixed-epoch file fails;
+  post-prune old-epoch file fails with the history hint), and golden
+  fixtures with a fixed password/salt/domain key that pin the wire
+  format and the derivation chain, so accidental format breaks fail
   loudly.
 - **CI**: GitHub Actions on Linux + macOS: `cargo fmt --check`,
   `cargo clippy -- -D warnings`, `cargo test`.

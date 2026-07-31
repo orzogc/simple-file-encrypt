@@ -34,10 +34,14 @@ enumeration — see [format.md](format.md)); an explicit argument that is
 a symlink — or any of whose components is detected to be one — is an
 error.
 
-Nested domains are rejected: `init` refuses to run when the current
-directory, any ancestor, or any descendant directory already has a
-config, and traversal treats a foreign `.simple-encrypt.toml` below the
-domain root as a hard error.
+Nested domains are rejected within one repository: `init` refuses when
+the current directory, an ancestor, or a descendant directory already
+has a config — the ancestor scan follows the same repository-boundary
+rule as domain resolution (it stops where the walk above stops), and
+the descendant scan does not enter nested repositories, so a config
+outside the current repository never blocks `init` (a submodule gets
+its own domain). Traversal treats a foreign `.simple-encrypt.toml`
+below the domain root as a hard error.
 
 ## Locking
 
@@ -341,7 +345,9 @@ supplied as both old and new.
 
 ### `rekey`
 
-Rotate the domain key — the compromise response. `rekey`:
+Rotate the domain key — the response to a possibly compromised domain
+key. If the **password** may be compromised, run `passwd` first;
+`rekey` alone never changes the password. `rekey`:
 
 1. unwraps the ring and scans for an unfinished rotation (any managed
    file still authenticating under a non-current ring key); if one is
@@ -374,10 +380,16 @@ epoch.
 
 `rekey --prune` drops the older entries once every managed encrypted
 file authenticates under the current key. It hard-errors when any
-exact managed file entry is missing from disk — the file could return
-from a stash or branch still encrypted under an old key; `remove` the
-entry first if it is truly gone (directory entries cover only what
-currently exists, which is all prune can see). Pruning trims the
+exact managed path entry — file **or directory** — is missing from
+disk: the path could return from a stash or branch still encrypted
+under an old key; `remove` the entry first if it is truly gone. For a
+directory entry that exists, prune can only verify the files currently
+visible beneath it — it cannot prove other branches hold none.
+Cryptographically, prune is a full ring rewrite: unwrap the whole
+ring, verify convergence, generate a fresh salt (and thus a fresh KEK
+from the same password), re-wrap the retained current key as a ring of
+length 1, and atomically replace the config — pre-prune wrappers can
+never be re-attached to the pruned generation. Pruning trims the
 **current config only**: configs already committed to git history keep
 the full ring, so it limits what a stolen current checkout exposes,
 not what a history reader with the current password can reach — see
@@ -453,7 +465,10 @@ literal index bytes. `mktemp -d` plus `umask 077` keep the export
 private; staged plaintext briefly exists under `$TMPDIR` — point it at
 a tmpfs if that matters. A domain config must itself be tracked for the
 export to contain it — which it must be anyway, since ciphertext is
-useless without it.
+useless without it. One accepted gap: a commit that deletes a config
+leaves no domain in the export and the hook passes — it gates
+plaintext, not the recoverability of ciphertext left behind without
+its config.
 
 ### Typical flow
 

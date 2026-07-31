@@ -76,9 +76,10 @@ kek = Argon2id(password, salt,              |
               m, t, p, out = 64)            |
         |                                   |
         +-----------> wrapped_keys[i] = AES-SIV(kek).encrypt(
-                          ad = AD_WRAP(i), plaintext = domain_key_i)
-                      (48 bytes each = SIV(16) || CT(32), hex in config;
-                       all entries wrapped under the same current KEK)
+                          ad = AD_WRAP(n, i), plaintext = domain_key_i)
+                      (n = ring length; 48 bytes each = SIV(16) || CT(32),
+                       hex in config; all entries wrapped under the same
+                       current KEK)
 
 domain_key (encryption always uses entry 0; decryption tries the ring
             in order)
@@ -92,7 +93,8 @@ file_tag_key = blake3::derive_key(CTX_FILE_TAG, file_km)      # binary only
 Context and associated-data strings (globally unique, frozen for v1):
 
 ```
-AD_WRAP(i)   = "github.com/orzogc/simple-encrypt v1 domain key wrap" || le64(i)
+AD_WRAP(n,i) = "github.com/orzogc/simple-encrypt v1 domain key wrap" || le64(n) || le64(i)
+               (n = ring length at wrap time, i = entry index)
 CTX_UNIT     = "github.com/orzogc/simple-encrypt v1 unit key"
 CTX_FILE_TAG = "github.com/orzogc/simple-encrypt v1 binary file tag key"
 AD_TEXT      = "github.com/orzogc/simple-encrypt v1 text unit"
@@ -109,13 +111,20 @@ Notes:
   password fails the SIV authentication. There is no separate verifier.
   A config whose ring entries do not all unwrap under the same KEK is
   corrupt (hard error).
-- The wrap AD binds each entry's **ring position**, so the
-  current-vs-retired role is authenticated: swapping, deleting, or
-  duplicating entries makes them fail to unwrap, and a repository
-  writer cannot silently redirect future encryption to a retired
-  (possibly compromised) key. Splicing entries from an older config
-  generation fails too: `passwd` and `rekey` rotate the salt — and
-  therefore the KEK — on every ring rewrite.
+- The wrap AD binds the **ring length and each entry's position**, so
+  the ring is tamper-evident as a unit within one config generation:
+  swapping, deleting (tail truncation included), inserting, or
+  duplicating entries makes the ring fail to unwrap, and editing the
+  current config cannot silently redirect future encryption to a
+  retired (possibly compromised) key. Splicing entries from an older
+  config generation fails too: every command that rewrites the ring
+  (`passwd`, `rekey`, `rekey --prune`) rotates the salt — and therefore
+  the KEK. What this does **not** prevent is rolling back the complete
+  config to a historically valid generation: if the password has not
+  changed since, that generation unwraps consistently and encryption
+  would target its old key. Countering that requires protected or
+  signed git history, or external trusted state — see
+  [threat-model.md](threat-model.md).
 - Ciphertext is a pure function of `(domain_key, canonical path,
   content)`. The password, salt, and KDF parameters only gate access to
   the domain keys, which is why `passwd` and KDF upgrades never churn

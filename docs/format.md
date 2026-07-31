@@ -95,14 +95,21 @@ Validation on load (all failures are hard errors):
   (`deny_unknown_fields`), so typos cannot silently disable protection.
 - `salt`: exactly 32 lowercase hex chars. `wrapped_keys`: 1 to 64
   entries, each exactly 96 lowercase hex chars; each entry must unwrap
-  under its position-bound associated data (see [crypto.md](crypto.md)),
-  so reordering, dropping, or duplicating entries is detected.
+  under associated data bound to the ring length and its position
+  (see [crypto.md](crypto.md)), so any reordering, dropping (tail
+  truncation included), inserting, or duplicating of entries within a
+  config generation is detected.
 - `algorithm` must be `"argon2id"`. Parameter tiers (validity floor,
   security floor, resource ceiling): see [crypto.md](crypto.md).
 - Every `paths` / `force_binary` entry must be a valid canonical relative
   path; a hand-edited entry that violates the rules (e.g. a trailing `/`)
   is a load-time error. A trailing `/` in command-line input is stripped
   before storing.
+- No entry may target tool- or git-critical files: an entry with any
+  component named `.git`, or whose final component is `.gitattributes`,
+  `.gitmodules`, or `.simple-encrypt.toml`, is a load-time error — the
+  managed list must never claim paths that every command would refuse
+  to touch.
 - `paths` and `force_binary` may be empty or absent (treated as empty).
 - The config file itself must not exceed 1 MiB, and `paths` plus
   `force_binary` together must not exceed 65536 entries.
