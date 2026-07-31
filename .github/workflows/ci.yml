@@ -6,6 +6,8 @@ name: CI
 on:
   push:
   pull_request:
+  # Lets release.yml run this whole suite as one job before building.
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always

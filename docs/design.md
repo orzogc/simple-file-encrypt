@@ -236,6 +236,11 @@ This document is the entry point. Detailed specifications live in:
   each crate in the tree, and a short `cargo fuzz` smoke over the
   config parser and both ciphertext decoders (targets in `fuzz/`).
   `unsafe_code` is denied crate-wide.
+- **Release**: pushing a `v*` tag runs the whole CI suite (reused via
+  `workflow_call`), then builds stripped release archives
+  (`x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`) with SHA-256
+  checksums and publishes them to GitHub Releases; the tag must match
+  the crate version in `Cargo.toml`.
 
 ## Versioning
 
