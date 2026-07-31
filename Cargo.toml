@@ -23,7 +23,7 @@ zeroize = "1.9.0"
 # Not used directly: feature unification makes the CMAC state (and, on
 # aarch64, the AES round keys) inside aes-siv zeroize on drop.
 cmac = { version = "0.7", features = ["zeroize"] }
-aes = { version = "0.8", features = ["zeroize"] }
+aes = { version = "0.9", features = ["zeroize"] }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
