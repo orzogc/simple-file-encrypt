@@ -122,8 +122,9 @@ Validation on load (all failures are hard errors):
 `rekey`, and `encrypt` (auto-add) rewrite it atomically (temp + rename).
 The tool writes the form above with entries in ascending byte order,
 deduplicated.
-`force_binary` is never modified by any command — it is maintained by
-hand.
+`force_binary` is maintained by hand and by `add --binary` /
+`remove --binary`; the tool only appends to or removes exact entries
+from it, so the existing order is preserved verbatim.
 
 ## Ciphertext probe
 

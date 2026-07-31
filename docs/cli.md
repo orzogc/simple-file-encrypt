@@ -302,7 +302,7 @@ exist on disk is an error. `--assume-plaintext` as specified above.
 Mirror of `encrypt` plus `--require-encrypted` (see above). Does not
 modify the managed list.
 
-### `add <PATHS…>`
+### `add [--binary] <PATHS…>`
 
 Canonicalize each path and insert it into `paths` (files or
 directories; deduplicated, sorted). An entry already covered by a
@@ -310,7 +310,14 @@ managed directory is reported and not duplicated; adding a directory
 prunes entries it now covers (reported). Warns when a path does not
 exist on disk. Does not encrypt anything and needs no password.
 
-### `remove <PATHS…>`
+With `--binary`, each path is additionally marked in `force_binary`
+(always encrypted in binary mode) — the marking is independent of the
+managed-list outcome, so an already-managed path can be marked with a
+later `add --binary`. New marks are appended, preserving any
+hand-maintained order. A text-mode ciphertext under a newly marked
+path is migrated to binary by the next `encrypt`.
+
+### `remove [--binary] <PATHS…>`
 
 Remove exact entries from `paths`. Refuses to remove an entry whose
 file probes as encrypted (or, for a directory entry, that covers any
@@ -323,6 +330,12 @@ still-valid ciphertext entry hides the file from `rekey`. Removing an
 entry whose file no longer exists is allowed. A path covered by a
 directory entry but not itself an entry is an error (the message names
 the covering entry).
+
+With `--binary`, remove exact entries from `force_binary` instead (an
+entry that does not exist is an error): the managed list is untouched,
+so the file stays managed and reverts to automatic mode choice.
+Existing binary ciphertext is **not** re-encrypted automatically —
+decrypt and re-encrypt to change its mode.
 
 ### `status`
 
