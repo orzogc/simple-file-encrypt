@@ -58,10 +58,10 @@ fn find_descendant_config(
             continue;
         }
         // A nested repository gets its own domain; do not enter it.
-        if path.join(".git").symlink_metadata().is_ok() {
+        if paths::exists_probe(&path.join(".git"))? {
             continue;
         }
-        if path.join(CONFIG_NAME).symlink_metadata().is_ok() {
+        if paths::exists_probe(&path.join(CONFIG_NAME))? {
             return Ok(Some(path.join(CONFIG_NAME)));
         }
         if let Some(found) = find_descendant_config(&path, depth + 1, scanned)? {
@@ -75,7 +75,7 @@ fn find_descendant_config(
 /// ancestor scan with the same repository-boundary rule as domain
 /// resolution, then a descendant scan that skips nested repositories.
 fn refuse_nested_domains(cwd: &Path) -> Result<()> {
-    if let Some(existing) = paths::discover_domain(cwd) {
+    if let Some(existing) = paths::discover_domain(cwd)? {
         if existing == cwd {
             return Err(Error::Usage(format!(
                 "`{CONFIG_NAME}` already exists in this directory"

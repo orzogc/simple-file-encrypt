@@ -52,16 +52,18 @@ pub fn open_domain(args: &[PathBuf], exclusive: bool) -> Result<(Domain, Vec<Str
     let mut root: Option<PathBuf> = None;
     let mut abs_args = Vec::with_capacity(args.len());
     if args.is_empty() {
-        root = paths::discover_domain(&cwd);
+        root = paths::discover_domain(&cwd)?;
     } else {
         for arg in args {
             let abs = paths::lexical_absolute(&cwd, arg);
-            let this = paths::discover_domain(&paths::resolution_start(&abs)).ok_or_else(|| {
+            let start = paths::resolution_start(&abs)?;
+            let this = paths::discover_domain(&start)?.ok_or_else(|| {
                 Error::Usage(format!(
                     "`{}` is outside any simple-encrypt domain (no `.simple-encrypt.toml` found)",
                     report::escape_path(arg)
                 ))
             })?;
+            check_arg_root_components(&cwd, &this)?;
             match &root {
                 None => root = Some(this),
                 Some(r) if *r == this => {}
@@ -115,6 +117,36 @@ pub fn open_domain(args: &[PathBuf], exclusive: bool) -> Result<(Domain, Vec<Str
         },
         rels,
     ))
+}
+
+/// Rejects when any component of the discovered domain root below its
+/// common prefix with `cwd` is a symlink. Those components were
+/// introduced by the explicit argument itself, so the documented "any
+/// component of an explicit argument" rule covers them; the root's own
+/// ancestors above the common prefix are the user's environment (a
+/// symlinked home or `/tmp`) and are not policed.
+fn check_arg_root_components(cwd: &Path, root: &Path) -> Result<()> {
+    let common = cwd
+        .components()
+        .zip(root.components())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut cur = PathBuf::new();
+    for (i, comp) in root.components().enumerate() {
+        cur.push(comp.as_os_str());
+        if i < common {
+            continue;
+        }
+        let md = std::fs::symlink_metadata(&cur).map_err(|e| Error::io("inspecting", &cur, e))?;
+        if md.file_type().is_symlink() {
+            return Err(Error::Usage(format!(
+                "the path to the domain root crosses the symlink `{}`; \
+                 resolve it and run from the real directory",
+                report::escape_path(&cur)
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Enforces the KDF policy tiers, announces an above-default cost, and

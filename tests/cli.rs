@@ -1456,7 +1456,7 @@ fn symlinked_domain_root_is_refused() {
     // An explicit argument reaching the domain through a symlinked
     // root must be refused, not followed into the other domain.
     let r = run_pw(&caller, PW, &["encrypt", "alias/s.txt"]).expect_code(1);
-    assert_contains(&r.stderr, "is itself a symlink");
+    assert_contains(&r.stderr, "symlink");
     // The file was not touched.
     assert_eq!(read_file(&real, "s.txt"), b"data\n");
 }
@@ -1497,4 +1497,49 @@ fn concurrent_parent_child_init_never_nests() {
             .count();
         assert!(configs <= 1, "nested domains were created concurrently");
     }
+}
+
+#[test]
+fn discovered_non_utf8_names_are_refused() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_domain(root);
+    fs::create_dir(root.join("d")).unwrap();
+    fs::write(
+        PathBuf::from(OsStr::from_bytes(root.join("d").as_os_str().as_bytes()))
+            .join(OsStr::from_bytes(b"evil-\xff.txt")),
+        b"plaintext\n",
+    )
+    .unwrap();
+    run_nopw(root, &["add", "d"]).expect_code(0);
+
+    // A non-UTF-8 name cannot feed key derivation; every command that
+    // expands the directory must fail, never silently skip the file.
+    let r = run_pw(root, PW, &["encrypt"]).expect_code(1);
+    assert_contains(&r.stderr, "not valid UTF-8");
+    let r = run_nopw(root, &["check"]).expect_code(2);
+    assert_contains(&r.stderr, "not valid UTF-8");
+    let r = run_pw(root, PW, &["verify"]).expect_code(2);
+    assert_contains(&r.stderr, "not valid UTF-8");
+}
+
+#[test]
+fn symlinked_component_above_discovered_root_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside-parent");
+    let caller = tmp.path().join("caller");
+    fs::create_dir_all(outside.join("subdomain")).unwrap();
+    fs::create_dir_all(&caller).unwrap();
+    write_file(&outside.join("subdomain"), "s.txt", b"data\n");
+    init_domain(&outside.join("subdomain"));
+    std::os::unix::fs::symlink(&outside, caller.join("alias")).unwrap();
+
+    // `alias` is introduced by the argument itself (below the cwd), so
+    // the "any component of an explicit argument" rule covers it even
+    // though the discovered root's final component is a real directory.
+    let r = run_pw(&caller, PW, &["encrypt", "alias/subdomain/s.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "crosses the symlink");
+    assert_eq!(read_file(&outside.join("subdomain"), "s.txt"), b"data\n");
 }

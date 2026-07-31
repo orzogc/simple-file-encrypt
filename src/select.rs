@@ -232,13 +232,13 @@ impl Expander<'_> {
     /// Errors when `dir` (a directory below the root) is a nested
     /// repository or holds a foreign domain config.
     fn check_boundary(&self, rel: &str, dir: &Path) -> Result<()> {
-        if dir.join(".git").symlink_metadata().is_ok() {
+        if paths::exists_probe(&dir.join(".git"))? {
             return Err(Error::Usage(format!(
                 "`{rel}` lies inside the nested repository `{}`; it needs its own simple-encrypt domain",
                 report::escape_path(dir)
             )));
         }
-        if dir.join(CONFIG_NAME).symlink_metadata().is_ok() {
+        if paths::exists_probe(&dir.join(CONFIG_NAME))? {
             return Err(Error::Usage(format!(
                 "found a foreign `{CONFIG_NAME}` below the domain root, in `{}`; \
                  nested domains are not supported within one repository",
@@ -342,11 +342,11 @@ impl Expander<'_> {
                 let crel = child_rel(&ns);
                 // A subdirectory with a `.git` entry is a nested
                 // repository: never entered.
-                if child_abs.join(".git").symlink_metadata().is_ok() {
+                if paths::exists_probe(&child_abs.join(".git"))? {
                     report::note(format!("skipping nested repository `{crel}`"));
                     continue;
                 }
-                if child_abs.join(CONFIG_NAME).symlink_metadata().is_ok() {
+                if paths::exists_probe(&child_abs.join(CONFIG_NAME))? {
                     return Err(Error::Usage(format!(
                         "found a foreign `{CONFIG_NAME}` below the domain root, in `{crel}`; \
                          nested domains are not supported within one repository"
@@ -356,14 +356,14 @@ impl Expander<'_> {
                 continue;
             }
             // Non-directory entries with non-UTF-8 names cannot become
-            // canonical paths; skip with a warning (explicitly naming
-            // one fails at minting instead).
+            // canonical paths (key derivation would have no stable
+            // input); refuse rather than silently leave plaintext
+            // behind — naming one explicitly already fails at minting.
             let Some(ns) = name_str else {
-                report::warn(format!(
-                    "skipping `{}`: file name is not valid UTF-8",
+                return Err(Error::Usage(format!(
+                    "`{}`: file name is not valid UTF-8; simple-encrypt refuses such names",
                     report::escape_path(&child_abs)
-                ));
-                continue;
+                )));
             };
             reject_control_name(&child_abs, &ns)?;
             // The domain config itself, temp files, and git metadata

@@ -109,21 +109,33 @@ pub fn lexical_absolute(cwd: &Path, arg: &Path) -> PathBuf {
     }
 }
 
+/// Probes `path` for existence without following a final symlink:
+/// `true` when it exists, `false` when it does not. Probe errors other
+/// than `NotFound` (permissions, I/O) are propagated — boundary and
+/// containment probes must fail closed, never silently degrade.
+pub fn exists_probe(path: &Path) -> Result<bool> {
+    match path.symlink_metadata() {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(Error::io("inspecting", path, e)),
+    }
+}
+
 /// Walks up from `start` looking for the domain config, stopping at
 /// repository boundaries: in each directory the config is looked for
 /// first, then a `.git` entry (file or directory). Returns the domain
 /// root, or `None` when the walk ends outside any domain.
-pub fn discover_domain(start: &Path) -> Option<PathBuf> {
+pub fn discover_domain(start: &Path) -> Result<Option<PathBuf>> {
     let mut dir = start.to_path_buf();
     loop {
-        if dir.join(CONFIG_NAME).symlink_metadata().is_ok() {
-            return Some(dir);
+        if exists_probe(&dir.join(CONFIG_NAME))? {
+            return Ok(Some(dir));
         }
-        if dir.join(".git").symlink_metadata().is_ok() {
-            return None;
+        if exists_probe(&dir.join(".git"))? {
+            return Ok(None);
         }
         if !dir.pop() {
-            return None;
+            return Ok(None);
         }
     }
 }
@@ -131,14 +143,20 @@ pub fn discover_domain(start: &Path) -> Option<PathBuf> {
 /// The directory domain resolution starts from for an explicit path
 /// argument: the argument itself when it is a directory, otherwise its
 /// parent (which is also the fallback for nonexistent arguments).
-pub fn resolution_start(abs: &Path) -> PathBuf {
-    if abs.is_dir() {
-        abs.to_path_buf()
-    } else {
-        abs.parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("/"))
+pub fn resolution_start(abs: &Path) -> Result<PathBuf> {
+    match abs.symlink_metadata() {
+        Ok(md) if md.file_type().is_dir() => Ok(abs.to_path_buf()),
+        Ok(_) => Ok(parent_or_root(abs)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(parent_or_root(abs)),
+        Err(e) => Err(Error::io("inspecting", abs, e)),
     }
+}
+
+/// The parent of `abs`, or `/` when it has none.
+fn parent_or_root(abs: &Path) -> PathBuf {
+    abs.parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 /// Mints a canonical relative path from a lexically-normalized absolute
@@ -323,20 +341,20 @@ mod tests {
         std::fs::write(root.join("repo").join(CONFIG_NAME), "x").unwrap();
         assert_eq!(
             discover_domain(&root.join("repo/sub/deep")).unwrap(),
-            root.join("repo")
+            Some(root.join("repo"))
         );
 
         // A nested repository boundary (a `.git` file) ends the walk.
         std::fs::write(root.join("repo/sub/.git"), "gitdir: elsewhere").unwrap();
-        assert_eq!(discover_domain(&root.join("repo/sub/deep")), None);
+        assert_eq!(discover_domain(&root.join("repo/sub/deep")).unwrap(), None);
         // The config is looked for before `.git` in the same directory.
         std::fs::write(root.join("repo/sub").join(CONFIG_NAME), "x").unwrap();
         assert_eq!(
             discover_domain(&root.join("repo/sub/deep")).unwrap(),
-            root.join("repo/sub")
+            Some(root.join("repo/sub"))
         );
         // No config above and no boundary: outside any domain.
-        assert_eq!(discover_domain(root), None);
+        assert_eq!(discover_domain(root).unwrap(), None);
     }
 
     #[test]

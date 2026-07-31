@@ -288,7 +288,8 @@ pub fn atomic_replace(path: &Path, expect: &Snapshot, content: &[u8]) -> Result<
     // never too loose) and durability is uncertain until a later sync.
     if let Err(e) = file.set_permissions(Permissions::from_mode(expect.mode & 0o7777)) {
         report::warn(format!(
-            "`{}` was replaced, but restoring its permission bits failed: {e}; it is mode 0600 now",
+            "`{}` was replaced, but restoring its permission bits failed: {e}; \
+             its permission bits are 0600 or stricter now (0600 masked by umask)",
             report::escape_path(path)
         ));
     }
@@ -443,6 +444,9 @@ enum SweepSkip {
     /// Escapes the domain or crosses a symlink: sweeping it could
     /// delete files outside the domain. Reported as a warning.
     Unsafe,
+    /// A component could not be inspected (permissions, I/O): stale
+    /// temps may linger, so this is warned about, not silent.
+    Unreadable(std::io::Error),
 }
 
 /// Verifies that `dir` is the domain root or a descendant of it
@@ -461,9 +465,13 @@ fn check_sweep_dir(root: &Path, dir: &Path) -> std::result::Result<(), SweepSkip
         match cur.symlink_metadata() {
             Ok(md) if md.file_type().is_symlink() => return Err(SweepSkip::Unsafe),
             Ok(md) if md.file_type().is_dir() => {}
-            // A non-directory component (or an unreadable path) means
-            // `dir` cannot exist as a directory: nothing to sweep.
-            Ok(_) | Err(_) => return Err(SweepSkip::Missing),
+            // A non-directory component means `dir` cannot exist as a
+            // directory: nothing to sweep.
+            Ok(_) => return Err(SweepSkip::Missing),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(SweepSkip::Missing);
+            }
+            Err(e) => return Err(SweepSkip::Unreadable(e)),
         }
     }
     Ok(())
@@ -484,6 +492,13 @@ pub fn sweep_temps<I: IntoIterator<Item = PathBuf>>(root: &Path, dirs: I) -> usi
             Err(SweepSkip::Unsafe) => {
                 report::warn(format!(
                     "not sweeping `{}` for stale temp files: not a real directory below the domain root",
+                    report::escape_path(&dir)
+                ));
+                continue;
+            }
+            Err(SweepSkip::Unreadable(e)) => {
+                report::warn(format!(
+                    "not sweeping `{}` for stale temp files: cannot inspect it: {e}",
                     report::escape_path(&dir)
                 ));
                 continue;
