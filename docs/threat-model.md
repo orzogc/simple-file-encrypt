@@ -24,9 +24,12 @@ Two classes, with very different coverage:
   code on the user's machine and cannot cause encryptions of chosen data.
 - **Active repository writer** (secondary, limited coverage): can modify
   ciphertext, config, and history. Against this adversary the tool
-  offers *unit-level* authenticity and the binary file tag, and nothing
-  more — see the integrity limits below. Full protection against a
-  hostile writer is out of scope.
+  offers *unit-level* authenticity, the binary file tag, and an
+  authenticated key-ring order (position-bound wrap AD: config
+  tampering cannot silently redirect future encryption to a retired,
+  possibly compromised key) — and nothing more; see the integrity
+  limits below. Full protection against a hostile writer is out of
+  scope.
 
 ## Guarantees
 
@@ -50,8 +53,10 @@ Two classes, with very different coverage:
   whole-file rollback to a complete older ciphertext survives.
 - **Wrong-password detection**: unwrapping the key ring fails fast,
   before any file is touched.
-- **Deterministic re-encryption**: unchanged plaintext never churns
-  ciphertext; `passwd` and KDF upgrades churn nothing at all.
+- **Deterministic re-encryption**: within one key epoch, unchanged
+  plaintext never churns ciphertext; `passwd` and KDF upgrades churn
+  nothing at all. `rekey` starts a new epoch and rewrites every
+  ciphertext by design.
 
 ## Leakage inventory (accepted by design)
 
@@ -64,17 +69,23 @@ counts and ciphertext sizes invert uniquely to plaintext sizes.
    is the same information a git diff of the ciphertext shows — that is
    the point, and the leak.
 2. **Line equality within a file**: identical plaintext lines in one
-   file have identical ciphertext lines — also across the entire git
-   history of that path, across branches, and across clones or forks
-   (they share the config and domain key). Reverting a line is visible
-   as the old ciphertext returning. High-frequency short lines (empty
-   lines, `}`, `true`, boilerplate) are realistically identifiable by
-   frequency analysis alone. Cross-*file* equality is hidden (per-path
-   keys).
+   file have identical ciphertext lines — also across the git history
+   of that path, across branches, and across clones or forks (they
+   share the config and domain key) — **within one key epoch**. A
+   `rekey` rewrites every ciphertext, so direct equality does not span
+   epochs; but if the rekey commit changed no content, the git diff's
+   line-position correspondence still links old and new ciphertext, so
+   positional analysis can carry knowledge across the boundary.
+   Reverting a line is visible as the old ciphertext returning (same
+   epoch). High-frequency short lines (empty lines, `}`, `true`,
+   boilerplate) are realistically identifiable by frequency analysis
+   alone. Cross-*file* equality is hidden (per-path keys).
 3. **Known-plaintext dictionaries**: if the plaintext of any committed
    version of a file is known (it was once public, or partially
    guessable), every one of its lines yields a ciphertext→plaintext
-   dictionary entry valid for all other versions of that path.
+   dictionary entry valid for all other versions of that path within
+   the same key epoch — and, via the positional correlation above,
+   often effectively across a rekey as well.
 4. **Binary files**: the exact plaintext length, and which 64 KiB
    regions changed between versions.
 5. **Confirmation attacks**: anyone who can get a guessed line encrypted
@@ -125,10 +136,14 @@ which prepends a fresh domain key and migrates every managed file to it
 in memory — no plaintext is written to disk in the process. Older ring
 entries are retained by default so ciphertext on unmerged branches
 stays decryptable; the trade-off is that the current password unlocks
-every retained epoch, and `rekey --prune` narrows it to the current
-one. Even `rekey` only protects content committed afterwards — nothing
+every retained epoch. `rekey --prune` narrows that for the **current
+config only**: configs already committed to history keep the full
+ring, so pruning limits what a stolen current checkout exposes — not
+what a reader of git history with the current password can reach;
+historical revocation would require rewriting that history. Even
+`rekey` only protects content committed afterwards — nothing
 retroactively removes what an old password could already read from
-history, short of rewriting that history.
+history.
 
 ## Out of scope
 
@@ -167,7 +182,8 @@ history, short of rewriting that history.
 | Crash during decryption | May leave a `.simple-encrypt.tmp.*` containing plaintext (mode `0600`) until the next exclusive-lock run sweeps the domain root and all target directories; treat as a plaintext spill. |
 | Concurrent runs on one domain | Guarded by an advisory `flock` on the domain root directory; the second instance fails fast. Advisory locks may not work on network filesystems — avoid concurrent use there. |
 | Another program rewriting a file mid-operation | The advisory lock excludes only other simple-encrypt instances. Before replacing a file the tool re-checks `(device, inode)`, size, and mtime against what it read and fails that file on mismatch; a race inside that window can still lose the concurrent edit. |
-| git EOL or filter conversion | Text ciphertext is byte-exact and LF-framed: mark managed paths `-text` in `.gitattributes`, and never apply clean/smudge filters or `working-tree-encoding` to them. A CRLF checkout fails closed as a format error. |
+| git EOL or filter conversion | Text ciphertext is byte-exact and LF-framed: mark managed paths `-text` in `.gitattributes`, and never apply clean/smudge filters or `working-tree-encoding` to them. A CRLF checkout fails closed as a format error. The tool itself refuses to encrypt `.gitattributes` and `.gitmodules`. |
+| File metadata beyond mode bits | Only Unix permission bits survive temp + rename: ownership, POSIX ACLs, extended attributes, security labels, and file flags are not preserved and may alter access semantics — keep files that depend on them out of managed paths. |
 | Hard links | `encrypt` refuses files with link count > 1: the other links would keep a readable plaintext alias. Resolve the links first. |
 | Moving/renaming an encrypted file | Decryption fails (path-bound keys). Rename in plaintext state; the auth-failure message hints at this cause. |
 | Hostile config in a cloned repo | KDF cost is tiered (security floor, flag-gated ceiling, absolute hard caps) with checked arithmetic; above-default cost is announced before Argon2 runs; unknown keys and versions are rejected; path entries cannot escape the domain root; file-size, line-count, file-count, ring-size, and config-size limits bound memory and CPU. |

@@ -35,7 +35,8 @@ This document is the entry point. Detailed specifications live in:
 - Not a replacement for [git-simple-encrypt](https://github.com/orzogc/git-simple-encrypt)
   when confidentiality of structure matters. That tool hides line-level
   patterns; this one deliberately exposes them for diffability.
-- No multi-user key management, no asymmetric recipients, no keyrings.
+- No multi-user key management, no asymmetric recipients, no OS keyring
+  integration.
 - No clean/smudge filters, hooks management, or any git subprocess calls.
 - No protection against an attacker who runs code on the user's machine,
   and no secure deletion of plaintext that ever touched disk.
@@ -81,8 +82,10 @@ This document is the entry point. Detailed specifications live in:
    authentication doubles as the password check — no separate
    verifier). This makes `passwd` and KDF upgrades free of ciphertext
    churn and keeps branches mergeable across them, at a documented
-   cost: `passwd` does not revoke old passwords (`rekey` does,
-   forward-only). Retained ring entries keep pre-`rekey` ciphertext on
+   cost: `passwd` alone does not revoke a compromised old password —
+   only the `passwd` + `rekey` combination does, and only for content
+   encrypted afterwards (`rekey` alone rotates the domain key, not the
+   password). Retained ring entries keep pre-`rekey` ciphertext on
    unmerged branches decryptable until explicitly pruned.
 2. **AES-CMAC-SIV (RFC 5297, AES-256) as the only cipher.**
    Deterministic authenticated encryption with a standardized
@@ -110,7 +113,9 @@ This document is the entry point. Detailed specifications live in:
    to protect, so it additionally carries a deterministic whole-file tag
    that detects chunk splicing while preserving locality (a local edit
    changes one chunk plus the trailer). An authenticated empty-file
-   marker keeps even "truncate to empty" forgeable only with the key.
+   marker gives emptiness the same unit-level authenticity as any
+   content (a historically empty version can still be replayed, like
+   any whole-file rollback).
 6. **No compression.** Keeps the dependency set small, preserves
    binary-mode locality, and avoids ciphertext churn from compressor
    version drift. A flags byte is reserved for the future.
@@ -120,8 +125,9 @@ This document is the entry point. Detailed specifications live in:
    a pre-rename re-check that the target was not concurrently modified.
    Multi-file operations stop at the first error and report what was
    and was not done. `rekey` prepends a fresh key to the ring and
-   migrates each file in memory — plaintext never touches the disk, and
-   an interruption leaves every file decryptable under a ring key.
+   migrates each file in memory — migration never writes decrypted
+   plaintext to disk, and an interruption leaves every file decryptable
+   under a ring key.
 8. **Serial execution, advisory locking.** One process per domain,
    enforced by a non-blocking `flock` on the domain root directory (no
    lock file to commit or ignore, and immune to the config's own

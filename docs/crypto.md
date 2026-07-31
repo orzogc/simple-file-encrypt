@@ -34,7 +34,7 @@ Implementations must use the **raw SIV interface** — in Rust,
 `aes_siv::siv::Aes256Siv`:
 
 ```rust
-let mut siv = Aes256Siv::new(unit_key.into());          // 64-byte key
+let mut siv = Aes256Siv::new((&unit_key).into());       // &[u8; 64] borrow
 let out = siv.encrypt([aad], plaintext)?;               // SIV(16) || CT
 let pt  = siv.decrypt([aad], ciphertext_with_siv)?;
 ```
@@ -76,7 +76,7 @@ kek = Argon2id(password, salt,              |
               m, t, p, out = 64)            |
         |                                   |
         +-----------> wrapped_keys[i] = AES-SIV(kek).encrypt(
-                          ad = AD_WRAP, plaintext = domain_key_i)
+                          ad = AD_WRAP(i), plaintext = domain_key_i)
                       (48 bytes each = SIV(16) || CT(32), hex in config;
                        all entries wrapped under the same current KEK)
 
@@ -92,7 +92,7 @@ file_tag_key = blake3::derive_key(CTX_FILE_TAG, file_km)      # binary only
 Context and associated-data strings (globally unique, frozen for v1):
 
 ```
-AD_WRAP      = "github.com/orzogc/simple-encrypt v1 domain key wrap"
+AD_WRAP(i)   = "github.com/orzogc/simple-encrypt v1 domain key wrap" || le64(i)
 CTX_UNIT     = "github.com/orzogc/simple-encrypt v1 unit key"
 CTX_FILE_TAG = "github.com/orzogc/simple-encrypt v1 binary file tag key"
 AD_TEXT      = "github.com/orzogc/simple-encrypt v1 text unit"
@@ -109,6 +109,13 @@ Notes:
   password fails the SIV authentication. There is no separate verifier.
   A config whose ring entries do not all unwrap under the same KEK is
   corrupt (hard error).
+- The wrap AD binds each entry's **ring position**, so the
+  current-vs-retired role is authenticated: swapping, deleting, or
+  duplicating entries makes them fail to unwrap, and a repository
+  writer cannot silently redirect future encryption to a retired
+  (possibly compromised) key. Splicing entries from an older config
+  generation fails too: `passwd` and `rekey` rotate the salt — and
+  therefore the KEK — on every ring rewrite.
 - Ciphertext is a pure function of `(domain_key, canonical path,
   content)`. The password, salt, and KDF parameters only gate access to
   the domain keys, which is why `passwd` and KDF upgrades never churn
@@ -182,7 +189,7 @@ file_tag = blake3::keyed_hash(
 ```
 
 The tag is deterministic (inputs are), covers the header bytes, and
-binds the exact multiset *and order* of chunks. It preserves locality —
+binds the exact ordered sequence of chunk SIVs. It preserves locality —
 editing one chunk changes that chunk and the trailer only — while
 rejecting substitution of same-index chunks from older versions, which
 per-chunk AD alone cannot detect. Whole-file rollback to a complete
@@ -220,8 +227,8 @@ version of the path can be replayed (a whole-file rollback, see
   |---|---|---|
   | Validity | `parallelism ≥ 1`, `memory_kib ≥ 8 × parallelism`, `iterations ≥ 1` | hard error |
   | Security floor | `memory_kib ≥ 19456` and `iterations ≥ 2` | error unless `--allow-weak-kdf` |
-  | Resource ceiling | `memory_kib ≤ 262144` (256 MiB), `memory_kib × iterations ≤ 2097152` (2 GiB·passes), `parallelism ≤ 4` | error unless `--allow-expensive-kdf` |
-  | Absolute caps | `memory_kib ≤ 4194304` (4 GiB), `memory_kib × iterations ≤ 67108864` (64 GiB·passes), `parallelism ≤ 64` | hard error even with flags |
+  | Resource ceiling | `memory_kib ≤ 262144` (256 MiB), `iterations ≤ 64`, `memory_kib × iterations ≤ 2097152` (2 GiB·passes), `parallelism ≤ 4` | error unless `--allow-expensive-kdf` |
+  | Absolute caps | `memory_kib ≤ 4194304` (4 GiB), `iterations ≤ 1024`, `memory_kib × iterations ≤ 67108864` (64 GiB·passes), `parallelism ≤ 64` | hard error even with flags |
 
   The product is computed with checked arithmetic, and every TOML
   integer is bounds-checked before conversion to the Argon2 parameter

@@ -18,6 +18,14 @@ from a starting directory until a `.simple-encrypt.toml` is found:
   domain root finds the root's own config);
 - without arguments: from the current working directory.
 
+The walk stops at repository boundaries: in each directory the config
+is looked for first, then a `.git` entry (file or directory) — a
+directory that has a `.git` but no config ends the walk with "outside
+any domain". A domain therefore never spans into a nested repository
+(a submodule needs its own `init`), and a config lying outside the
+repository that contains the target is never picked up — the config
+must live in the same repository as its ciphertext.
+
 All targets of one invocation must resolve to the **same** domain; mixing
 domains is an error. A target outside any domain is an error. Explicit
 arguments must lie inside the domain root after canonicalization
@@ -89,13 +97,16 @@ KDF-related global options, honored by every command that runs Argon2:
   worktrees and submodules use a `.git` *file*) — is always skipped and
   cannot be named explicitly. A **subdirectory** containing a `.git`
   entry is a nested-repository boundary: recursion and `init`'s
-  descendant scan do not enter it (noted); the domain root itself is
-  exempt, so a domain rooted in a linked worktree works. Explicit file
-  arguments inside such a subtree are still honored — the boundary
-  governs recursion, not reachability.
-- During expansion the tool also skips the domain config itself and
-  stale `.simple-encrypt.tmp.*` files. Explicitly naming the domain
-  config is an error.
+  descendant scan do not enter it (noted), and explicit arguments
+  inside it resolve to no domain (domain resolution stops at repository
+  boundaries — see above). The domain root itself is exempt, so a
+  domain rooted in a linked worktree works.
+- During expansion the tool also skips the domain config itself, stale
+  `.simple-encrypt.tmp.*` files, and any file named `.gitattributes` or
+  `.gitmodules` — git must read those as plaintext, and encrypting
+  `.gitattributes` would destroy the very `-text` protection the
+  ciphertext depends on. Explicitly naming the domain config, a
+  `.gitattributes`, or a `.gitmodules` is an error.
 - After expansion, targets with the same canonical path (a file named
   directly and again via a covering directory entry) are silently
   deduplicated. Two *different* canonical paths resolving to the same
@@ -171,7 +182,10 @@ no probe hit → skip with a note (or a hard error under
 plaintext or magic-stripped file); a `#simple-encrypt` first line that
 is not an exact v1 header form → hard error; a marker header → decrypts
 to an empty file; otherwise decrypt, trying ring keys in order, with
-authentication, format, or version failures as hard errors.
+authentication, format, or version failures as hard errors. The ring
+key is selected per file (by the first unit); a file whose later units
+stop authenticating may be a mixed-epoch merge artifact (see `rekey`) —
+the error message names this cause.
 
 ## Atomicity and failure semantics
 
@@ -203,7 +217,12 @@ authentication, format, or version failures as hard errors.
   everything and report all findings. There is no rollback — every
   completed file is individually valid, `status` shows the mixed state,
   and git history is the recovery mechanism for anything worse.
-- File timestamps are not preserved; permission bits are.
+- Only Unix permission bits are preserved. Timestamps change, and
+  ownership, POSIX ACLs, extended attributes, security labels
+  (e.g. SELinux), and file flags are not carried over to the new inode
+  created by temp + rename — files that must keep such metadata should
+  not be managed by this tool. Immutable files fail naturally at rename
+  time.
 
 ## Commands
 
@@ -334,7 +353,8 @@ Rotate the domain key — the compromise response. `rekey`:
 3. runs a full `encrypt` pass over the managed list: plaintext files
    are encrypted, old-key ciphertext is migrated — each file decrypted
    in memory and re-encrypted under the new key via atomic replace.
-   **Plaintext never touches the disk at any point.**
+   **Migration never writes decrypted plaintext to disk**; files that
+   already sit as plaintext in the working tree simply get encrypted.
 
 Interruption anywhere is safe: both keys stay in the config, so every
 file remains decryptable, and `rekey --continue` — or a plain
@@ -342,14 +362,27 @@ file remains decryptable, and `rekey --continue` — or a plain
 Missing managed files are reported and left alone; they migrate
 whenever they reappear.
 
-Old ring entries are **kept by default**: ciphertext on other branches,
-in stashes, or in missed files stays decryptable, and merging a
-pre-rekey branch cannot produce undecryptable files. The cost is that
-the current password unlocks every retained epoch. Once all branches
-have converged, `rekey --prune` verifies that every managed encrypted
-file authenticates under the current key and then drops the older
-entries — after which pre-rekey ciphertext is recoverable only through
-historical configs and the passwords of their era.
+Old ring entries are **kept by default**: complete files from any
+retained epoch — on other branches, in stashes, in missed files — stay
+decryptable. One caveat: a *line-level* merge resolution that
+interleaves units from before and after a rekey produces a mixed-epoch
+file that no single key decrypts; the authentication error names this
+cause, and the fix is to re-resolve the merge taking whole files from
+one side (or decrypt both sides first and merge as plaintext). The
+cost of retention is that the current password unlocks every retained
+epoch.
+
+`rekey --prune` drops the older entries once every managed encrypted
+file authenticates under the current key. It hard-errors when any
+exact managed file entry is missing from disk — the file could return
+from a stash or branch still encrypted under an old key; `remove` the
+entry first if it is truly gone (directory entries cover only what
+currently exists, which is all prune can see). Pruning trims the
+**current config only**: configs already committed to git history keep
+the full ring, so it limits what a stolen current checkout exposes,
+not what a history reader with the current password can reach — see
+[threat-model.md](threat-model.md). The command reports how many
+epochs were dropped.
 
 Rotation protects content encrypted afterwards; anyone who holds an old
 password can still read pre-rekey content from git history, and nothing
@@ -392,25 +425,35 @@ end-of-file rewriters) away from them.
 ### Pre-commit hook: check the staged tree
 
 A hook that probes the working tree can be bypassed by staging
-plaintext before encrypting, and cannot see a staged config. Check what
-is actually being committed by exporting the **index** and running
-`check` inside it:
+plaintext before encrypting, and cannot see a staged config. Export the
+**index** and run `check` inside it, once per domain found in the
+export (domains need not sit at the repository root, and one repository
+may hold several sibling domains):
 
 ```bash
 #!/bin/bash
 set -eu
+umask 077
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+trap 'rm -rf -- "$tmp"' EXIT
 git checkout-index --all --prefix="$tmp/"
-(cd "$tmp" && simple-encrypt check)
+while IFS= read -r -d '' cfg; do
+    (cd "$(dirname "$cfg")" && simple-encrypt check) || exit 1
+done < <(find "$tmp" -type f -name .simple-encrypt.toml -print0)
 ```
 
-This checks the staged config and the staged contents together
-(`mktemp -d` creates the directory mode `0700`; staged plaintext
-briefly exists under `$TMPDIR` — point it at a tmpfs if that matters).
-The domain config must itself be tracked for the exported tree to
-contain it — which it must be anyway, since ciphertext is useless
-without it.
+This checks each staged config together with its staged contents, and
+passes when the export contains no domain at all. Note that
+`checkout-index` runs git's checkout conversions: the exported bytes
+equal the index blobs only where managed paths carry `-text` and no
+filters — exactly what the attributes recipe above establishes. With
+misconfigured attributes the gate still judges encryptedness correctly
+(the probe survives EOL noise), but it is no longer examining the
+literal index bytes. `mktemp -d` plus `umask 077` keep the export
+private; staged plaintext briefly exists under `$TMPDIR` — point it at
+a tmpfs if that matters. A domain config must itself be tracked for the
+export to contain it — which it must be anyway, since ciphertext is
+useless without it.
 
 ### Typical flow
 

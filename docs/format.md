@@ -52,7 +52,7 @@ therefore changes its keys: rename in plaintext state.
 ## Domain config: `.simple-encrypt.toml`
 
 ```toml
-# Managed by simple-encrypt. `salt`, `wrapped_key`, and [kdf] are
+# Managed by simple-encrypt. `salt`, `wrapped_keys`, and [kdf] are
 # security-critical: do not edit them by hand.
 version = 1
 
@@ -94,7 +94,9 @@ Validation on load (all failures are hard errors):
 - Unknown keys anywhere in the file are rejected
   (`deny_unknown_fields`), so typos cannot silently disable protection.
 - `salt`: exactly 32 lowercase hex chars. `wrapped_keys`: 1 to 64
-  entries, each exactly 96 lowercase hex chars.
+  entries, each exactly 96 lowercase hex chars; each entry must unwrap
+  under its position-bound associated data (see [crypto.md](crypto.md)),
+  so reordering, dropping, or duplicating entries is detected.
 - `algorithm` must be `"argon2id"`. Parameter tiers (validity floor,
   security floor, resource ceiling): see [crypto.md](crypto.md).
 - Every `paths` / `force_binary` entry must be a valid canonical relative
