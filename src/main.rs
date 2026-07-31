@@ -79,6 +79,9 @@ enum Command {
         /// Files or directories inside the domain.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
+        /// Also mark the paths as `force_binary` (always binary mode).
+        #[arg(long)]
+        binary: bool,
     },
     /// Remove exact entries from the managed list.
     Remove {
@@ -88,6 +91,9 @@ enum Command {
         /// Skip the still-encrypted refusal (the file becomes invisible to `rekey`).
         #[arg(long)]
         force: bool,
+        /// Remove the paths from `force_binary` instead of the managed list.
+        #[arg(long, conflicts_with = "force")]
+        binary: bool,
     },
     /// Report the state of every managed file (no password).
     Status,
@@ -160,8 +166,12 @@ fn main() -> ExitCode {
                     require_encrypted,
                     gate,
                 }),
-                Command::Add { paths } => ops::add(&paths),
-                Command::Remove { paths, force } => ops::remove(&paths, force),
+                Command::Add { paths, binary } => ops::add(&paths, binary),
+                Command::Remove {
+                    paths,
+                    force,
+                    binary,
+                } => ops::remove(&paths, force, binary),
                 Command::Status => ops::status(),
                 Command::Passwd { kdf } => ops::passwd(&ops::PasswdOpts {
                     memory_kib: kdf.memory_kib,

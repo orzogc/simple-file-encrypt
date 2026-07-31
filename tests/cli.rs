@@ -1547,3 +1547,50 @@ fn symlinked_component_above_discovered_root_is_refused() {
     assert_contains(&r.stderr, "crosses the symlink");
     assert_eq!(read_file(&outside.join("subdomain"), "s.txt"), b"data\n");
 }
+
+#[test]
+fn add_and_remove_binary_marks_force_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "data.txt", b"plain text\n");
+    write_file(root, "d/inner.txt", b"inner\n");
+    init_domain(root);
+
+    // add --binary: managed AND marked, status shows the marker.
+    let r = run_nopw(root, &["add", "--binary", "data.txt", "d"]).expect_code(0);
+    assert_contains(&r.stdout, "added data.txt");
+    assert_contains(&r.stdout, "marked data.txt as always-binary");
+    assert_contains(&r.stdout, "marked d as always-binary");
+    let r = run_nopw(root, &["status"]).expect_code(0);
+    assert_contains(&r.stdout, "data.txt [binary]");
+    assert_contains(&r.stdout, "d/inner.txt [binary]");
+
+    // Re-marking is reported, not duplicated.
+    let r = run_nopw(root, &["add", "--binary", "data.txt"]).expect_code(0);
+    assert_contains(&r.stdout, "already managed");
+    assert_contains(&r.stdout, "already marked binary");
+    assert_eq!(read_config(root).matches("data.txt").count(), 2);
+
+    // Text content is encrypted in binary mode anyway.
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    assert!(read_file(root, "data.txt").starts_with(&BIN_MAGIC));
+
+    // remove --binary: unmarked but still managed; the mode reverts
+    // only after a decrypt + encrypt cycle.
+    let r = run_nopw(root, &["remove", "--binary", "data.txt"]).expect_code(0);
+    assert_contains(&r.stdout, "unmarked data.txt");
+    assert_contains(&r.stderr, "not re-encrypted automatically");
+    run_pw(root, PW, &["decrypt"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    assert!(read_file(root, "data.txt").starts_with(TEXT_HEADER.as_bytes()));
+    assert!(read_file(root, "d/inner.txt").starts_with(&BIN_MAGIC));
+
+    // The entry is gone; removing it again errors, and the file stays
+    // managed.
+    let r = run_nopw(root, &["remove", "--binary", "data.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "not a `force_binary` entry");
+    let r = run_nopw(root, &["status"]).expect_code(0);
+    assert_contains(&r.stdout, "encrypted    data.txt");
+    // --binary and --force conflict.
+    run_nopw(root, &["remove", "--binary", "--force", "data.txt"]).expect_code(1);
+}

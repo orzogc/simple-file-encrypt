@@ -19,12 +19,15 @@ fn sweep(domain: &super::Domain, rels: &[String]) {
     );
 }
 
-/// Runs the `add` command: canonicalize and insert entries.
+/// Runs the `add` command: canonicalize and insert entries. With
+/// `binary`, each path is additionally marked `force_binary` (always
+/// encrypted in binary mode), so binary mode needs no hand edit of the
+/// config.
 ///
 /// State-changing lines (`added …`) are printed only after the config
 /// rewrite has been committed, so the output never claims more than the
 /// disk holds.
-pub fn add(arg_paths: &[PathBuf]) -> Result<()> {
+pub fn add(arg_paths: &[PathBuf], binary: bool) -> Result<()> {
     let (mut domain, rels) = super::open_domain(arg_paths, true)?;
     sweep(&domain, &rels);
 
@@ -65,25 +68,37 @@ pub fn add(arg_paths: &[PathBuf]) -> Result<()> {
                     "`{rel}` is already covered by the managed entry `{covering}`"
                 ));
             }
-            continue;
+        } else {
+            // Adding a directory prunes entries it now covers.
+            let covered: Vec<String> = domain
+                .loaded
+                .config
+                .paths
+                .iter()
+                .filter(|e| paths::is_covered_by(e, rel))
+                .cloned()
+                .collect();
+            for e in covered {
+                announcements.push(format!(
+                    "`{e}` is now covered by `{rel}`; dropped the redundant entry"
+                ));
+                domain.loaded.config.paths.retain(|x| *x != e);
+            }
+            super::insert_sorted(&mut domain.loaded.config.paths, rel);
+            announcements.push(format!("added {rel}"));
         }
-        // Adding a directory prunes entries it now covers.
-        let covered: Vec<String> = domain
-            .loaded
-            .config
-            .paths
-            .iter()
-            .filter(|e| paths::is_covered_by(e, rel))
-            .cloned()
-            .collect();
-        for e in covered {
-            announcements.push(format!(
-                "`{e}` is now covered by `{rel}`; dropped the redundant entry"
-            ));
-            domain.loaded.config.paths.retain(|x| *x != e);
+
+        // Binary marking is independent of the managed-list outcome: a
+        // path already managed still needs its mark. Appended at the end
+        // so hand-maintained order is preserved.
+        if binary {
+            if domain.loaded.config.force_binary.contains(rel) {
+                report::out(format!("`{rel}` is already marked binary"));
+            } else {
+                domain.loaded.config.force_binary.push(rel.clone());
+                announcements.push(format!("marked {rel} as always-binary (force_binary)"));
+            }
         }
-        super::insert_sorted(&mut domain.loaded.config.paths, rel);
-        announcements.push(format!("added {rel}"));
     }
     if !announcements.is_empty() {
         domain.loaded.rewrite()?;
@@ -95,9 +110,12 @@ pub fn add(arg_paths: &[PathBuf]) -> Result<()> {
 }
 
 /// Runs the `remove` command: remove exact entries, refusing (without
-/// `--force`) to strand ciphertext. `removed …` lines are printed only
-/// after the config rewrite has been committed.
-pub fn remove(arg_paths: &[PathBuf], force: bool) -> Result<()> {
+/// `--force`) to strand ciphertext. With `--binary`, remove exact
+/// `force_binary` entries instead — the managed list is untouched, so
+/// the file stays managed and simply reverts to automatic mode choice.
+/// `removed …` lines are printed only after the config rewrite has
+/// been committed.
+pub fn remove(arg_paths: &[PathBuf], force: bool, binary: bool) -> Result<()> {
     let (mut domain, rels) = super::open_domain(arg_paths, true)?;
     sweep(&domain, &rels);
 
@@ -107,6 +125,20 @@ pub fn remove(arg_paths: &[PathBuf], force: bool) -> Result<()> {
             return Err(Error::Usage(
                 "the domain root is not a managed entry".into(),
             ));
+        }
+        if binary {
+            if !domain.loaded.config.force_binary.contains(rel) {
+                return Err(Error::Usage(format!(
+                    "`{rel}` is not a `force_binary` entry"
+                )));
+            }
+            domain.loaded.config.force_binary.retain(|e| e != rel);
+            announcements.push(format!("unmarked {rel} as always-binary (force_binary)"));
+            report::warn(format!(
+                "`{rel}` reverts to automatic mode choice; existing binary ciphertext is not \
+                 re-encrypted automatically — decrypt and re-encrypt to change its mode"
+            ));
+            continue;
         }
         if !domain.loaded.config.paths.contains(rel) {
             if let Some(covering) = domain

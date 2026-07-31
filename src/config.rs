@@ -47,8 +47,9 @@ pub struct Config {
     pub kdf: KdfParams,
     /// Managed paths: canonical relative paths, kept sorted and deduplicated.
     pub paths: Vec<String>,
-    /// Hand-maintained binary-mode overrides; never modified by the tool,
-    /// so the loaded order is preserved verbatim on rewrite.
+    /// Binary-mode overrides, hand-maintained or appended by
+    /// `add --binary` / `remove --binary`; the loaded order is
+    /// preserved verbatim on rewrite (the tool only appends/removes).
     pub force_binary: Vec<String>,
 }
 
