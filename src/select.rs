@@ -41,6 +41,18 @@ pub struct TargetFile {
 }
 
 /// The result of expanding one invocation's entries.
+/// A managed path skipped because it is a symlink or special file:
+/// never processed, but scans and key rotation must treat it as
+/// unverified content rather than silently converge past it.
+#[derive(Debug, Clone)]
+pub struct SkippedSpecial {
+    /// Canonical relative path.
+    pub rel: String,
+    /// Whether it is a symlink (vs. another non-regular kind).
+    pub symlink: bool,
+}
+
+/// The result of expanding one invocation's entries.
 #[derive(Debug)]
 pub struct Expanded {
     /// Selected regular files, in ascending canonical-path order.
@@ -54,7 +66,7 @@ pub struct Expanded {
     /// Managed paths skipped because they are symlinks or special
     /// files: never processed, but `rekey --prune` must treat them as
     /// unverified content rather than converge past them.
-    pub skipped_special: Vec<String>,
+    pub skipped_special: Vec<SkippedSpecial>,
     /// Directories to sweep for stale temp files: the domain root, the
     /// parents of all entries, and every directory visited.
     pub sweep_dirs: BTreeSet<PathBuf>,
@@ -110,7 +122,7 @@ struct Expander<'a> {
     files: BTreeMap<String, TargetFile>,
     missing_managed: Vec<String>,
     missing_explicit: Vec<String>,
-    skipped_special: Vec<String>,
+    skipped_special: Vec<SkippedSpecial>,
     sweep_dirs: BTreeSet<PathBuf>,
     count: usize,
     /// Directory entries examined so far (hostile-tree budget).
@@ -172,7 +184,10 @@ impl Expander<'_> {
             ))),
             Origin::Managed => {
                 report::warn(format!("skipping managed path `{rel}`: {kind}"));
-                self.skipped_special.push(rel.to_owned());
+                self.skipped_special.push(SkippedSpecial {
+                    rel: rel.to_owned(),
+                    symlink: ft.is_symlink(),
+                });
                 Ok(())
             }
         }
@@ -191,8 +206,12 @@ impl Expander<'_> {
         };
         for comp in parents.split('/') {
             dir.push(comp);
-            let Ok(md) = dir.symlink_metadata() else {
-                return Ok(()); // Missing prefix: handled as a missing entry.
+            let md = match dir.symlink_metadata() {
+                Ok(md) => md,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(()); // Missing prefix: handled as a missing entry.
+                }
+                Err(e) => return Err(Error::io("inspecting", &dir, e)),
             };
             let ft = md.file_type();
             if ft.is_symlink() {
@@ -319,6 +338,7 @@ impl Expander<'_> {
                         report::escape_path(&child_abs)
                     )));
                 };
+                reject_control_name(&child_abs, &ns)?;
                 let crel = child_rel(&ns);
                 // A subdirectory with a `.git` entry is a nested
                 // repository: never entered.
@@ -345,6 +365,7 @@ impl Expander<'_> {
                 ));
                 continue;
             };
+            reject_control_name(&child_abs, &ns)?;
             // The domain config itself, temp files, and git metadata
             // files are never processed.
             if rel.is_empty() && ns == CONFIG_NAME {
@@ -368,14 +389,34 @@ impl Expander<'_> {
                 self.add_file(&crel, child_abs, child_origin, &md)?;
             } else if md.file_type().is_symlink() {
                 report::warn(format!("skipping `{crel}`: a symlink"));
-                self.skipped_special.push(crel);
+                self.skipped_special.push(SkippedSpecial {
+                    rel: crel,
+                    symlink: true,
+                });
             } else {
                 report::warn(format!("skipping `{crel}`: not a regular file"));
-                self.skipped_special.push(crel);
+                self.skipped_special.push(SkippedSpecial {
+                    rel: crel,
+                    symlink: false,
+                });
             }
         }
         Ok(())
     }
+}
+
+/// A discovered name that contains a control character is a hard
+/// error: it must never reach key derivation, the managed list, or the
+/// output. Minting rejects such names for explicit arguments and
+/// stored entries; recursion applies the same rule to discovered ones.
+fn reject_control_name(abs: &Path, name: &str) -> Result<()> {
+    if paths::has_control(name) {
+        return Err(Error::Usage(format!(
+            "`{}`: a file name contains a control character; simple-encrypt refuses such names",
+            report::escape_path(abs)
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -461,7 +502,22 @@ mod tests {
         // with a warning and recorded, not walked.
         let exp = expand(root, &[("managed".into(), Origin::Managed)]).unwrap();
         assert!(exp.files.is_empty());
-        assert_eq!(exp.skipped_special, ["managed"]);
+        let skipped: Vec<&str> = exp.skipped_special.iter().map(|s| s.rel.as_str()).collect();
+        assert_eq!(skipped, ["managed"]);
+        assert!(exp.skipped_special[0].symlink);
+    }
+
+    #[test]
+    fn discovered_control_char_names_are_hard_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(&root.join("d/evil\nINJECTED"));
+        // Recursion must not mint a control-char path into the file
+        // list — neither via a managed directory nor an explicit one.
+        let err = expand(root, &[("d".into(), Origin::Managed)]).unwrap_err();
+        assert!(err.to_string().contains("control character"), "got: {err}");
+        let err = expand(root, &[("d".into(), Origin::Explicit { named: true })]).unwrap_err();
+        assert!(err.to_string().contains("control character"), "got: {err}");
     }
 
     #[test]

@@ -1,5 +1,8 @@
 //! `init`: create a fresh domain config in the current directory
-//! (see `docs/cli.md`). Needs no lock: `O_EXCL` is the guard.
+//! (see `docs/cli.md`). Inside a repository it takes an exclusive lock
+//! on the repository root across the nesting re-check and the `O_EXCL`
+//! create, so two concurrent `init`s cannot create nested domains;
+//! outside a repository `O_EXCL` is the only guard (documented).
 
 use std::path::{Path, PathBuf};
 
@@ -7,7 +10,7 @@ use crate::config::{self, Config};
 use crate::consts::{CONFIG_NAME, MAX_SCANNED_ENTRIES, MAX_WALK_DEPTH};
 use crate::crypto::{self, KdfGate, KdfParams};
 use crate::error::{Error, Result};
-use crate::{paths, pwinput, report};
+use crate::{fsops, paths, pwinput, report};
 
 /// Options of the `init` command.
 pub struct InitOpts {
@@ -68,15 +71,11 @@ fn find_descendant_config(
     Ok(None)
 }
 
-/// Runs the `init` command.
-pub fn init(opts: &InitOpts) -> Result<()> {
-    let cwd =
-        std::env::current_dir().map_err(|e| Error::io("resolving", "current directory", e))?;
-
-    // Refuse nested domains: an ancestor scan with the same
-    // repository-boundary rule as domain resolution, then a descendant
-    // scan that skips nested repositories.
-    if let Some(existing) = paths::discover_domain(&cwd) {
+/// Refuses when a domain already exists above or below `cwd`: an
+/// ancestor scan with the same repository-boundary rule as domain
+/// resolution, then a descendant scan that skips nested repositories.
+fn refuse_nested_domains(cwd: &Path) -> Result<()> {
+    if let Some(existing) = paths::discover_domain(cwd) {
         if existing == cwd {
             return Err(Error::Usage(format!(
                 "`{CONFIG_NAME}` already exists in this directory"
@@ -87,13 +86,54 @@ pub fn init(opts: &InitOpts) -> Result<()> {
             report::escape_path(&existing)
         )));
     }
-    if let Some(found) = find_descendant_config(&cwd, 0, &mut 0)? {
+    if let Some(found) = find_descendant_config(cwd, 0, &mut 0)? {
         return Err(Error::Usage(format!(
             "a domain config already exists below this directory, at `{}`; \
              nested domains are not supported within one repository",
             report::escape_path(&found)
         )));
     }
+    Ok(())
+}
+
+/// The nearest ancestor of `start` containing a `.git` entry (file or
+/// directory), if any: the repository whose root coordinates `init`.
+fn find_repo_root(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.to_path_buf();
+    loop {
+        if dir.join(".git").symlink_metadata().is_ok() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Creates the config, serializing against a concurrent `init` anywhere
+/// else in the same repository: two of them could otherwise both pass
+/// the nesting scans (one in an ancestor, one in a descendant) and
+/// create nested domains. The lock is taken only after the interactive
+/// part, and the nesting check is repeated under it. Outside a
+/// repository there is no shared lock point and the residual race is
+/// documented; `O_EXCL` still guards the config file itself.
+fn create_config(cwd: &Path, cfg: &Config) -> Result<()> {
+    let Some(repo_root) = find_repo_root(cwd) else {
+        return config::create_new(cwd, cfg);
+    };
+    let _guard = fsops::lock_dir(&repo_root, true)?;
+    refuse_nested_domains(cwd)?;
+    config::create_new(cwd, cfg)
+}
+
+/// Runs the `init` command.
+pub fn init(opts: &InitOpts) -> Result<()> {
+    let cwd =
+        std::env::current_dir().map_err(|e| Error::io("resolving", "current directory", e))?;
+
+    // Pre-scan for a good early error; the authoritative re-check
+    // happens under the lock in `create_config`.
+    refuse_nested_domains(&cwd)?;
 
     let kdf = super::merge_kdf_overrides(
         &KdfParams::DEFAULT,
@@ -114,7 +154,7 @@ pub fn init(opts: &InitOpts) -> Result<()> {
         paths: Vec::new(),
         force_binary: Vec::new(),
     };
-    config::create_new(&cwd, &cfg)?;
+    create_config(&cwd, &cfg)?;
     report::out(format!(
         "initialized `{}`",
         report::escape_path(&cwd.join(CONFIG_NAME))

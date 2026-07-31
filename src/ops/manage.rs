@@ -37,9 +37,10 @@ pub fn add(arg_paths: &[PathBuf]) -> Result<()> {
         }
         let abs = domain.root().join(rel);
         match abs.symlink_metadata() {
-            Err(_) => report::warn(format!(
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => report::warn(format!(
                 "`{rel}` does not exist on disk (yet); adding it anyway"
             )),
+            Err(e) => return Err(Error::io("inspecting", &abs, e)),
             Ok(md) if !md.is_file() && !md.is_dir() => {
                 report::warn(format!(
                     "`{rel}` is not a regular file or directory; it will be skipped when encrypting"

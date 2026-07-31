@@ -324,13 +324,26 @@ impl LoadedConfig {
     /// Atomically rewrites the config with the current in-memory state,
     /// refusing if the file changed since it was loaded or if the result
     /// would violate a load-time cap.
+    ///
+    /// The rename is the commit point, but durability matters here: a
+    /// crash that rolls the config rename back while already-migrated
+    /// files persist would strand ciphertext no on-disk config can
+    /// decrypt. When durability (or the read-back) is unconfirmed, the
+    /// rewrite reports failure so dependent work stops — the new config
+    /// is nonetheless visible, and re-running resumes from it.
     pub fn rewrite(&mut self) -> Result<()> {
         let rendered = render_checked(&self.config)?;
-        self.snap = fsops::atomic_replace(
-            &self.root.join(CONFIG_NAME),
-            &self.snap,
-            rendered.as_bytes(),
-        )?;
+        let path = self.root.join(CONFIG_NAME);
+        let replaced = fsops::atomic_replace(&path, &self.snap, rendered.as_bytes())?;
+        if !replaced.durable || replaced.snap.is_none() {
+            return Err(Error::Usage(format!(
+                "the config `{}` was replaced, but its post-commit state could not be confirmed \
+                 (see the warnings above); nothing that depends on the new config was written — \
+                 re-run the command to resume from the visible config",
+                crate::report::escape_path(&path)
+            )));
+        }
+        self.snap = replaced.snap.expect("checked above");
         self.config.paths.sort_unstable();
         self.config.paths.dedup();
         Ok(())
@@ -445,6 +458,25 @@ mod tests {
         let cfg = sample();
         create_new(dir.path(), &cfg).unwrap();
         assert!(load(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn rewrite_aborts_when_durability_is_unconfirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = sample();
+        create_new(dir.path(), &cfg).unwrap();
+        let mut loaded = load(dir.path()).unwrap();
+        loaded.config.paths.push("x.txt".into());
+
+        fsops::set_injected_sync_failure(true);
+        let err = loaded.rewrite().unwrap_err();
+        fsops::set_injected_sync_failure(false);
+
+        // The caller must stop, but the new config is nonetheless
+        // visible on disk: a retry resumes from it.
+        assert!(err.to_string().contains("re-run"), "got: {err}");
+        let reloaded = load(dir.path()).unwrap();
+        assert!(reloaded.config.paths.contains(&"x.txt".to_owned()));
     }
 
     #[test]

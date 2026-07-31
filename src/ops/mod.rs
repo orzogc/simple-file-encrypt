@@ -79,6 +79,19 @@ pub fn open_domain(args: &[PathBuf], exclusive: bool) -> Result<(Domain, Vec<Str
     let root = root.ok_or_else(|| {
         Error::Usage("not inside a simple-encrypt domain (no `.simple-encrypt.toml` found up to the repository boundary)".into())
     })?;
+    // The discovered root must be a real directory: a symlinked root
+    // would make the lexical containment checks of `mint` meaningless
+    // (they cover only components *below* the root). Ancestors of the
+    // root itself are the user's own environment (e.g. a symlinked
+    // home or /tmp) and are not policed.
+    let root_md =
+        std::fs::symlink_metadata(&root).map_err(|e| Error::io("inspecting", &root, e))?;
+    if root_md.file_type().is_symlink() {
+        return Err(Error::Usage(format!(
+            "the domain root `{}` is itself a symlink; resolve it to the real directory and run from there",
+            report::escape_path(&root)
+        )));
+    }
     let lock = fsops::lock_dir(&root, exclusive)?;
     let loaded = config::load(&root)?;
 

@@ -180,11 +180,12 @@ pub fn mint(root: &Path, abs: &Path) -> Result<String> {
         } else {
             let candidate = cur.join(&typed);
             match candidate.symlink_metadata() {
-                Err(_) => {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     // Not found: keep the typed spelling from here on.
                     missing = true;
                     typed
                 }
+                Err(e) => return Err(Error::io("inspecting", &candidate, e)),
                 Ok(md) if md.file_type().is_symlink() => {
                     return Err(Error::Usage(format!(
                         "`{}` is or contains a symlink (`{}`); simple-encrypt refuses symlinked targets",

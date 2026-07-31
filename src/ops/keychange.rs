@@ -92,6 +92,16 @@ pub fn rekey(mode: RekeyMode, gate: &KdfGate) -> Result<()> {
             return prune(&mut domain, &password, gate, &keys, &expanded);
         }
         RekeyMode::Continue => {
+            // Content that exists but could not be verified (a symlink
+            // or special managed path) blocks convergence, exactly as
+            // in --prune.
+            if let Some(skipped) = expanded.skipped_special.first() {
+                return Err(Error::Usage(format!(
+                    "managed path `{}` is a symlink or special file and was skipped, so its content \
+                     was never verified — resolve it (or `remove` the covering entry) first",
+                    skipped.rel
+                )));
+            }
             for missing in &expanded.missing_managed {
                 report::warn(format!(
                     "managed path `{missing}` is missing; it will migrate when it reappears"
@@ -103,7 +113,14 @@ pub fn rekey(mode: RekeyMode, gate: &KdfGate) -> Result<()> {
             // rotation is finished only when everything fully
             // authenticates under the current key.
             ensure_all_current(&keys, &expanded.files)?;
-            report::out("rotation complete: every managed ciphertext uses the current key");
+            if expanded.missing_managed.is_empty() {
+                report::out("rotation complete: every managed ciphertext uses the current key");
+            } else {
+                report::out(
+                    "rotation complete for everything on disk; \
+                     missing managed paths will migrate when they reappear",
+                );
+            }
             return Ok(());
         }
         RekeyMode::Fresh => {}
@@ -149,9 +166,11 @@ pub fn rekey(mode: RekeyMode, gate: &KdfGate) -> Result<()> {
     super::encrypt_pass(&mut domain, &new_keys, &expanded.files, false, false)
 }
 
-/// Finds a managed file that authenticates under a non-current ring
-/// key, if any. Authentication failures are hard errors: rotation must
-/// not proceed over broken ciphertext.
+/// Finds a managed file whose first unit authenticates under a
+/// non-current ring key, if any. First-unit authentication failures
+/// are hard errors here; damage deeper in a file is only discovered
+/// during the migration pass (after the new ring entry is safely
+/// committed), never silently skipped.
 fn find_old_epoch_file(keys: &[crypto::DomainKey], files: &[TargetFile]) -> Result<Option<String>> {
     for file in files {
         let data = fsops::read_capped(&file.abs, crate::consts::MAX_FILE_SIZE, "file")?;
@@ -226,18 +245,25 @@ fn prune(
     keys: &[crypto::DomainKey],
     expanded: &select::Expanded,
 ) -> Result<()> {
+    // Nothing to drop: no convergence check is needed at all.
+    let dropped = domain.loaded.config.wrapped_keys.len() - 1;
+    if dropped == 0 {
+        report::out("the key ring already has a single entry; nothing to prune");
+        return Ok(());
+    }
     // Every exact managed entry — file or directory — must exist on
     // disk: the path could return from a stash or branch still
     // encrypted under an old key.
     for entry in &domain.loaded.config.paths {
         let abs = domain.root().join(entry);
         match abs.symlink_metadata() {
-            Err(_) => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Error::Usage(format!(
                     "managed path `{entry}` is missing from disk; it could return from a stash or branch \
                      still encrypted under an old key — `remove` the entry first if it is truly gone"
                 )));
             }
+            Err(e) => return Err(Error::io("inspecting", &abs, e)),
             Ok(md) if !md.file_type().is_file() && !md.file_type().is_dir() => {
                 return Err(Error::Usage(format!(
                     "managed path `{entry}` is a symlink or special file, so its content was never \
@@ -251,8 +277,9 @@ fn prune(
     // must not converge past them.
     if let Some(skipped) = expanded.skipped_special.first() {
         return Err(Error::Usage(format!(
-            "managed path `{skipped}` is a symlink or special file and was skipped, so its content \
-             was never verified — resolve it (or `remove` the covering entry) before pruning"
+            "managed path `{}` is a symlink or special file and was skipped, so its content \
+             was never verified — resolve it (or `remove` the covering entry) before pruning",
+            skipped.rel
         )));
     }
     // Every managed encrypted file must fully authenticate under the
@@ -265,11 +292,6 @@ fn prune(
         }
     })?;
 
-    let dropped = domain.loaded.config.wrapped_keys.len() - 1;
-    if dropped == 0 {
-        report::out("the key ring already has a single entry; nothing to prune");
-        return Ok(());
-    }
     let retained = vec![keys[0].clone()];
     let salt = crypto::random_salt()?;
     let kek = super::derive_kek_checked(password, &salt, &domain.loaded.config.kdf, gate)?;

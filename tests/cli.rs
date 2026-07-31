@@ -1366,3 +1366,135 @@ fn overlong_password_input_is_bounded() {
     let r = run(c).expect_code(2);
     assert_contains(&r.stderr, "4096");
 }
+
+#[test]
+fn discovered_control_char_names_are_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_domain(root);
+    write_file(root, "d/evil\nINJECTED", b"x\n");
+
+    // A managed directory walk must not mint the name into a canonical
+    // path (key derivation and output would both be poisoned).
+    run_nopw(root, &["add", "d"]).expect_code(0);
+    let r = run_pw(root, PW, &["encrypt"]).expect_code(1);
+    assert_contains(&r.stderr, "control character");
+    assert!(
+        !r.stderr.contains("evil\nINJECTED"),
+        "raw injection: {}",
+        r.stderr
+    );
+
+    // An explicit directory walk fails the same way.
+    let r = run_pw(root, PW, &["encrypt", "d"]).expect_code(1);
+    assert_contains(&r.stderr, "control character");
+}
+
+#[test]
+fn scans_and_continue_report_skipped_special_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "s.txt", b"data\n");
+    init_domain(root);
+    run_pw(root, PW, &["encrypt", "s.txt"]).expect_code(0);
+    run_pw(root, PW, &["rekey"]).expect_code(0);
+
+    // Replace the managed file with a symlink: content now unverifiable.
+    fs::remove_file(root.join("s.txt")).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", root.join("s.txt")).unwrap();
+
+    // status names the state in its report (exit stays 0: report, not gate).
+    let r = run_nopw(root, &["status"]).expect_code(0);
+    assert_contains(&r.stdout, "symlink");
+    assert_contains(&r.stdout, "s.txt");
+
+    // check must not pass a gate over unverifiable managed content.
+    let r = run_nopw(root, &["check"]).expect_code(1);
+    assert_contains(&r.stdout, "symlink");
+    assert_contains(&r.stdout, "s.txt");
+
+    // verify fails it explicitly.
+    let r = run_pw(root, PW, &["verify"]).expect_code(1);
+    assert_contains(&r.stdout, "FAILED s.txt");
+
+    // --continue must not claim the rotation is complete.
+    let r = run_pw(root, PW, &["rekey", "--continue"]).expect_code(1);
+    assert_contains(&r.stderr, "never verified");
+
+    // A symlink *child* inside a managed directory is caught the same way.
+    write_file(root, "sub/real.txt", b"real\n");
+    run_nopw(root, &["add", "sub"]).expect_code(0);
+    std::os::unix::fs::symlink("/etc/passwd", root.join("sub/link.txt")).unwrap();
+    let r = run_nopw(root, &["check"]).expect_code(1);
+    assert_contains(&r.stdout, "sub/link.txt");
+}
+
+#[test]
+fn prune_with_single_entry_ring_short_circuits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "f.txt", b"x\n");
+    init_domain(root);
+    // A missing managed entry does not matter when there is nothing to
+    // prune: no convergence check runs at all.
+    run_nopw(root, &["add", "gone.txt"]).expect_code(0);
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(0);
+    assert_contains(&r.stdout, "nothing to prune");
+}
+
+#[test]
+fn symlinked_domain_root_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real-domain");
+    let caller = tmp.path().join("caller");
+    fs::create_dir_all(&real).unwrap();
+    fs::create_dir_all(&caller).unwrap();
+    write_file(&real, "s.txt", b"data\n");
+    init_domain(&real);
+    std::os::unix::fs::symlink(&real, caller.join("alias")).unwrap();
+
+    // An explicit argument reaching the domain through a symlinked
+    // root must be refused, not followed into the other domain.
+    let r = run_pw(&caller, PW, &["encrypt", "alias/s.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "is itself a symlink");
+    // The file was not touched.
+    assert_eq!(read_file(&real, "s.txt"), b"data\n");
+}
+
+#[test]
+fn concurrent_parent_child_init_never_nests() {
+    for _ in 0..10 {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+
+        let spawn_init = |dir: &Path| {
+            std::process::Command::new(env!("CARGO_BIN_EXE_simple-encrypt"))
+                .args([
+                    "--allow-weak-kdf",
+                    "init",
+                    "--memory-kib",
+                    "8",
+                    "--iterations",
+                    "1",
+                ])
+                .current_dir(dir)
+                .env("SIMPLE_ENCRYPT_PASSWORD", PW)
+                .env_remove("SIMPLE_ENCRYPT_NEW_PASSWORD")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let mut pa = spawn_init(root);
+        let mut pb = spawn_init(&root.join("sub"));
+        let _ = pa.wait().unwrap();
+        let _ = pb.wait().unwrap();
+        let configs = [root.join(CONFIG), root.join("sub").join(CONFIG)]
+            .iter()
+            .filter(|p| p.exists())
+            .count();
+        assert!(configs <= 1, "nested domains were created concurrently");
+    }
+}

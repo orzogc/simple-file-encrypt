@@ -66,6 +66,14 @@ pub fn status() -> Result<()> {
             ),
         ));
     }
+    for skipped in &expanded.skipped_special {
+        let state = if skipped.symlink {
+            "symlink    "
+        } else {
+            "special    "
+        };
+        lines.push((skipped.rel.clone(), format!("{state} {}", skipped.rel)));
+    }
     for file in &expanded.files {
         let prefix = fsops::read_prefix(&file.abs, 64)?;
         let p = probe(&prefix);
@@ -120,6 +128,17 @@ pub fn check(arg_paths: &[PathBuf]) -> Result<ScanOutcome> {
             },
         }
     }
+    // A managed path that exists only as a symlink or special file was
+    // never probed: it cannot count as encrypted for the gate.
+    for skipped in &expanded.skipped_special {
+        violations += 1;
+        let state = if skipped.symlink {
+            "symlink    "
+        } else {
+            "special    "
+        };
+        report::out(format!("{state} {}", skipped.rel));
+    }
     Ok(if operational > 0 {
         ScanOutcome::Operational
     } else if violations > 0 {
@@ -148,6 +167,20 @@ pub fn verify(arg_paths: &[PathBuf], gate: &KdfGate) -> Result<ScanOutcome> {
     }
     let mut failures = 0usize;
     let mut operational = 0usize;
+    // A managed path that exists only as a symlink or special file has
+    // no authenticatable content: it is a failure, not a skip.
+    for skipped in &expanded.skipped_special {
+        failures += 1;
+        report::out(format!(
+            "FAILED {}: managed path is {} and cannot be authenticated",
+            skipped.rel,
+            if skipped.symlink {
+                "a symlink"
+            } else {
+                "not a regular file"
+            }
+        ));
+    }
     for file in &expanded.files {
         let result =
             fsops::read_capped(&file.abs, crate::consts::MAX_FILE_SIZE, "file").and_then(|data| {

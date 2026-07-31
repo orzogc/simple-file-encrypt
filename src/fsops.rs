@@ -226,16 +226,31 @@ fn fsync_dir(dir: &Path) -> Result<()> {
         .map_err(|e| Error::io("fsyncing directory", dir, e))
 }
 
+/// The outcome of a committed rename (see [`atomic_replace`]): the new
+/// content is visible; this reports how much of the post-commit work
+/// succeeded so callers can decide what may depend on it.
+#[derive(Debug)]
+pub struct Replaced {
+    /// Snapshot of the new file; `None` when even the read-back failed.
+    pub snap: Option<Snapshot>,
+    /// Whether every durability step (file fsync, directory fsync)
+    /// succeeded. `false` means a crash may roll the rename back, so
+    /// dependent writes must not proceed on the assumption it sticks.
+    pub durable: bool,
+}
+
 /// Atomically replaces `path` with `content` via a `0600` temp file:
 /// write, fsync, re-check that the target is still the file described
 /// by `expect`, rename while still `0600`, restore the original
 /// permission bits through the open descriptor, fsync again, fsync the
-/// directory. Returns the new file's snapshot.
+/// directory.
 ///
-/// The rename is the commit point: a failure after it (chmod, fsync)
-/// is a loud warning, not an error, because the content is already
-/// visible — reporting the file as untouched would be a lie.
-pub fn atomic_replace(path: &Path, expect: &Snapshot, content: &[u8]) -> Result<Snapshot> {
+/// The rename is the commit point: a failure after it (chmod, fsync,
+/// read-back) is a loud warning folded into the returned [`Replaced`],
+/// not an error, because the content is already visible — reporting
+/// the file as untouched would be a lie. Callers whose invariants
+/// depend on durability (the config) must check `durable`.
+pub fn atomic_replace(path: &Path, expect: &Snapshot, content: &[u8]) -> Result<Replaced> {
     let dir = path.parent().ok_or_else(|| {
         Error::Usage(format!(
             "`{}` has no parent directory",
@@ -277,23 +292,79 @@ pub fn atomic_replace(path: &Path, expect: &Snapshot, content: &[u8]) -> Result<
             report::escape_path(path)
         ));
     }
-    if let Err(e) = file.sync_all() {
+    let mut durable = true;
+    if let Err(e) = sync_committed_file(&file) {
+        durable = false;
         report::warn(format!(
             "`{}` was replaced, but fsyncing it failed: {e}; a crash may lose the new content",
             report::escape_path(path)
         ));
     }
-    if let Err(e) = fsync_dir(dir) {
+    if let Err(e) = sync_committed_dir(dir) {
+        durable = false;
         report::warn(format!(
             "`{}` was replaced, but fsyncing its directory failed: {e}; a crash may lose the new content",
             report::escape_path(path)
         ));
     }
-    Ok(Snapshot::of(
-        &file
-            .metadata()
-            .map_err(|e| Error::io("inspecting", path, e))?,
-    ))
+    let snap = match file.metadata() {
+        Ok(md) => Some(Snapshot::of(&md)),
+        Err(e) => {
+            report::warn(format!(
+                "`{}` was replaced, but reading its new state back failed: {e}",
+                report::escape_path(path)
+            ));
+            None
+        }
+    };
+    Ok(Replaced { snap, durable })
+}
+
+/// Post-commit fsync of the replaced file, with the test-only fault
+/// injection point for the durability paths.
+fn sync_committed_file(file: &File) -> std::io::Result<()> {
+    if injected_sync_failure() {
+        return Err(std::io::Error::other("injected fsync failure"));
+    }
+    file.sync_all()
+}
+
+/// Post-commit fsync of the containing directory, with the test-only
+/// fault injection point for the durability paths.
+fn sync_committed_dir(dir: &Path) -> Result<()> {
+    if injected_sync_failure() {
+        return Err(Error::io(
+            "fsyncing directory",
+            dir,
+            std::io::Error::other("injected fsync failure"),
+        ));
+    }
+    fsync_dir(dir)
+}
+
+/// Whether a post-commit sync should artificially fail (tests only).
+/// Thread-local so parallel tests never inject into each other.
+#[cfg(test)]
+fn injected_sync_failure() -> bool {
+    INJECT_SYNC_FAILURE.with(std::cell::Cell::get)
+}
+
+/// Always `false` in non-test builds: no injection machinery remains.
+#[cfg(not(test))]
+fn injected_sync_failure() -> bool {
+    false
+}
+
+#[cfg(test)]
+thread_local! {
+    static INJECT_SYNC_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arms (or disarms) artificial failure of the post-commit fsyncs on
+/// the current thread, for durability-path tests.
+#[cfg(test)]
+pub(crate) fn set_injected_sync_failure(fail: bool) {
+    INJECT_SYNC_FAILURE.with(|f| f.set(fail));
 }
 
 /// Creates `path` exclusively (`O_EXCL`) with the given content and
@@ -483,10 +554,11 @@ mod tests {
         std::fs::set_permissions(&target, Permissions::from_mode(0o640)).unwrap();
         let read = read_capped(&target, 1024, "file").unwrap();
 
-        let snap = atomic_replace(&target, &read.snap, b"new").unwrap();
+        let replaced = atomic_replace(&target, &read.snap, b"new").unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"new");
         assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o7777, 0o640);
-        assert_eq!(snap.size, 3);
+        assert!(replaced.durable);
+        assert_eq!(replaced.snap.expect("read-back succeeds").size, 3);
 
         // A concurrent modification after the read fails the replace.
         let read = read_capped(&target, 1024, "file").unwrap();
@@ -496,6 +568,23 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"concurrent change");
         // No temp file leaks.
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn post_commit_sync_failure_marks_the_outcome_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("t.txt");
+        std::fs::write(&target, b"old").unwrap();
+        let read = read_capped(&target, 1024, "file").unwrap();
+
+        set_injected_sync_failure(true);
+        let replaced = atomic_replace(&target, &read.snap, b"new").unwrap();
+        set_injected_sync_failure(false);
+
+        // The rename committed; only durability is unconfirmed.
+        assert!(!replaced.durable);
+        assert!(replaced.snap.is_some());
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
     }
 
     #[test]
