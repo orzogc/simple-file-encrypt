@@ -32,10 +32,12 @@ arguments must lie inside the domain root after canonicalization
 (containment checks are lexical; spellings come from directory
 enumeration — see [format.md](format.md)); an explicit argument that is
 a symlink — or any of whose components is detected to be one — is an
-error. Managed entries from the config are re-checked on every run: if
-any directory between the domain root and a stored entry has become a
-symlink, the command refuses to follow it instead of operating outside
-the domain.
+error. The discovered domain root itself must not be a symlink either
+(the checks below cover only components *under* it); ancestors of the
+root are the user's own environment and are not policed. Managed
+entries from the config are re-checked on every run: if any directory
+between the domain root and a stored entry has become a symlink, the
+command refuses to follow it instead of operating outside the domain.
 
 Nested domains are rejected within one repository: `init` refuses when
 the current directory, an ancestor, or a descendant directory already
@@ -56,8 +58,13 @@ exclusive for anything that may write — `encrypt`, `decrypt`, `add`,
 lock stays valid across config rewrites (a lock on the config file
 itself would be stranded on the old inode the moment the file is
 rename-replaced). The lock is non-blocking: if another instance holds
-it, the command fails with a clear message. `init` needs no lock: it
-creates the config with `O_EXCL`. Advisory locks may be ineffective on
+it, the command fails with a clear message. `init` creates the config
+with `O_EXCL`, and inside a repository additionally takes the exclusive
+lock on the **repository root** across its nesting re-check and the
+create, so two concurrent `init`s (e.g. one in a parent directory, one
+in a child) cannot both succeed and create nested domains; outside a
+repository there is no shared lock point and that residual race is
+accepted. Advisory locks may be ineffective on
 some network filesystems; do not run concurrent instances there. The
 lock excludes other simple-encrypt instances only — see the
 mid-operation re-validation below for other programs.
@@ -88,7 +95,8 @@ used as the exact bytes supplied — no Unicode normalization
 (see [crypto.md](crypto.md)). The stdin reader is itself bounded: it
 stops just past the limit instead of buffering an unbounded stream
 first. The password is checked by unwrapping the key ring before any
-file is touched; a mismatch aborts immediately.
+managed target or ciphertext is touched (stale-temp sweeping may run
+earlier); a mismatch aborts immediately.
 
 KDF-related global options, honored by every command that runs Argon2:
 `--allow-weak-kdf` and `--allow-expensive-kdf`
@@ -104,9 +112,9 @@ KDF-related global options, honored by every command that runs Argon2:
   128 levels of nesting, so hostile trees cannot exhaust memory or time
   before the file cap applies.
 - Canonical paths never contain control characters (see
-  [format.md](format.md)); a target whose name contains one is an
-  error, and any path the tool prints is control-character-escaped
-  regardless.
+  [format.md](format.md)); a target or recursively discovered name
+  containing one is a hard error, and any path the tool prints is
+  control-character-escaped regardless.
 - Only **regular files** are processed. During recursion, FIFOs,
   sockets, device nodes, and symlinks are skipped with a warning;
   naming one explicitly is an error.
@@ -223,7 +231,12 @@ the error message names this cause.
   has happened the content is committed: a failure in the later steps
   (chmod, fsync) is reported as a **warning naming what did happen**
   (permissions left at `0600`, durability uncertain), never as if the
-  file were still in its old state.
+  file were still in its old state. For the config specifically, an
+  unconfirmed post-commit state additionally **aborts the command
+  before any dependent ciphertext is written**: a crash may roll the
+  config rename back, and files migrated to a key the rolled-back
+  config does not hold would be undecryptable — re-running resumes
+  from the visible config.
 - Immediately before the rename, the tool re-checks that the target is
   still the file it read: same `(device, inode)`, size, and mtime. A
   mismatch (an editor or build tool rewrote it mid-operation) fails
@@ -308,18 +321,21 @@ the covering entry).
 ### `status`
 
 For every managed file (directories expanded), print its state —
-`encrypted`, `plaintext`, `missing`, or `unrecognized` (a
-`#simple-encrypt`-prefixed first line that is no exact v1 header) —
-plus a `binary` marker where `force_binary` applies or the stored mode
-is binary. Needs no password. Exit code 0 regardless of states (it is a
-report, not a gate); an I/O error while probing aborts with exit 1.
+`encrypted`, `plaintext`, `missing`, `symlink`/`special` (a managed
+path that exists only as a symlink or other non-regular file), or
+`unrecognized` (a `#simple-encrypt`-prefixed first line that is no
+exact v1 header) — plus a `binary` marker where `force_binary` applies
+or the stored mode is binary. Needs no password. Exit code 0
+regardless of states (it is a report, not a gate); an I/O error while
+probing aborts with exit 1.
 
 ### `check [PATHS…]`
 
 Gate for CI and hooks: exit 0 when every managed file that exists on
 disk is encrypted (probe only — `check` needs no password and therefore
 cannot verify decryptability), exit 1 listing every offender (plaintext,
-or an unrecognized `#simple-encrypt`-prefixed header), exit 2 on
+a symlink or special managed path — its content was never probed — or
+an unrecognized `#simple-encrypt`-prefixed header), exit 2 on
 operational errors. With arguments, the given files and directories are
 checked instead, managed or not. Missing files are ignored.
 
@@ -336,12 +352,13 @@ ring, then decrypt every managed encrypted file (or the given paths) in
 memory, verifying every unit and, for binary files, the file tag.
 `verify` judges the authenticity of files that probe as encrypted:
 plaintext and missing files are reported but do **not** affect the exit
-code; unrecognized headers and authentication failures are recorded as
-failures and the scan continues; files that authenticate only under an
-older ring key are reported as pending migration (authentic — exit 0).
-Exit 0 when all encrypted files authenticate, exit 1 listing every
-failure, exit 2 on operational errors. The complete CI gate is
-`check && verify`: encryptedness and authenticity. This is also the
+code; symlink or special managed paths, unrecognized headers, and
+authentication failures are recorded as failures and the scan
+continues; files that authenticate only under an older ring key are
+reported as pending migration (authentic — exit 0). Exit 0 when all
+encrypted files authenticate, exit 1 listing every failure, exit 2 on
+operational errors. The complete CI gate is `check && verify`:
+encryptedness and authenticity. This is also the
 command that detects deep corruption (`encrypt`'s skip check only
 authenticates the first unit).
 
@@ -378,9 +395,12 @@ key. If the **password** may be compromised, run `passwd` first;
 `rekey` alone never changes the password. `rekey`:
 
 1. unwraps the ring and scans for an unfinished rotation (any managed
-   file still authenticating under a non-current ring key); if one is
-   found, it refuses to mint another key — rerun as `rekey --continue`
-   to resume the existing rotation instead;
+   file whose first unit authenticates under a non-current ring key);
+   if one is found, it refuses to mint another key — rerun as
+   `rekey --continue` to resume the existing rotation instead. The
+   scan authenticates first units only; damage deeper in a file
+   surfaces as an error during the migration pass (after the new ring
+   entry is safely committed), never as a silent skip;
 2. generates a fresh domain key and salt and atomically rewrites the
    config with the new key prepended to `wrapped_keys` (every entry
    re-wrapped under the new salt's KEK);
@@ -399,7 +419,9 @@ whenever they reappear. After its migration pass, `rekey --continue`
 before reporting success: skip decisions authenticate only the first
 unit, so a mixed-epoch or deeply damaged file would otherwise pass
 silently. A file that fails this bar needs manual resolution (the error
-says so) — `--continue` never loops advice with `--prune`.
+says so) — `--continue` never loops advice with `--prune`. It likewise
+refuses to declare completion while a managed path exists only as a
+symlink or special file: its content was never verified.
 
 Old ring entries are **kept by default**: complete files from any
 retained epoch — on other branches, in stashes, in missed files — stay

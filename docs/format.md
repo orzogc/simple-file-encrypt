@@ -253,6 +253,8 @@ Hostile inputs must exhaust neither memory nor CPU. Hard limits
 | Single decoded unit | 64 MiB + 16 | decrypt |
 | Units (lines) per text file | 4194304 (2²²) | encrypt and decrypt (the error suggests `force_binary`) |
 | Files per operation (after expansion) | 65536 | all commands |
+| Directory entries examined per expansion or `init` scan | 1048576 (2²⁰) | expansion, `init` descendant scan |
+| Directory recursion depth | 128 | expansion, `init` descendant scan |
 | Config file size | 1 MiB | config load |
 | `paths` + `force_binary` entries | 65536 | config load |
 | `wrapped_keys` entries | 64 | config load |

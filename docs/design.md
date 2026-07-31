@@ -212,9 +212,11 @@ This document is the entry point. Detailed specifications live in:
   sequences), CLI integration tests (end-to-end flows, `rekey` rotation
   and resume (`--continue`) semantics, locking, `check`/`verify`,
   synthesized `.git`-file repository boundaries (the worktree/submodule
-  shape), and hostile filesystem states: symlinked managed ancestors,
-  non-regular configs, control-character paths, newline-dense probe
-  hits, broken-pipe output), a key-ring tamper matrix over two- and
+  shape), and hostile filesystem states: symlinked managed ancestors
+  and domain roots, non-regular configs, control-character paths
+  (typed and discovered), newline-dense probe hits, broken-pipe
+  output, skipped-special scan/rotation semantics, concurrent
+  parent/child `init`), a key-ring tamper matrix over two- and
   three-entry rings (swap / drop head, middle, or tail / insert /
   duplicate / re-attach pre-prune wrappers → all rejected; whole-config
   rollback → cryptographically accepted by design and pinned as such;
@@ -222,13 +224,15 @@ This document is the entry point. Detailed specifications live in:
   post-prune old-epoch file fails with the history hint), and golden
   fixtures with a fixed password/salt/domain key that pin the wire
   format and the derivation chain, so accidental format breaks fail
-  loudly. Kill- and fault-injection (crash mid-rename, post-rename
-  fsync failure) is covered by design review and the failure-semantics
-  spec, not by tests.
+  loudly. Post-commit fsync failures are fault-injected through a
+  test-only thread-local hook; kill/crash mid-rename remains covered
+  by design review and the failure-semantics spec, not by tests.
 - **CI**: GitHub Actions on Linux + macOS, with every action pinned to
   a full commit SHA (Dependabot bumps them): `cargo fmt --check`,
-  `cargo clippy -- -D warnings`, `cargo test`, and a `cargo deny` job
-  for advisories and licenses. `unsafe_code` is denied crate-wide.
+  `cargo clippy -- -D warnings`, `cargo test`, a `cargo deny` job for
+  advisories and licenses, and a short `cargo fuzz` smoke over the
+  config parser and both ciphertext decoders (targets in `fuzz/`).
+  `unsafe_code` is denied crate-wide.
 
 ## Versioning
 

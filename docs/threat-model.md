@@ -56,7 +56,8 @@ Two classes, with very different coverage:
   recombining chunks from different versions is detected. Only
   whole-file rollback to a complete older ciphertext survives.
 - **Wrong-password detection**: unwrapping the key ring fails fast,
-  before any file is touched.
+  before any managed target or ciphertext is touched (stale temp-file
+  cleanup may run first).
 - **Deterministic re-encryption**: within one key epoch, unchanged
   plaintext never churns ciphertext; `passwd` and KDF upgrades churn
   nothing at all. `rekey` starts a new epoch and rewrites every
