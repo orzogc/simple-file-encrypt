@@ -6,6 +6,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # These direct deps exist only to unify zeroize features with
+      # aes-siv's transitive versions; they must move in lockstep with
+      # aes-siv (manually), never independently.
+      - dependency-name: aes
+      - dependency-name: cmac
   - package-ecosystem: cargo
     directory: /fuzz
     schedule:

@@ -3,8 +3,9 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let key = simple_encrypt::crypto::random_domain_key().expect("OS RNG");
-    let keys = vec![key];
+    // A fixed key keeps iterations fast and deterministic; the key
+    // value is irrelevant to panic-safety.
+    let keys = vec![zeroize::Zeroizing::new([0x42u8; 32])];
     // Nudge inputs past the probe so the structural parser and chunk
     // authentication are exercised; malformed input must fail, never
     // panic.
