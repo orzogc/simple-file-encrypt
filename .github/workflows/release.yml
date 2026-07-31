@@ -21,15 +21,19 @@ jobs:
       matrix:
         include:
           # The same runners the test matrix uses, so release binaries
-          # are built on exactly the tested platforms.
+          # are built on exactly the tested platforms. Linux is linked
+          # statically with musl (covered by ci.yml's musl job) so the
+          # archive runs on any distribution.
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
           - os: macos-latest
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Tag must match the crate version
         run: |
@@ -54,7 +58,7 @@ jobs:
           else
             shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
           fi
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: simple-encrypt-${{ matrix.target }}
           path: |
@@ -68,7 +72,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: simple-encrypt-*
           merge-multiple: true

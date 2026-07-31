@@ -233,14 +233,17 @@ This document is the entry point. Detailed specifications live in:
   `cargo clippy -- -D warnings`, `cargo test`, a `cargo deny` job for
   advisories and licenses, a feature-unification assertion that the
   `zeroize` features of `aes`/`cmac` apply to the single version of
-  each crate in the tree, and a short `cargo fuzz` smoke over the
-  config parser and both ciphertext decoders (targets in `fuzz/`).
+  each crate in the tree, a full test run against
+  `x86_64-unknown-linux-musl` (the release Linux binary is statically
+  linked), and a short `cargo fuzz` smoke over the config parser and
+  both ciphertext decoders (targets in `fuzz/`).
   `unsafe_code` is denied crate-wide.
 - **Release**: pushing a `v*` tag runs the whole CI suite (reused via
   `workflow_call`), then builds stripped release archives
-  (`x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`) with SHA-256
-  checksums and publishes them to GitHub Releases; the tag must match
-  the crate version in `Cargo.toml`.
+  (`x86_64-unknown-linux-musl` — statically linked, runs on any
+  distribution — and `aarch64-apple-darwin`) with SHA-256 checksums
+  and publishes them to GitHub Releases; the tag must match the crate
+  version in `Cargo.toml`.
 
 ## Versioning
 
