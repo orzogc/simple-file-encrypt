@@ -1,0 +1,34 @@
+[package]
+name = "simple-encrypt-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+simple-encrypt = { path = ".." }
+
+# Keep the fuzz crate out of the main package's workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "config_parse"
+path = "fuzz_targets/config_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "text_decrypt"
+path = "fuzz_targets/text_decrypt.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "bin_decrypt"
+path = "fuzz_targets/bin_decrypt.rs"
+test = false
+doc = false

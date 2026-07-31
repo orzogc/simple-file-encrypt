@@ -7,3 +7,9 @@
 
 CLAUDE.md
 skills-lock.json
+
+# cargo-fuzz
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+/fuzz/target/
