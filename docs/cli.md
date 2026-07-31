@@ -116,10 +116,11 @@ KDF-related global options, honored by every command that runs Argon2:
   deduplicated. Two *different* canonical paths resolving to the same
   `(device, inode)` — hard-linked pairs, case-insensitive aliases — are
   an error.
-- A plaintext file about to be encrypted is refused when its link count
-  is greater than 1: the other hard links would silently keep a
-  plaintext alias after encryption. The check applies only to files
-  entering encryption; `decrypt` only warns in the mirror case.
+- A file about to be encrypted (or migrated) is refused when its link
+  count is greater than 1: after the rename the other hard links would
+  silently keep a stale alias — plaintext when encrypting, old-epoch
+  ciphertext (invisible to `rekey --prune`'s convergence check) when
+  migrating. `decrypt` only warns in the mirror case.
 - `force_binary` applies to a file when its canonical relative path
   equals an entry or is under a directory entry.
 

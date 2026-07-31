@@ -66,12 +66,6 @@ wrapped_keys = [
     "b5bb…(96 hex chars)…09e2",
 ]
 
-[kdf]
-algorithm = "argon2id"
-memory_kib = 65536
-iterations = 3
-parallelism = 1
-
 # Managed paths: files and directories (recursive), canonical relative
 # paths (no trailing slash; directory-ness is resolved at run time).
 # Maintained by the tool: ascending byte order, deduplicated.
@@ -85,6 +79,14 @@ paths = [
 force_binary = [
     "secrets/huge-export.csv",
 ]
+
+# The [kdf] table comes last: everything after a TOML table header
+# belongs to that table, so top-level keys must precede it.
+[kdf]
+algorithm = "argon2id"
+memory_kib = 65536
+iterations = 3
+parallelism = 1
 ```
 
 Validation on load (all failures are hard errors):

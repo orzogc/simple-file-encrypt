@@ -1,0 +1,1089 @@
+//! CLI integration tests for the `simple-encrypt` binary (the test
+//! surface listed in `docs/design.md`, semantics from `docs/cli.md`).
+//!
+//! Every test creates its own temporary domain. Passwords are passed via
+//! per-command environment variables (never `std::env::set_var`, which
+//! would leak across parallel tests), and every command runs with
+//! `--allow-weak-kdf` plus tiny Argon2 parameters so the suite is fast.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use assert_cmd::Command;
+
+/// Default domain password used by most tests.
+const PW: &str = "test password";
+/// Domain config file name.
+const CONFIG: &str = ".simple-encrypt.toml";
+/// Exact v1 text header (without the terminating newline).
+const TEXT_HEADER: &str = "#simple-encrypt v1 text";
+/// Binary-mode magic bytes.
+const BIN_MAGIC: [u8; 8] = [0x89, 0x53, 0x45, 0x4E, 0x43, 0x0D, 0x0A, 0x1A];
+
+/// Captured outcome of one CLI invocation.
+struct Run {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+impl Run {
+    /// Asserts the exit code, dumping both streams on mismatch.
+    #[track_caller]
+    fn expect_code(self, want: i32) -> Run {
+        assert_eq!(
+            self.code, want,
+            "exit code {} != {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            self.code, want, self.stdout, self.stderr
+        );
+        self
+    }
+}
+
+/// Asserts that `hay` contains `needle`, printing the haystack on failure.
+#[track_caller]
+fn assert_contains(hay: &str, needle: &str) {
+    assert!(hay.contains(needle), "expected {needle:?} in:\n{hay}");
+}
+
+/// Builds a command with a clean password environment (external
+/// variables removed) and the global `--allow-weak-kdf` flag.
+fn se(dir: &Path) -> Command {
+    let mut c = Command::cargo_bin("simple-encrypt").unwrap();
+    c.current_dir(dir);
+    c.env_remove("SIMPLE_ENCRYPT_PASSWORD");
+    c.env_remove("SIMPLE_ENCRYPT_NEW_PASSWORD");
+    c.arg("--allow-weak-kdf");
+    c
+}
+
+/// Runs a prepared command and captures exit code and both streams.
+fn run(mut cmd: Command) -> Run {
+    let out = cmd.output().expect("failed to run simple-encrypt");
+    Run {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// Runs a subcommand with the password supplied via the environment.
+fn run_pw(dir: &Path, pw: &str, args: &[&str]) -> Run {
+    let mut c = se(dir);
+    c.env("SIMPLE_ENCRYPT_PASSWORD", pw);
+    c.args(args);
+    run(c)
+}
+
+/// Runs a subcommand with no password source at all (stdin is empty).
+fn run_nopw(dir: &Path, args: &[&str]) -> Run {
+    let mut c = se(dir);
+    c.args(args);
+    run(c)
+}
+
+/// Initializes a domain in `root` with fast (weak) KDF parameters.
+#[track_caller]
+fn init_domain(root: &Path) {
+    run_pw(
+        root,
+        PW,
+        &["init", "--memory-kib", "8", "--iterations", "1"],
+    )
+    .expect_code(0);
+}
+
+/// Writes a file below `root`, creating parent directories.
+fn write_file(root: &Path, rel: &str, content: &[u8]) {
+    let path = root.join(rel);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, content).unwrap();
+}
+
+/// Reads a file below `root`.
+fn read_file(root: &Path, rel: &str) -> Vec<u8> {
+    fs::read(root.join(rel)).unwrap()
+}
+
+/// Absolute path of the domain config.
+fn config_path(root: &Path) -> PathBuf {
+    root.join(CONFIG)
+}
+
+/// Reads the domain config as text.
+fn read_config(root: &Path) -> String {
+    fs::read_to_string(config_path(root)).unwrap()
+}
+
+/// Extracts the `wrapped_keys` entries (96-hex strings) from the config.
+fn wrapped_keys_of(root: &Path) -> Vec<String> {
+    let cfg = read_config(root);
+    let start = cfg.find("wrapped_keys = [").unwrap();
+    let end = start + cfg[start..].find(']').unwrap();
+    cfg[start..end]
+        .lines()
+        .filter_map(|l| {
+            l.trim()
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix("\","))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Rewrites the config's `wrapped_keys` array with the given entries.
+fn set_wrapped_keys(root: &Path, keys: &[String]) {
+    let cfg = read_config(root);
+    let start = cfg.find("wrapped_keys = [").unwrap();
+    let end = start + cfg[start..].find(']').unwrap() + 1;
+    let mut block = String::from("wrapped_keys = [\n");
+    for k in keys {
+        block.push_str("    \"");
+        block.push_str(k);
+        block.push_str("\",\n");
+    }
+    block.push(']');
+    fs::write(
+        config_path(root),
+        format!("{}{}{}", &cfg[..start], block, &cfg[end..]),
+    )
+    .unwrap();
+}
+
+/// Extracts the hex salt from the config.
+fn salt_of(root: &Path) -> String {
+    let cfg = read_config(root);
+    let start = cfg.find("salt = \"").unwrap() + "salt = \"".len();
+    let end = start + cfg[start..].find('"').unwrap();
+    cfg[start..end].to_owned()
+}
+
+/// Removes a managed `paths` entry by editing the config directly.
+fn remove_managed_entry(root: &Path, rel: &str) {
+    let cfg = read_config(root);
+    let line = format!("    \"{rel}\",\n");
+    assert!(cfg.contains(&line), "entry {rel} not found in config");
+    fs::write(config_path(root), cfg.replacen(&line, "", 1)).unwrap();
+}
+
+/// Whether a status/check-style line with the given state names `rel`.
+fn status_line(stdout: &str, state: &str, rel: &str) -> bool {
+    stdout
+        .lines()
+        .any(|l| l.starts_with(state) && l.contains(rel))
+}
+
+/// Retries `f` until it yields a value, for about two seconds.
+///
+/// Needed only where a test re-acquires a lock it just dropped: an
+/// flock held by this (multi-threaded) test process can outlive its
+/// handle for a moment when a child forked by a parallel test inherited
+/// the descriptor and has not exec'd yet.
+#[track_caller]
+fn eventually<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+    for _ in 0..100 {
+        if let Some(v) = f() {
+            return v;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("timed out waiting for: {what}");
+}
+
+/// Flips the first character of the first unit line (line index 1) of a
+/// text ciphertext, keeping the base64 alphabet and canonicality intact.
+fn tamper_first_unit(root: &Path, rel: &str) {
+    let ct = String::from_utf8(read_file(root, rel)).unwrap();
+    let mut lines: Vec<String> = ct.lines().map(str::to_owned).collect();
+    let first = lines[1].remove(0);
+    lines[1].insert(0, if first == 'A' { 'B' } else { 'A' });
+    let mut out = lines.join("\n");
+    if ct.ends_with('\n') {
+        out.push('\n');
+    }
+    fs::write(root.join(rel), out).unwrap();
+}
+
+// ---------------------------------------------------------------------
+// Basic flows
+// ---------------------------------------------------------------------
+
+#[test]
+fn init_add_encrypt_status_decrypt_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let env_content: &[u8] = b"SECRET=hunter2\nTOKEN=abc\n";
+    let inner_content: &[u8] = b"line one\nline two"; // no trailing newline
+    write_file(root, ".env", env_content);
+    write_file(root, "secrets/inner.txt", inner_content);
+
+    let r = run_pw(
+        root,
+        PW,
+        &["init", "--memory-kib", "8", "--iterations", "1"],
+    )
+    .expect_code(0);
+    assert_contains(&r.stdout, "initialized");
+    assert!(config_path(root).exists());
+
+    // `add` needs no password.
+    let r = run_nopw(root, &["add", ".env", "secrets"]).expect_code(0);
+    assert_contains(&r.stdout, "added .env");
+    assert_contains(&r.stdout, "added secrets");
+    let cfg = read_config(root);
+    assert_contains(&cfg, "\".env\"");
+    assert_contains(&cfg, "\"secrets\"");
+
+    // Encrypt the managed list (no arguments).
+    let r = run_pw(root, PW, &["encrypt"]).expect_code(0);
+    assert_contains(&r.stdout, "encrypted .env");
+    assert_contains(&r.stdout, "encrypted secrets/inner.txt");
+    let env_ct = read_file(root, ".env");
+    assert!(env_ct.starts_with(TEXT_HEADER.as_bytes()));
+    // Trailing-newline mirroring: the source had no final newline.
+    let inner_ct = read_file(root, "secrets/inner.txt");
+    assert!(inner_ct.starts_with(TEXT_HEADER.as_bytes()));
+    assert!(!inner_ct.ends_with(b"\n"));
+
+    // `status` needs no password and reports the encrypted state.
+    let r = run_nopw(root, &["status"]).expect_code(0);
+    assert!(status_line(&r.stdout, "encrypted", ".env"));
+    assert!(status_line(&r.stdout, "encrypted", "secrets/inner.txt"));
+
+    // Decrypt restores the exact original bytes.
+    let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
+    assert_contains(&r.stdout, "decrypted .env");
+    assert_contains(&r.stdout, "decrypted secrets/inner.txt");
+    assert_eq!(read_file(root, ".env"), env_content);
+    assert_eq!(read_file(root, "secrets/inner.txt"), inner_content);
+}
+
+#[test]
+fn modes_and_edge_content_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let empty: &[u8] = b"";
+    let crlf: &[u8] = b"alpha\r\nbeta\r\n";
+    let newline_only: &[u8] = b"\n";
+    let nulls: &[u8] = b"\x00\x01\x02binary\x00body";
+    write_file(root, "empty.txt", empty);
+    write_file(root, "crlf.txt", crlf);
+    write_file(root, "nl.txt", newline_only);
+    write_file(root, "nulls.bin", nulls);
+    init_domain(root);
+
+    run_pw(
+        root,
+        PW,
+        &["encrypt", "empty.txt", "crlf.txt", "nl.txt", "nulls.bin"],
+    )
+    .expect_code(0);
+
+    // Empty plaintext: a single marker-header line, nothing else.
+    let empty_ct = read_file(root, "empty.txt");
+    assert!(empty_ct.starts_with(format!("{TEXT_HEADER} ").as_bytes()));
+    assert_eq!(empty_ct.iter().filter(|&&b| b == b'\n').count(), 1);
+    // CRLF stays inside the encrypted line; ciphertext is LF-framed text.
+    assert!(read_file(root, "crlf.txt").starts_with(TEXT_HEADER.as_bytes()));
+    // NUL bytes select binary mode.
+    assert_eq!(&read_file(root, "nulls.bin")[..8], &BIN_MAGIC);
+
+    // `status` marks the binary-mode file (and only it).
+    let r = run_nopw(root, &["status"]).expect_code(0);
+    let bin_line = r.stdout.lines().find(|l| l.contains("nulls.bin")).unwrap();
+    assert_contains(bin_line, "[binary]");
+    assert!(bin_line.starts_with("encrypted"));
+    let crlf_line = r.stdout.lines().find(|l| l.contains("crlf.txt")).unwrap();
+    assert!(!crlf_line.contains("[binary]"));
+
+    // Byte-exact round trip for every mode and edge case.
+    run_pw(root, PW, &["decrypt"]).expect_code(0);
+    assert_eq!(read_file(root, "empty.txt"), empty);
+    assert_eq!(read_file(root, "crlf.txt"), crlf);
+    assert_eq!(read_file(root, "nl.txt"), newline_only);
+    assert_eq!(read_file(root, "nulls.bin"), nulls);
+}
+
+#[test]
+fn encrypt_is_idempotent_and_deterministic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "f.txt", b"one\ntwo\nthree\n");
+    init_domain(root);
+
+    run_pw(root, PW, &["encrypt", "f.txt"]).expect_code(0);
+    let ct1 = read_file(root, "f.txt");
+
+    // Second encrypt skips; the ciphertext bytes do not change.
+    let r = run_pw(root, PW, &["encrypt", "f.txt"]).expect_code(0);
+    assert_contains(&r.stdout, "skipped f.txt (already encrypted)");
+    assert_eq!(read_file(root, "f.txt"), ct1);
+
+    // Editing one line changes only that unit line.
+    run_pw(root, PW, &["decrypt"]).expect_code(0);
+    write_file(root, "f.txt", b"one\nTWO\nthree\n");
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    let ct2 = read_file(root, "f.txt");
+    let l1: Vec<&[u8]> = ct1.split(|&b| b == b'\n').collect();
+    let l2: Vec<&[u8]> = ct2.split(|&b| b == b'\n').collect();
+    assert_eq!(l1.len(), l2.len());
+    assert_eq!(l1[0], l2[0]); // header
+    assert_eq!(l1[1], l2[1]); // "one"
+    assert_ne!(l1[2], l2[2]); // edited line
+    assert_eq!(l1[3], l2[3]); // "three"
+
+    // decrypt -> encrypt of unchanged content is byte-identical.
+    run_pw(root, PW, &["decrypt"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    assert_eq!(read_file(root, "f.txt"), ct2);
+
+    // Restoring the original content reproduces the original ciphertext.
+    run_pw(root, PW, &["decrypt"]).expect_code(0);
+    write_file(root, "f.txt", b"one\ntwo\nthree\n");
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    assert_eq!(read_file(root, "f.txt"), ct1);
+}
+
+#[test]
+fn explicit_targets_auto_add_and_config_stability() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let content: &[u8] = b"api_key = xyz\n";
+    write_file(root, "u.txt", content);
+    init_domain(root);
+
+    // Encrypting an unmanaged file auto-adds it before encrypting.
+    let r = run_pw(root, PW, &["encrypt", "u.txt"]).expect_code(0);
+    assert_contains(&r.stdout, "added u.txt");
+    assert_contains(&r.stdout, "encrypted u.txt");
+    assert_contains(&read_config(root), "\"u.txt\"");
+
+    // An already-encrypted file named explicitly is re-added too.
+    remove_managed_entry(root, "u.txt");
+    assert!(!read_config(root).contains("\"u.txt\""));
+    let r = run_pw(root, PW, &["encrypt", "u.txt"]).expect_code(0);
+    assert_contains(&r.stdout, "added u.txt");
+    assert_contains(&r.stdout, "skipped u.txt (already encrypted)");
+    assert_contains(&read_config(root), "\"u.txt\"");
+
+    // A nonexistent explicit target is an error.
+    let r = run_pw(root, PW, &["encrypt", "nope.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "does not exist on disk");
+
+    // `decrypt` never modifies the managed list.
+    let cfg_before = read_config(root);
+    run_pw(root, PW, &["decrypt", "u.txt"]).expect_code(0);
+    assert_eq!(read_config(root), cfg_before);
+    assert_eq!(read_file(root, "u.txt"), content);
+}
+
+// ---------------------------------------------------------------------
+// Probe collisions and flags
+// ---------------------------------------------------------------------
+
+#[test]
+fn assume_plaintext_escape_hatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_domain(root);
+
+    // Plaintext masquerading as v1 ciphertext: a valid header and a
+    // canonical base64 line that cannot authenticate.
+    let masked: &[u8] = b"#simple-encrypt v1 text\nAAAAAAAAAAAAAAAAAAAAAAAA\n";
+    write_file(root, "fake.txt", masked);
+    let r = run_pw(root, PW, &["encrypt", "fake.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "assume-plaintext");
+    assert_eq!(read_file(root, "fake.txt"), masked); // untouched
+
+    let r = run_pw(root, PW, &["encrypt", "--assume-plaintext", "fake.txt"]).expect_code(0);
+    assert_contains(&r.stderr, "treating unauthenticated probe hit as plaintext");
+    assert_contains(&r.stdout, "encrypted fake.txt");
+    assert_ne!(read_file(root, "fake.txt"), masked);
+    run_pw(root, PW, &["decrypt", "fake.txt"]).expect_code(0);
+    assert_eq!(read_file(root, "fake.txt"), masked);
+
+    // A `#simple-encrypt` first line that is no exact v1 header.
+    let unrec: &[u8] = b"#simple-encrypt v9 x\npayload\n";
+    write_file(root, "unrec.txt", unrec);
+    let r = run_pw(root, PW, &["encrypt", "unrec.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "no exact v1 header");
+    run_pw(root, PW, &["encrypt", "--assume-plaintext", "unrec.txt"]).expect_code(0);
+    run_pw(root, PW, &["decrypt", "unrec.txt"]).expect_code(0);
+    assert_eq!(read_file(root, "unrec.txt"), unrec);
+
+    // The flag requires explicit paths.
+    let r = run_pw(root, PW, &["encrypt", "--assume-plaintext"]).expect_code(1);
+    assert_contains(&r.stderr, "requires explicit paths");
+}
+
+#[test]
+fn decrypt_require_encrypted_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "p.txt", b"still plaintext\n");
+    init_domain(root);
+
+    let r = run_pw(root, PW, &["decrypt", "p.txt"]).expect_code(0);
+    assert_contains(&r.stdout, "skipped p.txt (not encrypted)");
+
+    let r = run_pw(root, PW, &["decrypt", "--require-encrypted", "p.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "not encrypted");
+}
+
+// ---------------------------------------------------------------------
+// Managed-list bookkeeping
+// ---------------------------------------------------------------------
+
+#[test]
+fn add_remove_bookkeeping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "n.txt", b"note\n");
+    write_file(root, "d/inner.txt", b"inner\n");
+    write_file(root, "stray.txt", b"stray\n");
+    init_domain(root);
+
+    // Duplicate adds are reported, not duplicated.
+    run_nopw(root, &["add", "n.txt"]).expect_code(0);
+    let r = run_nopw(root, &["add", "n.txt"]).expect_code(0);
+    assert_contains(&r.stdout, "already managed");
+
+    // Adding a directory prunes the file entries it covers.
+    run_nopw(root, &["add", "d/inner.txt"]).expect_code(0);
+    let r = run_nopw(root, &["add", "d"]).expect_code(0);
+    assert_contains(&r.stdout, "now covered by");
+    assert_contains(&r.stdout, "added d");
+    let cfg = read_config(root);
+    assert!(!cfg.contains("\"d/inner.txt\""));
+    assert_contains(&cfg, "\"d\"");
+    let r = run_nopw(root, &["add", "d/inner.txt"]).expect_code(0);
+    assert_contains(&r.stdout, "already covered by the managed entry `d`");
+
+    // Adding a nonexistent path warns but succeeds.
+    let r = run_nopw(root, &["add", "ghost.txt"]).expect_code(0);
+    assert_contains(&r.stderr, "does not exist on disk");
+    assert_contains(&read_config(root), "\"ghost.txt\"");
+    run_nopw(root, &["remove", "ghost.txt"]).expect_code(0);
+
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+
+    // Removing an encrypted entry is refused; --force overrides.
+    let r = run_nopw(root, &["remove", "n.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "decrypt it first");
+    // A directory entry covering encrypted files is refused too.
+    let r = run_nopw(root, &["remove", "d"]).expect_code(1);
+    assert_contains(&r.stderr, "decrypt it first");
+    // A path covered by a directory entry is not an exact entry.
+    let r = run_nopw(root, &["remove", "d/inner.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "covered by the managed directory entry `d`");
+    // An unmanaged path cannot be removed.
+    let r = run_nopw(root, &["remove", "stray.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "not a managed path");
+
+    let r = run_nopw(root, &["remove", "--force", "n.txt"]).expect_code(0);
+    assert_contains(&r.stderr, "force-removing");
+    assert_contains(&r.stdout, "removed n.txt");
+    assert!(!read_config(root).contains("\"n.txt\""));
+
+    // After decryption the directory entry can be removed normally.
+    run_pw(root, PW, &["decrypt"]).expect_code(0);
+    let r = run_nopw(root, &["remove", "d"]).expect_code(0);
+    assert_contains(&r.stdout, "removed d");
+}
+
+// ---------------------------------------------------------------------
+// Read-only scans
+// ---------------------------------------------------------------------
+
+#[test]
+fn status_and_check_mixed_states() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "enc.txt", b"secret\n");
+    write_file(root, "plain.txt", b"exposed\n");
+    write_file(root, "unrec.txt", b"#simple-encrypt v9 x\n");
+    init_domain(root);
+    run_pw(root, PW, &["encrypt", "enc.txt"]).expect_code(0);
+    run_nopw(root, &["add", "plain.txt", "gone.txt", "unrec.txt"]).expect_code(0);
+
+    // `status` reports every state and exits 0 regardless.
+    let r = run_nopw(root, &["status"]).expect_code(0);
+    assert!(status_line(&r.stdout, "encrypted", "enc.txt"));
+    assert!(status_line(&r.stdout, "plaintext", "plain.txt"));
+    assert!(status_line(&r.stdout, "missing", "gone.txt"));
+    assert!(status_line(&r.stdout, "unrecognized", "unrec.txt"));
+
+    // `check` lists offenders (exit 1), ignores missing files, and
+    // needs no password (none is provided here).
+    let r = run_nopw(root, &["check"]).expect_code(1);
+    assert!(status_line(&r.stdout, "plaintext", "plain.txt"));
+    assert!(status_line(&r.stdout, "unrecognized", "unrec.txt"));
+    assert!(!r.stdout.contains("enc.txt"));
+    assert!(!r.stdout.contains("gone.txt"));
+
+    // All existing managed files encrypted: exit 0.
+    fs::remove_file(root.join("unrec.txt")).unwrap();
+    run_pw(root, PW, &["encrypt", "plain.txt"]).expect_code(0);
+    run_nopw(root, &["check"]).expect_code(0);
+}
+
+#[test]
+fn verify_authentication_and_exit_codes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "a.txt", b"alpha\nbeta\n");
+    init_domain(root);
+    run_pw(root, PW, &["encrypt", "a.txt"]).expect_code(0);
+    let good_ct = read_file(root, "a.txt");
+
+    // Everything authenticates: exit 0.
+    let r = run_pw(root, PW, &["verify"]).expect_code(0);
+    assert_contains(&r.stdout, "verified a.txt");
+
+    // Plaintext and missing files are reported but do not fail verify.
+    write_file(root, "plain.txt", b"not encrypted\n");
+    run_nopw(root, &["add", "plain.txt", "gone.txt"]).expect_code(0);
+    let r = run_pw(root, PW, &["verify"]).expect_code(0);
+    assert_contains(&r.stdout, "plaintext plain.txt");
+    assert_contains(&r.stdout, "missing gone.txt");
+
+    // An unrecognized header is a failure; the scan still continues.
+    write_file(root, "unrec.txt", b"#simple-encrypt v9 x\n");
+    run_nopw(root, &["add", "unrec.txt"]).expect_code(0);
+    let r = run_pw(root, PW, &["verify"]).expect_code(1);
+    assert_contains(&r.stdout, "FAILED unrec.txt");
+    assert_contains(&r.stdout, "verified a.txt");
+    fs::remove_file(root.join("unrec.txt")).unwrap();
+
+    // A single flipped base64 character fails authentication: exit 1.
+    tamper_first_unit(root, "a.txt");
+    let r = run_pw(root, PW, &["verify"]).expect_code(1);
+    assert_contains(&r.stdout, "FAILED a.txt");
+    write_file(root, "a.txt", &good_ct);
+    run_pw(root, PW, &["verify"]).expect_code(0);
+
+    // A wrong password is an operational error: exit 2.
+    let r = run_pw(root, "wrong password", &["verify"]).expect_code(2);
+    assert_contains(&r.stderr, "wrong password");
+}
+
+// ---------------------------------------------------------------------
+// passwd and rekey
+// ---------------------------------------------------------------------
+
+#[test]
+fn passwd_rewraps_ring_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "s.txt", b"k=v\n");
+    init_domain(root);
+    run_pw(root, PW, &["encrypt", "s.txt"]).expect_code(0);
+    let ct = read_file(root, "s.txt");
+    let old_salt = salt_of(root);
+
+    // Change the password via the two environment variables.
+    const NEW_PW: &str = "brand new pw";
+    let mut c = se(root);
+    c.env("SIMPLE_ENCRYPT_PASSWORD", PW);
+    c.env("SIMPLE_ENCRYPT_NEW_PASSWORD", NEW_PW);
+    c.arg("passwd");
+    let r = run(c).expect_code(0);
+    assert_contains(&r.stdout, "password changed");
+    assert_contains(&r.stderr, "revoke"); // the non-revocation warning
+
+    // Ciphertext bytes are untouched; the salt rotated; ring length 1.
+    assert_eq!(read_file(root, "s.txt"), ct);
+    assert_ne!(salt_of(root), old_salt);
+    assert_eq!(wrapped_keys_of(root).len(), 1);
+
+    // The old password no longer unwraps the ring; the new one does.
+    let r = run_pw(root, PW, &["verify"]).expect_code(2);
+    assert_contains(&r.stderr, "wrong password");
+    run_pw(root, NEW_PW, &["verify"]).expect_code(0);
+
+    // Both passwords can also come from stdin, one per line.
+    const THIRD_PW: &str = "third pw";
+    let mut c = se(root);
+    c.arg("passwd");
+    c.write_stdin(format!("{NEW_PW}\n{THIRD_PW}\n"));
+    run(c).expect_code(0);
+    run_pw(root, THIRD_PW, &["verify"]).expect_code(0);
+    run_pw(root, THIRD_PW, &["decrypt"]).expect_code(0);
+    assert_eq!(read_file(root, "s.txt"), b"k=v\n");
+}
+
+#[test]
+fn rekey_migration_flow() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "a.txt", b"a1\na2\n");
+    write_file(root, "b.txt", b"b\n");
+    init_domain(root);
+    run_pw(root, PW, &["encrypt", "a.txt", "b.txt"]).expect_code(0);
+    let old_a = read_file(root, "a.txt");
+
+    // Fresh rekey: mint, then migrate every managed ciphertext.
+    let r = run_pw(root, PW, &["rekey"]).expect_code(0);
+    assert_contains(&r.stdout, "minted a new domain key");
+    assert_contains(&r.stdout, "migrated a.txt");
+    assert_contains(&r.stdout, "migrated b.txt");
+    assert_eq!(wrapped_keys_of(root).len(), 2);
+    let new_a = read_file(root, "a.txt");
+    assert_ne!(new_a, old_a);
+    run_pw(root, PW, &["verify"]).expect_code(0);
+
+    // An old-epoch file resurfacing is authentic: pending migration.
+    write_file(root, "a.txt", &old_a);
+    let r = run_pw(root, PW, &["verify"]).expect_code(0);
+    assert_contains(&r.stdout, "pending migration a.txt");
+
+    // A fresh rekey refuses while the rotation is unfinished.
+    let r = run_pw(root, PW, &["rekey"]).expect_code(1);
+    assert_contains(&r.stderr, "unfinished rotation");
+    assert_contains(&r.stderr, "--continue");
+
+    // `rekey --continue` migrates the straggler deterministically.
+    let r = run_pw(root, PW, &["rekey", "--continue"]).expect_code(0);
+    assert_contains(&r.stdout, "migrated a.txt");
+    assert_contains(&r.stdout, "skipped b.txt (already encrypted)");
+    assert_eq!(read_file(root, "a.txt"), new_a);
+    let r = run_pw(root, PW, &["verify"]).expect_code(0);
+    assert!(!r.stdout.contains("pending migration"));
+}
+
+#[test]
+fn rekey_prune_flow() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "a.txt", b"payload\n");
+    init_domain(root);
+    run_pw(root, PW, &["encrypt", "a.txt"]).expect_code(0);
+    let old_ct = read_file(root, "a.txt");
+
+    run_pw(root, PW, &["rekey"]).expect_code(0);
+    let cur_ct = read_file(root, "a.txt");
+    let pre_keys = wrapped_keys_of(root);
+    assert_eq!(pre_keys.len(), 2);
+
+    // Prune refuses while an old-epoch file exists.
+    write_file(root, "a.txt", &old_ct);
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot prune");
+    run_pw(root, PW, &["rekey", "--continue"]).expect_code(0);
+    assert_eq!(read_file(root, "a.txt"), cur_ct);
+
+    // Prune refuses when an exact managed entry is missing from disk.
+    fs::remove_file(root.join("a.txt")).unwrap();
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
+    assert_contains(&r.stderr, "missing from disk");
+    assert_contains(&r.stderr, "remove");
+    write_file(root, "a.txt", &cur_ct);
+
+    // Converged: prune rewrites the ring as one entry under a new salt.
+    let pre_salt = salt_of(root);
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(0);
+    assert_contains(&r.stdout, "pruned 1 old key epoch");
+    let post_keys = wrapped_keys_of(root);
+    assert_eq!(post_keys.len(), 1);
+    assert_ne!(salt_of(root), pre_salt);
+
+    // Pruning again is a no-op.
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(0);
+    assert_contains(&r.stdout, "nothing to prune");
+
+    // A pruned-epoch ciphertext fails closed with the history hint.
+    write_file(root, "a.txt", &old_ct);
+    let r = run_pw(root, PW, &["decrypt", "a.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "pruned");
+    assert_contains(&r.stderr, "history");
+    let r = run_pw(root, PW, &["verify"]).expect_code(1);
+    assert_contains(&r.stdout, "FAILED a.txt");
+
+    // Re-attaching a pre-prune wrapper to the pruned config fails: the
+    // prune rotated the salt, so old wrappers cannot come back.
+    set_wrapped_keys(root, &[post_keys[0].clone(), pre_keys[1].clone()]);
+    let r = run_pw(root, PW, &["encrypt"]).expect_code(1);
+    assert_contains(&r.stderr, "wrong password");
+}
+
+#[test]
+fn key_ring_tamper_matrix_and_rollback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let plaintext: &[u8] = b"x\ny\n";
+    write_file(root, "f.txt", plaintext);
+    init_domain(root);
+    run_pw(root, PW, &["encrypt", "f.txt"]).expect_code(0);
+    let gen1_cfg = read_config(root);
+    let gen1_ct = read_file(root, "f.txt");
+
+    run_pw(root, PW, &["rekey"]).expect_code(0);
+    let gen2_cfg = read_config(root);
+    let keys = wrapped_keys_of(root);
+    assert_eq!(keys.len(), 2);
+    let (k0, k1) = (keys[0].clone(), keys[1].clone());
+
+    // Any reordering, dropping, or duplicating of ring entries makes
+    // every password-using command fail (the wrap AD binds ring length
+    // and position).
+    let mutations: Vec<Vec<String>> = vec![
+        vec![k1.clone(), k0.clone()],             // swap
+        vec![k1.clone()],                         // drop head
+        vec![k0.clone()],                         // drop tail
+        vec![k0.clone(), k1.clone(), k1.clone()], // duplicate
+    ];
+    for m in &mutations {
+        fs::write(config_path(root), &gen2_cfg).unwrap();
+        set_wrapped_keys(root, m);
+        let r = run_pw(root, PW, &["decrypt"]).expect_code(1);
+        assert!(
+            r.stderr.contains("wrong password") || r.stderr.contains("corrupt key ring"),
+            "unexpected error: {}",
+            r.stderr
+        );
+    }
+
+    // A forged tail entry unwraps entry 0 but exposes the corrupt ring.
+    fs::write(config_path(root), &gen2_cfg).unwrap();
+    set_wrapped_keys(root, &[k0.clone(), "0".repeat(96)]);
+    let r = run_pw(root, PW, &["decrypt"]).expect_code(1);
+    assert_contains(&r.stderr, "corrupt key ring");
+
+    // Sanity: the intact config still verifies.
+    fs::write(config_path(root), &gen2_cfg).unwrap();
+    run_pw(root, PW, &["verify"]).expect_code(0);
+
+    // Rolling back the complete config generation together with its
+    // ciphertext is cryptographically accepted (pinned by design).
+    fs::write(config_path(root), &gen1_cfg).unwrap();
+    write_file(root, "f.txt", &gen1_ct);
+    run_pw(root, PW, &["decrypt", "f.txt"]).expect_code(0);
+    assert_eq!(read_file(root, "f.txt"), plaintext);
+}
+
+// ---------------------------------------------------------------------
+// Boundaries and protected paths
+// ---------------------------------------------------------------------
+
+#[test]
+fn repository_boundaries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outer = tmp.path();
+    fs::create_dir(outer.join(".git")).unwrap(); // repository boundary
+    let root = outer.join("repo");
+    fs::create_dir(&root).unwrap();
+    write_file(&root, "top.txt", b"top\n");
+    // A `.git` *file* marks a nested repository (submodule/worktree).
+    write_file(&root, "sub/.git", b"gitdir: ../.git/modules/sub\n");
+    write_file(&root, "sub/secret.txt", b"inner secret\n");
+    fs::write(outer.join("outside.txt"), b"outside\n").unwrap();
+    init_domain(&root);
+
+    // A target inside the nested repository resolves to no domain.
+    let r = run_pw(&root, PW, &["encrypt", "sub/secret.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "outside any simple-encrypt domain");
+
+    // A target outside the domain root resolves to no domain either.
+    let r = run_pw(&root, PW, &["encrypt", "../outside.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "outside any simple-encrypt domain");
+
+    // Recursion skips the nested repository with a note.
+    let r = run_pw(&root, PW, &["encrypt", "."]).expect_code(0);
+    assert_contains(&r.stdout, "encrypted top.txt");
+    assert_contains(&r.stderr, "skipping nested repository `sub`");
+    assert_eq!(read_file(&root, "sub/secret.txt"), b"inner secret\n");
+}
+
+#[test]
+fn nested_init_refused() {
+    // A domain above refuses `init` below (and in the same directory).
+    let tmp_a = tempfile::tempdir().unwrap();
+    let root_a = tmp_a.path();
+    fs::create_dir(root_a.join(".git")).unwrap();
+    init_domain(root_a);
+    let r = run_pw(
+        root_a,
+        PW,
+        &["init", "--memory-kib", "8", "--iterations", "1"],
+    )
+    .expect_code(1);
+    assert_contains(&r.stderr, "already exists in this directory");
+    let sub = root_a.join("subdir");
+    fs::create_dir(&sub).unwrap();
+    let r = run_pw(
+        &sub,
+        PW,
+        &["init", "--memory-kib", "8", "--iterations", "1"],
+    )
+    .expect_code(1);
+    assert_contains(&r.stderr, "a domain already exists at");
+
+    // A domain below refuses `init` above.
+    let tmp_b = tempfile::tempdir().unwrap();
+    let root_b = tmp_b.path();
+    fs::create_dir(root_b.join(".git")).unwrap();
+    let sub_b = root_b.join("sub");
+    fs::create_dir(&sub_b).unwrap();
+    init_domain(&sub_b);
+    let r = run_pw(
+        root_b,
+        PW,
+        &["init", "--memory-kib", "8", "--iterations", "1"],
+    )
+    .expect_code(1);
+    assert_contains(&r.stderr, "below this directory");
+}
+
+#[test]
+fn protected_targets_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let attrs: &[u8] = b"*.env -text\n";
+    write_file(root, ".gitattributes", attrs);
+    write_file(root, "g.txt", b"hello\n");
+    init_domain(root);
+
+    // git- and tool-critical files cannot be targeted or managed.
+    let r = run_pw(root, PW, &["encrypt", ".gitattributes"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot target");
+    let r = run_nopw(root, &["add", ".gitattributes"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot target");
+    let r = run_pw(root, PW, &["encrypt", CONFIG]).expect_code(1);
+    assert_contains(&r.stderr, "cannot target");
+
+    // Recursion silently skips them.
+    let r = run_pw(root, PW, &["encrypt", "."]).expect_code(0);
+    assert_contains(&r.stdout, "encrypted g.txt");
+    assert_eq!(read_file(root, ".gitattributes"), attrs);
+}
+
+// ---------------------------------------------------------------------
+// Locking, hard links, renames
+// ---------------------------------------------------------------------
+
+#[test]
+fn domain_lock_excludes_concurrent_instances() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "f.txt", b"data\n");
+    init_domain(root);
+    run_nopw(root, &["add", "f.txt"]).expect_code(0);
+
+    // An exclusive lock held elsewhere blocks writers and readers.
+    {
+        let dir = fs::File::open(root).unwrap();
+        dir.try_lock().unwrap();
+        let r = run_pw(root, PW, &["encrypt", "f.txt"]).expect_code(1);
+        assert_contains(&r.stderr, "another simple-encrypt instance");
+        let r = run_nopw(root, &["status"]).expect_code(1);
+        assert_contains(&r.stderr, "another simple-encrypt instance");
+    }
+
+    // A shared lock lets readers through but still blocks writers.
+    {
+        let dir = fs::File::open(root).unwrap();
+        eventually("shared lock after the exclusive one was dropped", || {
+            dir.try_lock_shared().ok()
+        });
+        run_nopw(root, &["status"]).expect_code(0);
+        let r = run_pw(root, PW, &["encrypt", "f.txt"]).expect_code(1);
+        assert_contains(&r.stderr, "another simple-encrypt instance");
+    }
+
+    // With all locks released the command succeeds.
+    let r = eventually("encrypt succeeding after all locks were dropped", || {
+        let r = run_pw(root, PW, &["encrypt", "f.txt"]);
+        (r.code == 0).then_some(r)
+    });
+    assert_contains(&r.stdout, "encrypted f.txt");
+}
+
+#[test]
+fn hard_link_refusals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "a.txt", b"top secret\n");
+    init_domain(root);
+    fs::hard_link(root.join("a.txt"), root.join("alias.txt")).unwrap();
+
+    // Encrypting a multi-link plaintext would leave a plaintext alias.
+    let r = run_pw(root, PW, &["encrypt", "a.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "hard links");
+    assert_eq!(read_file(root, "a.txt"), b"top secret\n");
+
+    // Two paths resolving to one inode in one operation are an error.
+    let r = run_pw(root, PW, &["encrypt", "a.txt", "alias.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "same file");
+
+    // Resolving the link clears the refusal.
+    fs::remove_file(root.join("alias.txt")).unwrap();
+    run_pw(root, PW, &["encrypt", "a.txt"]).expect_code(0);
+}
+
+#[test]
+fn renamed_ciphertext_fails_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "s.txt", b"secret\n");
+    init_domain(root);
+    run_pw(root, PW, &["encrypt", "s.txt"]).expect_code(0);
+
+    // Keys are path-bound: a renamed ciphertext cannot decrypt, and the
+    // error names the cause.
+    fs::rename(root.join("s.txt"), root.join("moved.txt")).unwrap();
+    let r = run_pw(root, PW, &["decrypt", "moved.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "renamed");
+    assert_contains(&r.stderr, "path-bound");
+}
+
+// ---------------------------------------------------------------------
+// Miscellaneous hardening
+// ---------------------------------------------------------------------
+
+#[test]
+fn empty_password_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "f.txt", b"data\n");
+    init_domain(root);
+
+    let mut c = se(root);
+    c.env("SIMPLE_ENCRYPT_PASSWORD", "");
+    c.args(["encrypt", "f.txt"]);
+    let r = run(c).expect_code(1);
+    assert_contains(&r.stderr, "must not be empty");
+}
+
+#[test]
+fn stale_temp_files_swept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "x.txt", b"x\n");
+    init_domain(root);
+    let stale = root.join(".simple-encrypt.tmp.ABCDEFGH01234567");
+    fs::write(&stale, b"crash leftover").unwrap();
+
+    // Any exclusive-lock command sweeps stale temp files.
+    let r = run_nopw(root, &["add", "x.txt"]).expect_code(0);
+    assert!(!stale.exists());
+    assert_contains(&r.stderr, "removed stale temp file");
+}
+
+#[test]
+fn config_strictness() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_domain(root);
+    let good = read_config(root);
+
+    // Unknown keys are rejected.
+    fs::write(config_path(root), format!("{good}\nmystery_knob = true\n")).unwrap();
+    let r = run_nopw(root, &["status"]).expect_code(1);
+    assert_contains(&r.stderr, "config error");
+
+    // A newer version fails closed with the upgrade hint.
+    fs::write(
+        config_path(root),
+        good.replace("version = 1", "version = 2"),
+    )
+    .unwrap();
+    let r = run_nopw(root, &["status"]).expect_code(1);
+    assert_contains(&r.stderr, "upgrade simple-encrypt");
+}
+
+#[test]
+fn usage_errors_exit_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    // clap usage errors exit 1 (never 2, which check/verify reserve).
+    let mut c = se(root);
+    c.arg("frobnicate");
+    let r = run(c);
+    assert_eq!(r.code, 1, "stderr: {}", r.stderr);
+
+    // Help output is not an error.
+    let mut c = se(root);
+    c.arg("--help");
+    run(c).expect_code(0);
+}
+
+// ---------------------------------------------------------------------
+// Regressions from the spec-compliance review
+// ---------------------------------------------------------------------
+
+/// `remove` must not claim `removed …` for entries whose removal was
+/// never persisted: a later entry's refusal aborts the whole rewrite.
+#[test]
+fn remove_reports_only_persisted_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "a.txt", b"a\n");
+    write_file(root, "b.txt", b"b\n");
+    init_domain(root);
+    run_nopw(root, &["add", "a.txt", "b.txt"]).expect_code(0);
+    run_pw(root, PW, &["encrypt", "b.txt"]).expect_code(0);
+
+    // a.txt is removable, but b.txt is encrypted: the command fails and
+    // nothing may be reported (or persisted) as removed.
+    let r = run_nopw(root, &["remove", "a.txt", "b.txt"]).expect_code(1);
+    assert!(
+        !r.stdout.contains("removed a.txt"),
+        "claimed an unpersisted removal:\n{}",
+        r.stdout
+    );
+    assert_contains(&read_config(root), "\"a.txt\"");
+}
+
+/// Encrypting an explicit file already covered by a managed directory
+/// entry must not add a redundant exact entry (it is already managed).
+#[test]
+fn auto_add_respects_directory_coverage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "secrets/x.txt", b"x\n");
+    init_domain(root);
+    run_nopw(root, &["add", "secrets"]).expect_code(0);
+
+    let r = run_pw(root, PW, &["encrypt", "secrets/x.txt"]).expect_code(0);
+    assert_contains(&r.stdout, "encrypted secrets/x.txt");
+    let cfg = read_config(root);
+    assert!(
+        !cfg.contains("secrets/x.txt"),
+        "redundant entry written:\n{cfg}"
+    );
+    assert_contains(&cfg, "\"secrets\"");
+}
+
+/// The write side refuses to grow the config beyond what `load`
+/// accepts, instead of bricking the domain (config caps are enforced
+/// both ways). The size cap is unit-tested; this exercises the
+/// entry-count cap end to end.
+#[test]
+fn config_caps_are_enforced_on_the_write_side() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_domain(root);
+
+    // Hand-grow the config to exactly the entry-count cap (valid to load).
+    let entries: Vec<String> = (0..65536).map(|i| format!("\"p{i:05}\"")).collect();
+    let cfg = read_config(root);
+    let grown = cfg.replace(
+        "paths = []",
+        &format!("paths = [\n{}\n]", entries.join(",\n")),
+    );
+    fs::write(config_path(root), &grown).unwrap();
+    run_nopw(root, &["status"]).expect_code(0); // still loads
+
+    // One more entry would cross the cap: `add` must fail without
+    // touching the config instead of writing an unloadable one.
+    write_file(root, "one-more.txt", b"x\n");
+    let r = run_nopw(root, &["add", "one-more.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "entries");
+    assert_eq!(
+        read_config(root),
+        grown,
+        "config was rewritten despite the cap"
+    );
+    run_nopw(root, &["status"]).expect_code(0); // and still loads
+}

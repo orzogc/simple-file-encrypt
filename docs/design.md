@@ -188,15 +188,17 @@ This document is the entry point. Detailed specifications live in:
 
 ## Engineering
 
-- **Language**: Rust, edition 2024, MSRV 1.88.
+- **Language**: Rust, edition 2024, MSRV 1.89 (`std` file locking).
 - **Crate shape**: single binary crate `simple-encrypt` with an internal
   `lib.rs` so integration tests can call the library API. The library
   API is not public and carries no stability promise.
 - **Dependencies** (intentionally lean): `clap` (derive CLI), `argon2`,
   `aes-siv` (RFC 5297 AEAD), `blake3`, `rand`, `zeroize`, `base64`,
-  `serde` + `toml`, `thiserror` (typed core errors), `anyhow` (CLI
-  boundary), `rpassword`, `tempfile`, `fs4` (advisory file locking).
-  Dev: `proptest`, `assert_cmd`.
+  `serde` + `toml`, `thiserror` (typed core errors), `rpassword`,
+  `libc` (Unix open flags). Advisory locking uses `std`'s native
+  `File::try_lock` (stable since 1.89); temp files are created by hand
+  (`O_EXCL | O_NOFOLLOW`, CSPRNG names) so no temp-file crate is
+  needed. Dev: `proptest`, `assert_cmd`, `tempfile`.
 - **Platforms**: Linux and macOS are supported and tested in CI; on
   macOS, case-insensitive volumes are handled by re-spelling paths from
   directory listings, with residual Unicode-normalization edge cases

@@ -1,0 +1,282 @@
+//! Command implementations (see `docs/cli.md`) and their shared
+//! plumbing: domain resolution, locking, ring unlocking, and the
+//! serial stop-at-first-error processing report.
+
+mod decrypt;
+mod encrypt;
+mod init;
+mod keychange;
+mod manage;
+mod scan;
+
+pub use decrypt::{DecryptOpts, decrypt};
+pub(crate) use encrypt::encrypt_pass;
+pub use encrypt::{EncryptOpts, encrypt};
+pub use init::{InitOpts, init};
+pub use keychange::{PasswdOpts, RekeyMode, passwd, rekey};
+pub use manage::{add, remove};
+pub use scan::{ScanOutcome, check, status, verify};
+
+use std::path::{Path, PathBuf};
+
+use zeroize::Zeroizing;
+
+use crate::config::{self, LoadedConfig};
+use crate::crypto::{self, DomainKey, KdfGate, KdfParams, Kek};
+use crate::error::{Error, Result};
+use crate::fsops::{self, DirLock};
+use crate::select::TargetFile;
+use crate::{paths, report};
+
+/// An opened domain: root, held lock, and loaded config.
+pub struct Domain {
+    /// The loaded (and rewritable) config; `loaded.root` is the domain root.
+    pub loaded: LoadedConfig,
+    /// The advisory lock, held until drop.
+    _lock: DirLock,
+}
+
+impl Domain {
+    /// The domain root directory.
+    pub fn root(&self) -> &Path {
+        &self.loaded.root
+    }
+}
+
+/// Resolves the domain for an invocation, locks it, loads the config,
+/// and mints the explicit arguments into canonical relative paths
+/// (`""` = the domain root directory).
+pub fn open_domain(args: &[PathBuf], exclusive: bool) -> Result<(Domain, Vec<String>)> {
+    let cwd =
+        std::env::current_dir().map_err(|e| Error::io("resolving", "current directory", e))?;
+    let mut root: Option<PathBuf> = None;
+    let mut abs_args = Vec::with_capacity(args.len());
+    if args.is_empty() {
+        root = paths::discover_domain(&cwd);
+    } else {
+        for arg in args {
+            let abs = paths::lexical_absolute(&cwd, arg);
+            let this = paths::discover_domain(&paths::resolution_start(&abs)).ok_or_else(|| {
+                Error::Usage(format!(
+                    "`{}` is outside any simple-encrypt domain (no `.simple-encrypt.toml` found)",
+                    arg.display()
+                ))
+            })?;
+            match &root {
+                None => root = Some(this),
+                Some(r) if *r == this => {}
+                Some(r) => {
+                    return Err(Error::Usage(format!(
+                        "targets resolve to different domains (`{}` and `{}`); operate on one domain at a time",
+                        r.display(),
+                        this.display()
+                    )));
+                }
+            }
+            abs_args.push(abs);
+        }
+    }
+    let root = root.ok_or_else(|| {
+        Error::Usage("not inside a simple-encrypt domain (no `.simple-encrypt.toml` found up to the repository boundary)".into())
+    })?;
+    let lock = fsops::lock_dir(&root, exclusive)?;
+    let loaded = config::load(&root)?;
+
+    let mut rels = Vec::with_capacity(abs_args.len());
+    for (abs, arg) in abs_args.iter().zip(args) {
+        let rel = paths::mint(&root, abs)?;
+        if !rel.is_empty()
+            && let Some(reason) = paths::forbidden_reason(&rel)
+        {
+            return Err(Error::Usage(format!(
+                "cannot target `{}`: {reason}",
+                arg.display()
+            )));
+        }
+        rels.push(rel);
+    }
+    Ok((
+        Domain {
+            loaded,
+            _lock: lock,
+        },
+        rels,
+    ))
+}
+
+/// Enforces the KDF policy tiers, announces an above-default cost, and
+/// derives the KEK.
+pub fn derive_kek_checked(
+    password: &str,
+    salt: &[u8; crate::consts::SALT_LEN],
+    params: &KdfParams,
+    gate: &KdfGate,
+) -> Result<Kek> {
+    crypto::check_kdf_policy(params, gate)?;
+    if params.exceeds_default() {
+        report::note(format!(
+            "deriving the key-encryption key with Argon2id: {} KiB memory x {} passes",
+            params.memory_kib, params.iterations
+        ));
+    }
+    crypto::derive_kek(password, salt, params)
+}
+
+/// Derives the KEK from the password and unwraps the whole key ring
+/// (entry 0 = current). A wrong password fails here, before any file is
+/// touched.
+pub fn unlock_ring(
+    loaded: &LoadedConfig,
+    gate: &KdfGate,
+    password: &str,
+) -> Result<Vec<DomainKey>> {
+    let kek = derive_kek_checked(password, &loaded.config.salt, &loaded.config.kdf, gate)?;
+    crypto::unwrap_ring(&kek, &loaded.config.wrapped_keys)
+}
+
+/// Reads the primary password and unlocks the ring.
+pub fn read_password_and_unlock(loaded: &LoadedConfig, gate: &KdfGate) -> Result<Vec<DomainKey>> {
+    let password = crate::pwinput::primary(false)?;
+    unlock_ring(loaded, gate, &password)
+}
+
+/// Merges CLI KDF overrides over base parameters and validates the
+/// result structurally.
+pub fn merge_kdf_overrides(
+    base: &KdfParams,
+    memory_kib: Option<u64>,
+    iterations: Option<u64>,
+    parallelism: Option<u64>,
+) -> Result<KdfParams> {
+    crypto::validate_kdf_structural(
+        memory_kib.unwrap_or(u64::from(base.memory_kib)),
+        iterations.unwrap_or(u64::from(base.iterations)),
+        parallelism.unwrap_or(u64::from(base.parallelism)),
+    )
+}
+
+/// Sweep-directory set for commands that do not expand targets
+/// (`add`, `remove`, `passwd`): the domain root plus the lexical parent
+/// of every managed entry.
+pub fn lexical_sweep_dirs(root: &Path, entries: &[String]) -> Vec<PathBuf> {
+    let mut dirs = vec![root.to_path_buf()];
+    for rel in entries {
+        // The empty entry denotes the root itself, whose parent lies
+        // outside the domain and must never be swept.
+        if rel.is_empty() {
+            continue;
+        }
+        if let Some(parent) = root.join(rel).parent() {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    dirs
+}
+
+/// Inserts an entry into a sorted, deduplicated list; returns whether
+/// the list changed.
+pub fn insert_sorted(list: &mut Vec<String>, entry: &str) -> bool {
+    match list.binary_search_by(|e| e.as_str().cmp(entry)) {
+        Ok(_) => false,
+        Err(pos) => {
+            list.insert(pos, entry.to_owned());
+            true
+        }
+    }
+}
+
+/// Runs `process` serially over the targets, stopping at the first
+/// error and reporting the completed / failed / not-attempted lists on
+/// stderr. `process` returns the finished progress line (e.g.
+/// `encrypted a.txt`), or `None` for silent completion.
+pub fn run_serial<F>(files: &[TargetFile], mut process: F) -> Result<()>
+where
+    F: FnMut(&TargetFile) -> Result<Option<String>>,
+{
+    let mut completed: Vec<String> = Vec::new();
+    for (i, file) in files.iter().enumerate() {
+        match process(file) {
+            Ok(line) => {
+                if let Some(line) = line {
+                    report::out(&line);
+                    completed.push(line);
+                }
+            }
+            Err(e) => {
+                report::errline(format!(
+                    "aborted at the first error; {} of {} file(s) processed",
+                    i,
+                    files.len()
+                ));
+                if !completed.is_empty() {
+                    report::errline(format!(
+                        "completed ({}):\n  {}",
+                        completed.len(),
+                        completed.join("\n  ")
+                    ));
+                }
+                report::errline(format!("failed:\n  {}", file.rel));
+                let rest: Vec<&str> = files[i + 1..].iter().map(|f| f.rel.as_str()).collect();
+                if !rest.is_empty() {
+                    report::errline(format!(
+                        "not attempted ({}):\n  {}",
+                        rest.len(),
+                        rest.join("\n  ")
+                    ));
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses to replace a file with more than one hard link when
+/// (re-)encrypting: the other links would keep a stale alias.
+pub fn refuse_hard_links(file: &TargetFile, action: &str) -> Result<()> {
+    if file.nlink > 1 {
+        return Err(Error::Usage(format!(
+            "`{}` has {} hard links; {action} would leave the other links pointing at a stale copy — \
+             resolve the links first",
+            file.rel, file.nlink
+        )));
+    }
+    Ok(())
+}
+
+/// The plaintext modes a file can be encrypted in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Per-line deterministic encryption.
+    Text,
+    /// Chunked whole-file encryption with a file tag.
+    Binary,
+}
+
+/// Picks the mode for a plaintext: `force_binary` match or NUL byte in
+/// the content mean binary, everything else is text.
+pub fn pick_mode(loaded: &LoadedConfig, rel: &str, content: &[u8]) -> Mode {
+    if loaded.config.is_force_binary(rel) || content.contains(&0) {
+        Mode::Binary
+    } else {
+        Mode::Text
+    }
+}
+
+/// Encrypts content in the given mode under the current (index 0) key.
+pub fn encrypt_content(
+    keys: &[DomainKey],
+    rel: &str,
+    mode: Mode,
+    content: &[u8],
+) -> Result<Vec<u8>> {
+    let fk = crypto::FileKeys::derive(&keys[0], rel);
+    match mode {
+        Mode::Text => crate::textmode::encrypt(&fk, rel, content),
+        Mode::Binary => crate::binmode::encrypt(&fk, rel, content),
+    }
+}
+
+/// Password wrapped in `Zeroizing` for the commands that read it once
+/// up front.
+pub type Password = Zeroizing<String>;
