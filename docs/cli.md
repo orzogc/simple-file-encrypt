@@ -32,9 +32,12 @@ arguments must lie inside the domain root after canonicalization
 (containment checks are lexical; spellings come from directory
 enumeration — see [format.md](format.md)); an explicit argument that is
 a symlink — or any of whose components is detected to be one — is an
-error. The discovered domain root itself must not be a symlink either
-(the checks below cover only components *under* it); ancestors of the
-root are the user's own environment and are not policed. Managed
+error. The discovered domain root itself must not be a symlink either,
+and neither may any component the explicit argument introduced between
+the working directory and that root (a hostile checkout can plant such
+a link); only the root's ancestors *above* the working directory — the
+user's own environment, such as a symlinked home directory or `/tmp` —
+are trusted unchecked. Managed
 entries from the config are re-checked on every run: if any directory
 between the domain root and a stored entry has become a symlink, the
 command refuses to follow it instead of operating outside the domain.
@@ -114,7 +117,10 @@ KDF-related global options, honored by every command that runs Argon2:
 - Canonical paths never contain control characters (see
   [format.md](format.md)); a target or recursively discovered name
   containing one is a hard error, and any path the tool prints is
-  control-character-escaped regardless.
+  control-character-escaped regardless. The same hard error applies to
+  a name that is not valid UTF-8 at all: it cannot feed key derivation,
+  so it is refused rather than skipped — never silently left as
+  plaintext behind an otherwise-passing gate.
 - Only **regular files** are processed. During recursion, FIFOs,
   sockets, device nodes, and symlinks are skipped with a warning;
   naming one explicitly is an error.
@@ -422,6 +428,13 @@ silently. A file that fails this bar needs manual resolution (the error
 says so) — `--continue` never loops advice with `--prune`. It likewise
 refuses to declare completion while a managed path exists only as a
 symlink or special file: its content was never verified.
+
+A fresh `rekey`, by contrast, may start a new epoch while managed
+paths are missing or skipped: exit 0 then means the epoch started and
+everything *processed* was migrated — not that every managed path was
+verified. The old key is retained either way, and pending paths
+migrate when they reappear; full convergence is what `--continue` and
+`--prune` check.
 
 Old ring entries are **kept by default**: complete files from any
 retained epoch — on other branches, in stashes, in missed files — stay

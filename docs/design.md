@@ -213,9 +213,10 @@ This document is the entry point. Detailed specifications live in:
   and resume (`--continue`) semantics, locking, `check`/`verify`,
   synthesized `.git`-file repository boundaries (the worktree/submodule
   shape), and hostile filesystem states: symlinked managed ancestors
-  and domain roots, non-regular configs, control-character paths
-  (typed and discovered), newline-dense probe hits, broken-pipe
-  output, skipped-special scan/rotation semantics, concurrent
+  and domain roots (including argument-introduced ones), non-regular
+  configs, control-character or non-UTF-8 names (typed and
+  discovered), newline-dense probe hits, broken-pipe output,
+  skipped-special scan/rotation semantics, concurrent
   parent/child `init`), a key-ring tamper matrix over two- and
   three-entry rings (swap / drop head, middle, or tail / insert /
   duplicate / re-attach pre-prune wrappers → all rejected; whole-config
@@ -230,7 +231,9 @@ This document is the entry point. Detailed specifications live in:
 - **CI**: GitHub Actions on Linux + macOS, with every action pinned to
   a full commit SHA (Dependabot bumps them): `cargo fmt --check`,
   `cargo clippy -- -D warnings`, `cargo test`, a `cargo deny` job for
-  advisories and licenses, and a short `cargo fuzz` smoke over the
+  advisories and licenses, a feature-unification assertion that the
+  `zeroize` features of `aes`/`cmac` apply to the single version of
+  each crate in the tree, and a short `cargo fuzz` smoke over the
   config parser and both ciphertext decoders (targets in `fuzz/`).
   `unsafe_code` is denied crate-wide.
 
