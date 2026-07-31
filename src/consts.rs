@@ -68,6 +68,16 @@ pub const MAX_UNITS: u64 = 1 << 22;
 /// Hard cap on files per operation, after directory expansion.
 pub const MAX_FILES_PER_OP: usize = 65536;
 
+/// Hard cap on directory entries examined during one expansion or
+/// descendant scan, counting every visited entry (files, directories,
+/// skipped specials), so hostile trees cannot exhaust memory or time
+/// before the file cap applies.
+pub const MAX_SCANNED_ENTRIES: usize = 1 << 20;
+
+/// Hard cap on directory recursion depth during expansion and `init`'s
+/// descendant scan.
+pub const MAX_WALK_DEPTH: usize = 128;
+
 /// Hard cap on the config file size: 1 MiB.
 pub const MAX_CONFIG_SIZE: u64 = 1024 * 1024;
 

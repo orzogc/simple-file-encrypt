@@ -9,30 +9,25 @@ use std::path::PathBuf;
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// All failure modes of the core library.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum Error {
     /// An operating-system I/O failure, annotated with the path involved.
-    #[error("{op} `{path}`: {source}")]
     Io {
         /// Human-readable operation, e.g. "reading".
         op: &'static str,
         /// The path the operation targeted.
         path: PathBuf,
         /// The underlying OS error.
-        #[source]
         source: std::io::Error,
     },
 
     /// The domain config is missing, malformed, or fails validation.
-    #[error("config error: {0}")]
     Config(String),
 
     /// The config (or ciphertext) was produced by a newer tool version.
-    #[error("{0}; upgrade simple-encrypt")]
     NewerVersion(String),
 
     /// A ciphertext file violates the wire format.
-    #[error("`{path}`: {msg}")]
     Format {
         /// The offending file (canonical relative path).
         path: String,
@@ -41,7 +36,6 @@ pub enum Error {
     },
 
     /// Authentication failed on a ciphertext unit, marker, or file tag.
-    #[error("`{path}`: {msg}")]
     Auth {
         /// The offending file (canonical relative path).
         path: String,
@@ -50,42 +44,76 @@ pub enum Error {
     },
 
     /// The password failed to unwrap the key ring.
-    #[error("wrong password (or the config's salt/wrapped_keys were corrupted)")]
     WrongPassword,
 
     /// Ring entries do not all unwrap under the same KEK.
-    #[error(
-        "corrupt key ring: entry {index} does not unwrap under the same KEK as entry 0 \
-         (the config was tampered with or corrupted)"
-    )]
     RingCorrupt {
         /// Index of the first entry that failed to unwrap.
         index: usize,
     },
 
     /// KDF parameters violate a validation tier.
-    #[error("{0}")]
     Kdf(String),
 
     /// Another simple-encrypt instance holds the domain lock.
-    #[error("another simple-encrypt instance is running on `{root}`")]
     Locked {
         /// The domain root directory.
         root: PathBuf,
     },
 
     /// Password input failed (empty, over-long, unreadable, mismatch).
-    #[error("{0}")]
     Password(String),
 
     /// Command usage or target-selection error (outside domain, symlink
     /// argument, forbidden path, missing explicit target, ...).
-    #[error("{0}")]
     Usage(String),
 
     /// A hard resource limit was exceeded.
-    #[error("{0}")]
     Limit(String),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Paths are escaped against terminal/log injection; the
+            // string payloads are built from canonical paths (already
+            // control-free) or fixed text.
+            Error::Io { op, path, source } => {
+                write!(f, "{op} `{}`: {source}", crate::report::escape_path(path))
+            }
+            Error::Config(msg) => write!(f, "config error: {msg}"),
+            Error::NewerVersion(msg) => write!(f, "{msg}; upgrade simple-encrypt"),
+            Error::Format { path, msg } | Error::Auth { path, msg } => {
+                write!(f, "`{}`: {msg}", crate::report::escape_str(path))
+            }
+            Error::WrongPassword => write!(
+                f,
+                "wrong password (or the config's salt/wrapped_keys were corrupted)"
+            ),
+            Error::RingCorrupt { index } => write!(
+                f,
+                "corrupt key ring: entry {index} does not unwrap under the same KEK as entry 0 \
+                 (the config was tampered with or corrupted)"
+            ),
+            Error::Locked { root } => write!(
+                f,
+                "another simple-encrypt instance is running on `{}`",
+                crate::report::escape_path(root)
+            ),
+            Error::Kdf(msg) | Error::Password(msg) | Error::Usage(msg) | Error::Limit(msg) => {
+                write!(f, "{msg}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
 }
 
 impl Error {

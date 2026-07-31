@@ -753,6 +753,36 @@ fn key_ring_tamper_matrix_and_rollback() {
     fs::write(config_path(root), &gen2_cfg).unwrap();
     run_pw(root, PW, &["verify"]).expect_code(0);
 
+    // A three-entry ring adds the middle-entry cases: drop the middle,
+    // insert a forgery, or swap the head into the middle.
+    run_pw(root, PW, &["rekey"]).expect_code(0);
+    let keys3 = wrapped_keys_of(root);
+    assert_eq!(keys3.len(), 3);
+    let gen3_cfg = read_config(root);
+    let mutations3: Vec<Vec<String>> = vec![
+        vec![keys3[0].clone(), keys3[2].clone()], // drop middle
+        vec![keys3[1].clone(), keys3[0].clone(), keys3[2].clone()], // head into middle
+        vec![
+            keys3[0].clone(),
+            "f".repeat(96), // inserted forgery
+            keys3[1].clone(),
+            keys3[2].clone(),
+        ],
+    ];
+    for m in &mutations3 {
+        fs::write(config_path(root), &gen3_cfg).unwrap();
+        set_wrapped_keys(root, m);
+        let r = run_pw(root, PW, &["decrypt"]).expect_code(1);
+        assert!(
+            r.stderr.contains("wrong password") || r.stderr.contains("corrupt key ring"),
+            "unexpected error: {}",
+            r.stderr
+        );
+    }
+    // Sanity: the intact three-entry config still verifies.
+    fs::write(config_path(root), &gen3_cfg).unwrap();
+    run_pw(root, PW, &["verify"]).expect_code(0);
+
     // Rolling back the complete config generation together with its
     // ciphertext is cryptographically accepted (pinned by design).
     fs::write(config_path(root), &gen1_cfg).unwrap();
@@ -1086,4 +1116,253 @@ fn config_caps_are_enforced_on_the_write_side() {
         "config was rewritten despite the cap"
     );
     run_nopw(root, &["status"]).expect_code(0); // and still loads
+}
+
+// ---------------------------------------------------------------------
+// Hostile filesystem states
+// ---------------------------------------------------------------------
+
+#[test]
+fn managed_ancestor_symlink_escape_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(root.join("managed")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    write_file(&root, "managed/secret.txt", b"secret\n");
+    fs::write(outside.join("secret.txt"), b"outside\n").unwrap();
+    init_domain(&root);
+    run_pw(&root, PW, &["add", "managed/secret.txt"]).expect_code(0);
+
+    // Replace the managed directory with a symlink out of the domain
+    // (a hostile commit can carry exactly this change).
+    fs::remove_dir_all(root.join("managed")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("managed")).unwrap();
+    let stray = outside.join(".simple-encrypt.tmp.ABCDEFGH01234567");
+    fs::write(&stray, b"precious\n").unwrap();
+
+    // The stored entry must not be followed out of the domain.
+    let r = run_pw(&root, PW, &["encrypt"]).expect_code(1);
+    assert_contains(&r.stderr, "symlink");
+    assert_eq!(fs::read(outside.join("secret.txt")).unwrap(), b"outside\n");
+
+    // Commands that sweep (`add` sweeps the parents of managed entries)
+    // must not reach through the symlink either.
+    let r = run_nopw(&root, &["add", "other.txt"]);
+    assert_eq!(r.code, 0, "stderr: {}", r.stderr);
+    assert_contains(&r.stderr, "not sweeping");
+    assert!(stray.exists(), "the sweep must stay inside the domain");
+}
+
+#[test]
+fn config_must_be_a_regular_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_domain(root);
+
+    // A symlinked config is refused at open (O_NOFOLLOW).
+    let real = root.join("real.toml");
+    fs::rename(config_path(root), &real).unwrap();
+    std::os::unix::fs::symlink(&real, config_path(root)).unwrap();
+    let r = run_nopw(root, &["status"]).expect_code(1);
+    assert_contains(&r.stderr, "opening");
+    fs::remove_file(config_path(root)).unwrap();
+
+    // A FIFO config fails fast instead of blocking the read.
+    let mk = std::process::Command::new("mkfifo")
+        .arg(config_path(root))
+        .status()
+        .unwrap();
+    assert!(mk.success());
+    let mut c = se(root);
+    c.args(["status"])
+        .timeout(std::time::Duration::from_secs(30));
+    let r = run(c).expect_code(1);
+    assert_contains(&r.stderr, "not a regular file");
+}
+
+#[test]
+fn newline_dense_probe_hit_stays_cheap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_domain(root);
+    // The first-unit check must not materialize per-line slices of a
+    // newline-dense tail (~17x memory amplification before the fix).
+    let mut content = Vec::from(&b"#simple-encrypt v1 text\nAAAA\n"[..]);
+    content.extend(std::iter::repeat_n(b'\n', 8_000_000));
+    write_file(root, "dense.txt", &content);
+    run_pw(root, PW, &["add", "dense.txt"]).expect_code(0);
+    let r = run_pw(root, PW, &["encrypt"]).expect_code(1);
+    assert_contains(&r.stderr, "dense.txt");
+    assert_contains(&r.stderr, "fewer than 16 bytes");
+}
+
+#[test]
+fn temp_name_lookalikes_survive_the_sweep() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "x.txt", b"x\n");
+    init_domain(root);
+    let lookalikes = [
+        ".simple-encrypt.tmp.notes",
+        ".simple-encrypt.tmp.abc",
+        ".simple-encrypt.tmp.ABCDEFGH0123456789",
+        ".simple-encrypt.tmp.ABCDEFGH0123456!",
+    ];
+    for name in lookalikes {
+        write_file(root, name, b"keep\n");
+    }
+    run_nopw(root, &["add", "x.txt"]).expect_code(0);
+    for name in lookalikes {
+        assert!(root.join(name).exists(), "{name} must survive the sweep");
+    }
+}
+
+#[test]
+fn rekey_continue_rejects_mixed_epoch_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "m.txt", b"l1\nl2\nl3\n");
+    init_domain(root);
+    run_pw(root, PW, &["encrypt", "m.txt"]).expect_code(0);
+    let old_ct = read_file(root, "m.txt");
+    run_pw(root, PW, &["rekey"]).expect_code(0);
+    let new_ct = read_file(root, "m.txt");
+
+    // Splice a file whose first unit belongs to the current epoch and
+    // whose later units belong to the old one (a bad merge can produce
+    // exactly this).
+    let new_lines: Vec<&[u8]> = new_ct.split(|&b| b == b'\n').collect();
+    let old_lines: Vec<&[u8]> = old_ct.split(|&b| b == b'\n').collect();
+    let mixed = [new_lines[0], new_lines[1], old_lines[2], old_lines[3], b""].join(&b'\n');
+    write_file(root, "m.txt", &mixed);
+
+    // --continue must not report success over a deeply damaged file.
+    let r = run_pw(root, PW, &["rekey", "--continue"]).expect_code(1);
+    assert_contains(&r.stderr, "does not fully authenticate");
+    assert_contains(&r.stderr, "resolve the file manually");
+    // prune must not point back at --continue either (no advice loop).
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot prune");
+    assert_contains(&r.stderr, "resolve the file manually");
+    // The ring stays untouched.
+    assert_eq!(wrapped_keys_of(root).len(), 2);
+}
+
+#[test]
+fn prune_refuses_symlinked_managed_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "s.txt", b"data\n");
+    init_domain(root);
+    run_pw(root, PW, &["encrypt", "s.txt"]).expect_code(0);
+    run_pw(root, PW, &["rekey"]).expect_code(0);
+
+    fs::remove_file(root.join("s.txt")).unwrap();
+    std::os::unix::fs::symlink("/nonexistent-target", root.join("s.txt")).unwrap();
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
+    assert_contains(&r.stderr, "symlink or special file");
+    assert_eq!(wrapped_keys_of(root).len(), 2);
+}
+
+#[test]
+fn control_characters_in_paths_are_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_domain(root);
+    let evil = "evil\nFAILED fake.txt";
+    write_file(root, evil, b"x\n");
+
+    // Minting refuses control characters and reports them escaped.
+    let r = run_nopw(root, &["add", evil]).expect_code(1);
+    assert_contains(&r.stderr, "control character");
+    assert_contains(&r.stderr, "evil\\nFAILED");
+    assert!(
+        !r.stderr.contains("evil\nFAILED"),
+        "raw injection: {}",
+        r.stderr
+    );
+    let r = run_pw(root, PW, &["encrypt", evil]).expect_code(1);
+    assert_contains(&r.stderr, "control character");
+
+    // A hostile stored entry fails at load, shown in escaped form.
+    let cfg = read_config(root).replace("paths = []", "paths = [\"evil\\nfake.txt\"]");
+    fs::write(config_path(root), cfg).unwrap();
+    let r = run_nopw(root, &["status"]).expect_code(1);
+    assert_contains(&r.stderr, "control character");
+    assert_contains(&r.stderr, "evil\\nfake.txt");
+}
+
+#[test]
+fn broken_pipe_exits_141_instead_of_panicking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_domain(root);
+    // Enough output to overflow the pipe buffer after the reader leaves.
+    for i in 0..4000 {
+        write_file(root, &format!("dir/f{i:04}.txt"), b"x\n");
+    }
+    run_nopw(root, &["add", "dir"]).expect_code(0);
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_simple-encrypt"))
+        .arg("--allow-weak-kdf")
+        .arg("status")
+        .current_dir(root)
+        .env_remove("SIMPLE_ENCRYPT_PASSWORD")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    use std::io::Read;
+    let mut buf = [0u8; 1024];
+    let _ = stdout.read(&mut buf);
+    drop(stdout); // the consumer is gone; further writes hit EPIPE
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(141));
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(!stderr.contains("panic"), "stderr: {stderr}");
+}
+
+#[test]
+fn auto_add_registers_all_files_before_encrypting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_domain(root);
+    write_file(root, "d/a.txt", b"a\n");
+    write_file(root, "d/b.txt", b"b\n");
+    // One config rewrite covers the whole directory, before any file is
+    // encrypted (no per-file rewrite storm).
+    let r = run_pw(root, PW, &["encrypt", "d"]).expect_code(0);
+    let first_enc = r.stdout.find("encrypted ").unwrap();
+    let last_add = r.stdout.rfind("added ").unwrap();
+    assert!(
+        last_add < first_enc,
+        "all registrations must precede encryption:\n{}",
+        r.stdout
+    );
+    let cfg = read_config(root);
+    assert!(cfg.contains("d/a.txt") && cfg.contains("d/b.txt"));
+}
+
+#[test]
+fn overlong_password_input_is_bounded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "f.txt", b"x\n");
+    init_domain(root);
+    run_pw(root, PW, &["encrypt", "f.txt"]).expect_code(0);
+    // A newline-free stream far past the 4096-byte cap is rejected from
+    // a bounded read, not buffered whole first.
+    let mut c = se(root);
+    c.args(["verify"]);
+    c.write_stdin("A".repeat(1 << 20));
+    let r = run(c).expect_code(2);
+    assert_contains(&r.stderr, "4096");
 }

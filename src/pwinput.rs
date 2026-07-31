@@ -1,7 +1,7 @@
 //! Password input: environment variable, interactive no-echo prompt, or
 //! stdin lines, in that priority order (see `docs/cli.md`).
 
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
 
 use zeroize::{Zeroize, Zeroizing};
 
@@ -92,10 +92,13 @@ fn prompt_tty(prompt: &str) -> Result<Zeroizing<String>> {
 }
 
 /// Reads the next line from (non-TTY) stdin, stripping the trailing
-/// newline; no confirmation.
+/// newline; no confirmation. At most `MAX_PASSWORD_LEN + 2` bytes are
+/// read: enough to tell a valid line from an over-limit one, so an
+/// unbounded stream cannot exhaust memory before the length check runs.
 fn read_stdin_line(what: &str) -> Result<Zeroizing<String>> {
+    let mut limited = std::io::stdin().lock().take((MAX_PASSWORD_LEN + 2) as u64);
     let mut line = String::new();
-    let n = std::io::stdin().lock().read_line(&mut line).map_err(|e| {
+    let n = limited.read_line(&mut line).map_err(|e| {
         line.zeroize();
         Error::Password(format!("cannot read {what} from stdin: {e}"))
     })?;

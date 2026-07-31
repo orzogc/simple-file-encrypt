@@ -7,15 +7,36 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use crate::consts::{CONFIG_NAME, TMP_PREFIX};
+use crate::consts::{CONFIG_NAME, TMP_PREFIX, TMP_RAND_LEN};
 use crate::error::{Error, Result};
 
 /// File names that no command may touch and no config entry may claim.
 const PROTECTED_FINAL: [&str; 3] = [".gitattributes", ".gitmodules", CONFIG_NAME];
 
+/// Whether `s` contains a C0, DEL, or C1 control character. Such
+/// characters are banned from canonical paths so a hostile file name
+/// cannot inject lines or terminal sequences into the tool's output.
+pub fn has_control(s: &str) -> bool {
+    s.chars().any(|c| {
+        let u = c as u32;
+        u < 0x20 || (0x7F..=0x9F).contains(&u)
+    })
+}
+
+/// Whether `name` is exactly a tool temp-file name:
+/// `.simple-encrypt.tmp.<16 alnum>`. Only exact matches are swept as
+/// stale temps; lookalikes (`.simple-encrypt.tmp.notes`) are ordinary
+/// user files.
+pub fn is_temp_name(name: &str) -> bool {
+    let Some(rand) = name.strip_prefix(TMP_PREFIX) else {
+        return false;
+    };
+    rand.len() == TMP_RAND_LEN && rand.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 /// Validates an already-canonical relative path (a stored config entry):
 /// non-empty, `/`-separated, no leading/trailing `/`, no empty segments,
-/// no `.` or `..` segments.
+/// no `.` or `..` segments, no control characters.
 pub fn validate_canonical(entry: &str) -> Result<(), String> {
     if entry.is_empty() {
         return Err("empty path".into());
@@ -33,6 +54,9 @@ pub fn validate_canonical(entry: &str) -> Result<(), String> {
             _ => {}
         }
     }
+    if has_control(entry) {
+        return Err("contains a control character".into());
+    }
     Ok(())
 }
 
@@ -49,7 +73,7 @@ pub fn forbidden_reason(entry: &str) -> Option<String> {
             "`{last}` must stay readable as plaintext for git and simple-encrypt"
         ));
     }
-    if last.starts_with(TMP_PREFIX) {
+    if is_temp_name(last) {
         return Some("it is a simple-encrypt temp file".into());
     }
     None
@@ -128,8 +152,8 @@ pub fn mint(root: &Path, abs: &Path) -> Result<String> {
     let rel = abs.strip_prefix(root).map_err(|_| {
         Error::Usage(format!(
             "`{}` lies outside the domain rooted at `{}`",
-            abs.display(),
-            root.display()
+            crate::report::escape_path(abs),
+            crate::report::escape_path(root)
         ))
     })?;
     let mut canonical = String::new();
@@ -139,12 +163,17 @@ pub fn mint(root: &Path, abs: &Path) -> Result<String> {
         let Component::Normal(typed) = comp else {
             return Err(Error::Usage(format!(
                 "`{}`: unexpected path component after normalization",
-                abs.display()
+                crate::report::escape_path(abs)
             )));
         };
         let typed = typed
             .to_str()
-            .ok_or_else(|| Error::Usage(format!("`{}` is not valid UTF-8", abs.display())))?
+            .ok_or_else(|| {
+                Error::Usage(format!(
+                    "`{}` is not valid UTF-8",
+                    crate::report::escape_path(abs)
+                ))
+            })?
             .to_owned();
         let spelled = if missing {
             typed
@@ -159,13 +188,20 @@ pub fn mint(root: &Path, abs: &Path) -> Result<String> {
                 Ok(md) if md.file_type().is_symlink() => {
                     return Err(Error::Usage(format!(
                         "`{}` is or contains a symlink (`{}`); simple-encrypt refuses symlinked targets",
-                        abs.display(),
-                        candidate.display()
+                        crate::report::escape_path(abs),
+                        crate::report::escape_path(&candidate)
                     )));
                 }
                 Ok(md) => respell(&cur, &typed, &md)?,
             }
         };
+        if has_control(&spelled) {
+            return Err(Error::Usage(format!(
+                "`{}`: a path component contains a control character; \
+                 simple-encrypt refuses such names",
+                crate::report::escape_path(abs)
+            )));
+        }
         if !canonical.is_empty() {
             canonical.push('/');
         }
@@ -200,7 +236,7 @@ fn respell(dir: &Path, typed: &str, md: &std::fs::Metadata) -> Result<String> {
                     .ok_or_else(|| {
                         Error::Usage(format!(
                             "`{}`: filesystem-reported name is not valid UTF-8",
-                            dir.display()
+                            crate::report::escape_path(dir)
                         ))
                     })?
                     .to_owned(),

@@ -210,13 +210,19 @@ fn select_key(keys: &[DomainKey], path: &str, ad: &[u8], unit: &[u8]) -> Result<
 
 /// Authenticates only the first unit (or the empty-file marker) against
 /// the ring; used by `encrypt` to decide skip/migrate cheaply. Returns
-/// the authenticating key index.
+/// the authenticating key index. Only the first line is inspected:
+/// splitting the whole input into line slices would let a hostile
+/// newline-dense file cost ~17x its size in allocations before any
+/// check runs.
 pub fn authenticate_first(keys: &[DomainKey], path: &str, ct: &[u8]) -> Result<usize> {
     match parse_header(path, ct)? {
         Header::Marker(marker) => Ok(select_key(keys, path, AD_TEXT_EMPTY, &marker)?.0),
         Header::Units(rest) => {
-            let (unit_lines, _) = split_lines(rest);
-            let first = decode_unit(path, unit_lines[0])?;
+            let first_line = rest
+                .split(|&b| b == b'\n')
+                .next()
+                .expect("rest is non-empty");
+            let first = decode_unit(path, first_line)?;
             Ok(select_key(keys, path, AD_TEXT, &first)?.0)
         }
     }
@@ -446,6 +452,25 @@ mod tests {
         let err = decrypt(&ks, "f.txt", &ct).unwrap_err();
         assert!(matches!(err, Error::Limit(_)), "got: {err}");
         assert!(err.to_string().contains("force_binary"));
+    }
+
+    #[test]
+    fn authenticate_first_reads_only_the_first_line() {
+        let ks = keys(1);
+        let fk = FileKeys::derive(&ks[0], "f.txt");
+        // A valid first unit followed by millions of newlines: the
+        // authentication decision must not materialize per-line slices.
+        let mut ct = encrypt(&fk, "f.txt", b"hello\n").unwrap();
+        ct.extend(std::iter::repeat_n(b'\n', 4_000_000));
+        assert_eq!(authenticate_first(&ks, "f.txt", &ct).unwrap(), 0);
+        // An invalid first unit with a dense tail fails as a format error.
+        let mut bad = Vec::from(&b"#simple-encrypt v1 text\n"[..]);
+        bad.extend_from_slice(b"AA\n");
+        bad.extend(std::iter::repeat_n(b'\n', 4_000_000));
+        assert!(matches!(
+            authenticate_first(&ks, "f.txt", &bad),
+            Err(Error::Format { .. })
+        ));
     }
 
     #[test]

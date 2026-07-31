@@ -5,7 +5,7 @@
 use std::fs::{File, Metadata, OpenOptions, Permissions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::consts::{TMP_PREFIX, TMP_RAND_LEN};
 use crate::error::{Error, Result};
@@ -43,7 +43,7 @@ impl Snapshot {
     }
 
     /// Whether the file is still the one this snapshot was taken of.
-    fn matches(&self, other: &Snapshot) -> bool {
+    pub fn matches(&self, other: &Snapshot) -> bool {
         self.dev == other.dev
             && self.ino == other.ino
             && self.size == other.size
@@ -62,23 +62,41 @@ pub struct FileData {
 /// Reads a regular file whole, enforcing a size cap (violations are
 /// errors, not truncations) and detecting concurrent modification
 /// during the read.
+///
+/// The open uses `O_NOFOLLOW` and the descriptor is required to be a
+/// regular file, so a symlink, FIFO, or device fails fast instead of
+/// blocking the read or streaming without end. The read itself is
+/// bounded at `cap + 1` bytes: a file growing past the cap mid-read is
+/// rejected before it can allocate beyond the cap.
 pub fn read_capped(path: &Path, cap: u64, what: &str) -> Result<FileData> {
-    let mut file = File::open(path).map_err(|e| Error::io("opening", path, e))?;
+    let file = open_no_follow(path)?;
     let md = file
         .metadata()
         .map_err(|e| Error::io("inspecting", path, e))?;
+    require_regular(path, &md, what)?;
     if md.size() > cap {
         return Err(Error::Limit(format!(
             "`{}`: {} is {} bytes, exceeding the {cap}-byte cap",
-            path.display(),
+            report::escape_path(path),
             what,
             md.size()
         )));
     }
     let snap = Snapshot::of(&md);
     let mut content = Vec::with_capacity(md.size() as usize);
-    file.read_to_end(&mut content)
+    // Read at most cap + 1 bytes: one byte past the cap proves the file
+    // grew (or lied about its size) without an unbounded allocation.
+    let mut limited = file.take(cap.saturating_add(1));
+    limited
+        .read_to_end(&mut content)
         .map_err(|e| Error::io("reading", path, e))?;
+    if content.len() as u64 > cap {
+        return Err(Error::Limit(format!(
+            "`{}`: {} exceeds the {cap}-byte cap (it grew while being read)",
+            report::escape_path(path),
+            what
+        )));
+    }
     if content.len() as u64 != snap.size {
         return Err(Error::io(
             "reading",
@@ -91,10 +109,39 @@ pub fn read_capped(path: &Path, cap: u64, what: &str) -> Result<FileData> {
     Ok(FileData { content, snap })
 }
 
-/// Reads at most `n` leading bytes of a file; enough for the keyless
-/// ciphertext probe without pulling a large file into memory.
+/// Opens `path` read-only without following a symlinked final component
+/// and without blocking on a FIFO (`O_NONBLOCK` returns immediately;
+/// the caller's regular-file check then rejects it). `O_NONBLOCK` is a
+/// no-op for the regular files that pass the check.
+fn open_no_follow(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| Error::io("opening", path, e))
+}
+
+/// Requires the opened file to be a regular file: anything else (FIFO,
+/// socket, device) must never be read as content.
+fn require_regular(path: &Path, md: &Metadata, what: &str) -> Result<()> {
+    if !md.file_type().is_file() {
+        return Err(Error::Usage(format!(
+            "`{}`: {} is not a regular file",
+            report::escape_path(path),
+            what
+        )));
+    }
+    Ok(())
+}
+
+/// Reads at most `n` leading bytes of a regular file; enough for the
+/// keyless ciphertext probe without pulling a large file into memory.
 pub fn read_prefix(path: &Path, n: usize) -> Result<Vec<u8>> {
-    let file = File::open(path).map_err(|e| Error::io("opening", path, e))?;
+    let file = open_no_follow(path)?;
+    let md = file
+        .metadata()
+        .map_err(|e| Error::io("inspecting", path, e))?;
+    require_regular(path, &md, "probe target")?;
     let mut buf = vec![0u8; n];
     let mut filled = 0;
     let mut handle = file.take(n as u64);
@@ -184,10 +231,17 @@ fn fsync_dir(dir: &Path) -> Result<()> {
 /// by `expect`, rename while still `0600`, restore the original
 /// permission bits through the open descriptor, fsync again, fsync the
 /// directory. Returns the new file's snapshot.
+///
+/// The rename is the commit point: a failure after it (chmod, fsync)
+/// is a loud warning, not an error, because the content is already
+/// visible — reporting the file as untouched would be a lie.
 pub fn atomic_replace(path: &Path, expect: &Snapshot, content: &[u8]) -> Result<Snapshot> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| Error::Usage(format!("`{}` has no parent directory", path.display())))?;
+    let dir = path.parent().ok_or_else(|| {
+        Error::Usage(format!(
+            "`{}` has no parent directory",
+            report::escape_path(path)
+        ))
+    })?;
     let (mut file, guard) = create_temp(dir)?;
     file.write_all(content)
         .map_err(|e| Error::io("writing temp file", &guard.path, e))?;
@@ -213,13 +267,28 @@ pub fn atomic_replace(path: &Path, expect: &Snapshot, content: &[u8]) -> Result<
     let mut guard = guard;
     guard.armed = false;
 
-    // Restore the original permission bits only after the rename, so a
-    // crash leaves permissions too strict, never too loose.
-    file.set_permissions(Permissions::from_mode(expect.mode & 0o7777))
-        .map_err(|e| Error::io("restoring permissions of", path, e))?;
-    file.sync_all()
-        .map_err(|e| Error::io("fsyncing", path, e))?;
-    fsync_dir(dir)?;
+    // Past the rename the content is committed; a failure below must
+    // not be reported as if the file were still in its old state. Warn
+    // loudly instead: permissions may be left at 0600 (too strict,
+    // never too loose) and durability is uncertain until a later sync.
+    if let Err(e) = file.set_permissions(Permissions::from_mode(expect.mode & 0o7777)) {
+        report::warn(format!(
+            "`{}` was replaced, but restoring its permission bits failed: {e}; it is mode 0600 now",
+            report::escape_path(path)
+        ));
+    }
+    if let Err(e) = file.sync_all() {
+        report::warn(format!(
+            "`{}` was replaced, but fsyncing it failed: {e}; a crash may lose the new content",
+            report::escape_path(path)
+        ));
+    }
+    if let Err(e) = fsync_dir(dir) {
+        report::warn(format!(
+            "`{}` was replaced, but fsyncing its directory failed: {e}; a crash may lose the new content",
+            report::escape_path(path)
+        ));
+    }
     Ok(Snapshot::of(
         &file
             .metadata()
@@ -229,10 +298,16 @@ pub fn atomic_replace(path: &Path, expect: &Snapshot, content: &[u8]) -> Result<
 
 /// Creates `path` exclusively (`O_EXCL`) with the given content and
 /// permission bits, fsyncing the file and its directory. Used by `init`.
+/// A failure after creation removes the file: a half-written config
+/// must not strand the directory (every later `init` would refuse it as
+/// "already exists").
 pub fn create_exclusive(path: &Path, content: &[u8], mode: u32) -> Result<()> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| Error::Usage(format!("`{}` has no parent directory", path.display())))?;
+    let dir = path.parent().ok_or_else(|| {
+        Error::Usage(format!(
+            "`{}` has no parent directory",
+            report::escape_path(path)
+        ))
+    })?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -241,16 +316,24 @@ pub fn create_exclusive(path: &Path, content: &[u8], mode: u32) -> Result<()> {
         .open(path)
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
-                Error::Usage(format!("`{}` already exists", path.display()))
+                Error::Usage(format!("`{}` already exists", report::escape_path(path)))
             } else {
                 Error::io("creating", path, e)
             }
         })?;
+    // O_EXCL proves we created the file, so removing it on failure is
+    // safe; the guard is disarmed only after everything is durable.
+    let mut guard = TempGuard {
+        path: path.to_path_buf(),
+        armed: true,
+    };
     file.write_all(content)
         .map_err(|e| Error::io("writing", path, e))?;
     file.sync_all()
         .map_err(|e| Error::io("fsyncing", path, e))?;
-    fsync_dir(dir)
+    fsync_dir(dir)?;
+    guard.armed = false;
+    Ok(())
 }
 
 /// An advisory lock on the domain root directory, held for the life of
@@ -282,26 +365,86 @@ pub fn lock_dir(root: &Path, exclusive: bool) -> Result<DirLock> {
     }
 }
 
-/// Deletes stale `.simple-encrypt.tmp.*` files from the given
-/// directories (deduplicated). Failures are warnings, not errors; the
-/// exclusive lock guarantees no live instance owns them.
-pub fn sweep_temps<I: IntoIterator<Item = PathBuf>>(dirs: I) -> usize {
+/// Why a sweep directory is skipped without an error.
+enum SweepSkip {
+    /// Does not exist (or a component does not): nothing to sweep.
+    Missing,
+    /// Escapes the domain or crosses a symlink: sweeping it could
+    /// delete files outside the domain. Reported as a warning.
+    Unsafe,
+}
+
+/// Verifies that `dir` is the domain root or a descendant of it
+/// reachable through real directories only. A symlink anywhere between
+/// the root and `dir` would redirect the sweep outside the domain.
+fn check_sweep_dir(root: &Path, dir: &Path) -> std::result::Result<(), SweepSkip> {
+    let Ok(rel) = dir.strip_prefix(root) else {
+        return Err(SweepSkip::Unsafe);
+    };
+    let mut cur = root.to_path_buf();
+    for comp in rel.components() {
+        let Component::Normal(name) = comp else {
+            return Err(SweepSkip::Unsafe);
+        };
+        cur.push(name);
+        match cur.symlink_metadata() {
+            Ok(md) if md.file_type().is_symlink() => return Err(SweepSkip::Unsafe),
+            Ok(md) if md.file_type().is_dir() => {}
+            // A non-directory component (or an unreadable path) means
+            // `dir` cannot exist as a directory: nothing to sweep.
+            Ok(_) | Err(_) => return Err(SweepSkip::Missing),
+        }
+    }
+    Ok(())
+}
+
+/// Deletes stale temp files from the given directories (deduplicated):
+/// entries whose names match the tool's temp namespace exactly
+/// (`.simple-encrypt.tmp.<16 alnum>`). Directories must lie below
+/// `root` without crossing a symlink. Failures are warnings, not
+/// errors; the exclusive lock guarantees no live instance owns them.
+pub fn sweep_temps<I: IntoIterator<Item = PathBuf>>(root: &Path, dirs: I) -> usize {
     let mut removed = 0;
     let unique: std::collections::BTreeSet<PathBuf> = dirs.into_iter().collect();
     for dir in unique {
+        match check_sweep_dir(root, &dir) {
+            Ok(()) => {}
+            Err(SweepSkip::Missing) => continue,
+            Err(SweepSkip::Unsafe) => {
+                report::warn(format!(
+                    "not sweeping `{}` for stale temp files: not a real directory below the domain root",
+                    report::escape_path(&dir)
+                ));
+                continue;
+            }
+        }
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 report::warn(format!(
                     "cannot sweep `{}` for stale temp files: {e}",
-                    dir.display()
+                    report::escape_path(&dir)
                 ));
                 continue;
             }
         };
-        for entry in entries.flatten() {
-            if !entry.file_name().to_string_lossy().starts_with(TMP_PREFIX) {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    report::warn(format!(
+                        "cannot fully list `{}` for stale temp files: {e}",
+                        report::escape_path(&dir)
+                    ));
+                    continue;
+                }
+            };
+            let is_temp = entry
+                .file_name()
+                .to_str()
+                .is_some_and(crate::paths::is_temp_name);
+            if !is_temp {
                 continue;
             }
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
@@ -312,12 +455,15 @@ pub fn sweep_temps<I: IntoIterator<Item = PathBuf>>(dirs: I) -> usize {
             match std::fs::remove_file(&path) {
                 Ok(()) => {
                     removed += 1;
-                    report::note(format!("removed stale temp file `{}`", path.display()));
+                    report::note(format!(
+                        "removed stale temp file `{}`",
+                        report::escape_path(&path)
+                    ));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => report::warn(format!(
                     "cannot remove stale temp file `{}`: {e}",
-                    path.display()
+                    report::escape_path(&path)
                 )),
             }
         }
@@ -379,14 +525,73 @@ mod tests {
     }
 
     #[test]
-    fn sweep_removes_only_temp_files() {
+    fn sweep_removes_only_exact_temp_names() {
         let dir = tempfile::tempdir().unwrap();
-        let keep = dir.path().join("keep.txt");
-        let tmp = dir.path().join(format!("{TMP_PREFIX}abcdef0123456789"));
-        std::fs::write(&keep, b"k").unwrap();
-        std::fs::write(&tmp, b"t").unwrap();
-        assert_eq!(sweep_temps([dir.path().to_path_buf()]), 1);
-        assert!(keep.exists());
+        let root = dir.path();
+        let keep = root.join("keep.txt");
+        let tmp = root.join(format!("{TMP_PREFIX}abcdef0123456789"));
+        // Lookalikes outside the exact namespace must survive.
+        let short = root.join(format!("{TMP_PREFIX}abc"));
+        let long = root.join(format!("{TMP_PREFIX}abcdef0123456789ff"));
+        let notes = root.join(format!("{TMP_PREFIX}notes"));
+        let punct = root.join(format!("{TMP_PREFIX}abcdef012345678!"));
+        for p in [&keep, &tmp, &short, &long, &notes, &punct] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        assert_eq!(sweep_temps(root, [root.to_path_buf()]), 1);
         assert!(!tmp.exists());
+        for p in [&keep, &short, &long, &notes, &punct] {
+            assert!(p.exists(), "{} must survive the sweep", p.display());
+        }
+    }
+
+    #[test]
+    fn sweep_never_follows_symlinked_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(root.join("managed")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let stray = outside.join(format!("{TMP_PREFIX}abcdef0123456789"));
+        std::fs::write(&stray, b"x").unwrap();
+        // Replace the real directory with a symlink pointing outside.
+        std::fs::remove_dir(root.join("managed")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("managed")).unwrap();
+
+        assert_eq!(sweep_temps(&root, [root.join("managed")]), 0);
+        assert!(stray.exists(), "the sweep must not follow the symlink");
+        // The root itself is still swept.
+        std::fs::write(root.join(format!("{TMP_PREFIX}abcdef0123456789")), b"x").unwrap();
+        assert_eq!(sweep_temps(&root, [root.clone()]), 1);
+    }
+
+    #[test]
+    fn read_capped_rejects_symlinks_and_non_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("t");
+        std::fs::write(&target, b"data").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(read_capped(&link, 1024, "file").is_err());
+        assert!(read_prefix(&link, 16).is_err());
+        // A directory is not a regular file either.
+        assert!(read_capped(dir.path(), 1024, "file").is_err());
+    }
+
+    /// `/proc` files report size 0 but yield content: they exercise the
+    /// bounded read and the growth-detection branch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_capped_bounds_files_that_grow_while_reading() {
+        let proc = Path::new("/proc/self/status");
+        // Reports size 0 (<= cap) but yields far more than 16 bytes:
+        // the bounded read must trip the cap, not allocate freely.
+        let err = read_capped(proc, 16, "file").err().expect("must fail");
+        assert!(matches!(err, Error::Limit(_)), "got: {err}");
+        // With a generous cap the drift is caught by the size check.
+        let err = read_capped(proc, u64::MAX, "file")
+            .err()
+            .expect("must fail");
+        assert!(err.to_string().contains("changed size"), "got: {err}");
     }
 }

@@ -12,6 +12,7 @@ use crate::{fsops, paths, report};
 /// invocation's own arguments.
 fn sweep(domain: &super::Domain, rels: &[String]) {
     fsops::sweep_temps(
+        domain.root(),
         super::lexical_sweep_dirs(domain.root(), &domain.loaded.config.paths)
             .into_iter()
             .chain(super::lexical_sweep_dirs(domain.root(), rels)),

@@ -27,10 +27,10 @@ pub struct PasswdOpts {
 /// and the new password. No file content is read or written.
 pub fn passwd(opts: &PasswdOpts) -> Result<()> {
     let (mut domain, _) = super::open_domain(&[], true)?;
-    fsops::sweep_temps(super::lexical_sweep_dirs(
+    fsops::sweep_temps(
         domain.root(),
-        &domain.loaded.config.paths,
-    ));
+        super::lexical_sweep_dirs(domain.root(), &domain.loaded.config.paths),
+    );
 
     let old_password = pwinput::old_password()?;
     let keys = super::unlock_ring(&domain.loaded, &opts.gate, &old_password)?;
@@ -82,14 +82,14 @@ pub fn rekey(mode: RekeyMode, gate: &KdfGate) -> Result<()> {
         .map(|p| (p.clone(), Origin::Managed))
         .collect();
     let expanded = select::expand(domain.root(), &entries)?;
-    fsops::sweep_temps(expanded.sweep_dirs.clone());
+    fsops::sweep_temps(domain.root(), expanded.sweep_dirs.clone());
 
     let password = pwinput::primary(false)?;
     let keys = super::unlock_ring(&domain.loaded, gate, &password)?;
 
     match mode {
         RekeyMode::Prune => {
-            return prune(&mut domain, &password, gate, &keys, &expanded.files);
+            return prune(&mut domain, &password, gate, &keys, &expanded);
         }
         RekeyMode::Continue => {
             for missing in &expanded.missing_managed {
@@ -97,7 +97,14 @@ pub fn rekey(mode: RekeyMode, gate: &KdfGate) -> Result<()> {
                     "managed path `{missing}` is missing; it will migrate when it reappears"
                 ));
             }
-            return super::encrypt_pass(&mut domain, &keys, &expanded.files, false, false);
+            super::encrypt_pass(&mut domain, &keys, &expanded.files, false, false)?;
+            // Skip/migrate decisions authenticate the first unit only;
+            // a file can still be mixed-epoch or damaged deeper in. The
+            // rotation is finished only when everything fully
+            // authenticates under the current key.
+            ensure_all_current(&keys, &expanded.files)?;
+            report::out("rotation complete: every managed ciphertext uses the current key");
+            return Ok(());
         }
         RekeyMode::Fresh => {}
     }
@@ -167,29 +174,11 @@ fn find_old_epoch_file(keys: &[crypto::DomainKey], files: &[TargetFile]) -> Resu
     Ok(None)
 }
 
-/// `rekey --prune`: verify convergence under the current key, then
-/// rewrite the ring as a single freshly-wrapped entry under a fresh
-/// salt, so pre-prune wrappers can never be re-attached.
-fn prune(
-    domain: &mut Domain,
-    password: &str,
-    gate: &KdfGate,
-    keys: &[crypto::DomainKey],
-    files: &[TargetFile],
-) -> Result<()> {
-    // Every exact managed entry — file or directory — must exist on
-    // disk: the path could return from a stash or branch still
-    // encrypted under an old key.
-    for entry in &domain.loaded.config.paths {
-        if domain.root().join(entry).symlink_metadata().is_err() {
-            return Err(Error::Usage(format!(
-                "managed path `{entry}` is missing from disk; it could return from a stash or branch \
-                 still encrypted under an old key — `remove` the entry first if it is truly gone"
-            )));
-        }
-    }
-    // Every managed encrypted file must fully authenticate under the
-    // current key (a first-unit check would miss mixed-epoch files).
+/// Fully authenticates every encrypted managed file under the current
+/// ring key (entry 0). A first-unit check would miss mixed-epoch and
+/// deeply damaged files, so this is the convergence bar for
+/// `rekey --continue` and `rekey --prune`.
+fn ensure_all_current(keys: &[crypto::DomainKey], files: &[TargetFile]) -> Result<()> {
     let current = &keys[..1];
     for file in files {
         let data = fsops::read_capped(&file.abs, crate::consts::MAX_FILE_SIZE, "file")?;
@@ -206,13 +195,75 @@ fn prune(
                 .map(|e| e.to_string()),
         };
         if let Some(reason) = failed {
+            // Old-epoch content migrates with `--continue`; anything
+            // else needs manual resolution — never advise a loop.
+            let migratable = match probe(&data.content) {
+                Probe::TextV1 => textmode::decrypt(keys, &file.rel, &data.content).is_ok(),
+                Probe::Binary => binmode::decrypt(keys, &file.rel, &data.content).is_ok(),
+                _ => false,
+            };
+            let advice = if migratable {
+                "run `rekey --continue` (or `encrypt`) to migrate it first"
+            } else {
+                "resolve the file manually first (it is damaged or mixes key epochs)"
+            };
             return Err(Error::Usage(format!(
-                "cannot prune: `{}` does not fully authenticate under the current key ({reason}); \
-                 run `rekey --continue` (or `encrypt`) to migrate it first",
+                "`{}` does not fully authenticate under the current key ({reason}); {advice}",
                 file.rel
             )));
         }
     }
+    Ok(())
+}
+
+/// `rekey --prune`: verify convergence under the current key, then
+/// rewrite the ring as a single freshly-wrapped entry under a fresh
+/// salt, so pre-prune wrappers can never be re-attached.
+fn prune(
+    domain: &mut Domain,
+    password: &str,
+    gate: &KdfGate,
+    keys: &[crypto::DomainKey],
+    expanded: &select::Expanded,
+) -> Result<()> {
+    // Every exact managed entry — file or directory — must exist on
+    // disk: the path could return from a stash or branch still
+    // encrypted under an old key.
+    for entry in &domain.loaded.config.paths {
+        let abs = domain.root().join(entry);
+        match abs.symlink_metadata() {
+            Err(_) => {
+                return Err(Error::Usage(format!(
+                    "managed path `{entry}` is missing from disk; it could return from a stash or branch \
+                     still encrypted under an old key — `remove` the entry first if it is truly gone"
+                )));
+            }
+            Ok(md) if !md.file_type().is_file() && !md.file_type().is_dir() => {
+                return Err(Error::Usage(format!(
+                    "managed path `{entry}` is a symlink or special file, so its content was never \
+                     verified — resolve it (or `remove` the entry) before pruning"
+                )));
+            }
+            Ok(_) => {}
+        }
+    }
+    // Entries skipped during expansion are likewise unverified; prune
+    // must not converge past them.
+    if let Some(skipped) = expanded.skipped_special.first() {
+        return Err(Error::Usage(format!(
+            "managed path `{skipped}` is a symlink or special file and was skipped, so its content \
+             was never verified — resolve it (or `remove` the covering entry) before pruning"
+        )));
+    }
+    // Every managed encrypted file must fully authenticate under the
+    // current key.
+    ensure_all_current(keys, &expanded.files).map_err(|e| {
+        if let Error::Usage(msg) = e {
+            Error::Usage(format!("cannot prune: {msg}"))
+        } else {
+            e
+        }
+    })?;
 
     let dropped = domain.loaded.config.wrapped_keys.len() - 1;
     if dropped == 0 {

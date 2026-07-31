@@ -59,7 +59,7 @@ pub fn open_domain(args: &[PathBuf], exclusive: bool) -> Result<(Domain, Vec<Str
             let this = paths::discover_domain(&paths::resolution_start(&abs)).ok_or_else(|| {
                 Error::Usage(format!(
                     "`{}` is outside any simple-encrypt domain (no `.simple-encrypt.toml` found)",
-                    arg.display()
+                    report::escape_path(arg)
                 ))
             })?;
             match &root {
@@ -68,8 +68,8 @@ pub fn open_domain(args: &[PathBuf], exclusive: bool) -> Result<(Domain, Vec<Str
                 Some(r) => {
                     return Err(Error::Usage(format!(
                         "targets resolve to different domains (`{}` and `{}`); operate on one domain at a time",
-                        r.display(),
-                        this.display()
+                        report::escape_path(r),
+                        report::escape_path(&this)
                     )));
                 }
             }
@@ -90,7 +90,7 @@ pub fn open_domain(args: &[PathBuf], exclusive: bool) -> Result<(Domain, Vec<Str
         {
             return Err(Error::Usage(format!(
                 "cannot target `{}`: {reason}",
-                arg.display()
+                report::escape_path(arg)
             )));
         }
         rels.push(rel);

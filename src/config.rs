@@ -80,14 +80,16 @@ pub struct LoadedConfig {
 
 /// Validates a `paths` / `force_binary` entry at load time.
 fn validate_entry(kind: &str, entry: &str) -> Result<()> {
+    // The entry is hostile-input content; escape it in messages.
+    let shown = crate::report::escape_str(entry);
     if let Err(reason) = paths::validate_canonical(entry) {
         return Err(Error::Config(format!(
-            "`{kind}` entry `{entry}` is not a canonical relative path: {reason}"
+            "`{kind}` entry `{shown}` is not a canonical relative path: {reason}"
         )));
     }
     if let Some(reason) = paths::forbidden_reason(entry) {
         return Err(Error::Config(format!(
-            "`{kind}` entry `{entry}` is not allowed: {reason}"
+            "`{kind}` entry `{shown}` is not allowed: {reason}"
         )));
     }
     Ok(())
@@ -99,9 +101,14 @@ pub fn parse(content: &[u8]) -> Result<Config> {
         .map_err(|_| Error::Config("config file is not valid UTF-8".into()))?;
 
     // Check the version first, leniently, so a config from a newer tool
-    // yields "upgrade" instead of "unknown field".
-    let value: toml::Value =
-        toml::from_str(text).map_err(|e| Error::Config(format!("invalid TOML: {e}")))?;
+    // yields "upgrade" instead of "unknown field". The parser's
+    // diagnostics quote the (hostile) input; sanitize them.
+    let value: toml::Value = toml::from_str(text).map_err(|e| {
+        Error::Config(format!(
+            "invalid TOML: {}",
+            crate::report::escape_opaque(&e.to_string())
+        ))
+    })?;
     match value.get("version") {
         None => return Err(Error::Config("missing `version`".into())),
         Some(toml::Value::Integer(v)) => {
@@ -115,7 +122,8 @@ pub fn parse(content: &[u8]) -> Result<Config> {
         Some(_) => return Err(Error::Config("`version` must be an integer".into())),
     }
 
-    let raw: RawConfig = toml::from_str(text).map_err(|e| Error::Config(format!("{e}")))?;
+    let raw: RawConfig = toml::from_str(text)
+        .map_err(|e| Error::Config(crate::report::escape_opaque(&e.to_string()).into_owned()))?;
     debug_assert_eq!(
         raw.version, FORMAT_VERSION,
         "version was checked in the lenient pass"
@@ -327,6 +335,27 @@ impl LoadedConfig {
         self.config.paths.dedup();
         Ok(())
     }
+
+    /// Errors when the config file on disk no longer matches the
+    /// snapshot taken at load (or the last rewrite): another program
+    /// replaced it mid-operation, so ciphertext written under the
+    /// in-memory ring might be undecryptable by the on-disk config. The
+    /// advisory lock excludes other simple-encrypt instances, not git
+    /// or editors; a race inside the stat window remains (accepted, see
+    /// `docs/threat-model.md`).
+    pub fn ensure_fresh(&self) -> Result<()> {
+        let path = self.root.join(CONFIG_NAME);
+        let md =
+            std::fs::symlink_metadata(&path).map_err(|e| Error::io("re-checking", &path, e))?;
+        if !self.snap.matches(&Snapshot::of(&md)) {
+            return Err(Error::Usage(format!(
+                "`{}` changed on disk since it was loaded (another program rewrote it); \
+                 refusing to write ciphertext the on-disk config might not decrypt — re-run the command",
+                crate::report::escape_path(&path)
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -416,6 +445,24 @@ mod tests {
         let cfg = sample();
         create_new(dir.path(), &cfg).unwrap();
         assert!(load(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn ensure_fresh_detects_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = sample();
+        create_new(dir.path(), &cfg).unwrap();
+        let loaded = load(dir.path()).unwrap();
+        assert!(loaded.ensure_fresh().is_ok());
+        // In-place modification: mtime changes.
+        std::fs::write(dir.path().join(CONFIG_NAME), render(&cfg)).unwrap();
+        assert!(loaded.ensure_fresh().is_err());
+        // Same-content replacement via rename: the inode changes.
+        let loaded = load(dir.path()).unwrap();
+        let tmp = dir.path().join("staging.tmp");
+        std::fs::write(&tmp, render(&cfg)).unwrap();
+        std::fs::rename(&tmp, dir.path().join(CONFIG_NAME)).unwrap();
+        assert!(loaded.ensure_fresh().is_err());
     }
 
     #[test]

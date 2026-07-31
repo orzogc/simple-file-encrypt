@@ -9,7 +9,7 @@ repository = "https://github.com/orzogc/simple-encrypt"
 
 [dependencies]
 aes-siv = "0.7.0"
-argon2 = "0.5.3"
+argon2 = { version = "0.5.3", features = ["zeroize"] }
 base64 = "0.23.0"
 blake3 = "1.8.5"
 clap = { version = "4.6.4", features = ["derive"] }
@@ -17,9 +17,13 @@ libc = "0.2.189"
 rand = "0.10.2"
 rpassword = "7.5.4"
 serde = { version = "1.0.229", features = ["derive"] }
-thiserror = "2.0.19"
 toml = "1.1.4"
 zeroize = "1.9.0"
+
+# Not used directly: feature unification makes the CMAC state (and, on
+# aarch64, the AES round keys) inside aes-siv zeroize on drop.
+cmac = { version = "0.7", features = ["zeroize"] }
+aes = { version = "0.8", features = ["zeroize"] }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
@@ -32,7 +36,7 @@ lto = true
 [lints.rust]
 missing_docs = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs_dep)'] }
-#unsafe_code = "deny"
+unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "warn"
 unused_qualifications = "warn"
 

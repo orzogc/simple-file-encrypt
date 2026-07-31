@@ -5,9 +5,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use crate::consts::{CONFIG_NAME, MAX_FILES_PER_OP, TMP_PREFIX};
+use crate::consts::{CONFIG_NAME, MAX_FILES_PER_OP, MAX_SCANNED_ENTRIES, MAX_WALK_DEPTH};
 use crate::error::{Error, Result};
-use crate::report;
+use crate::{paths, report};
 
 /// Where a target entry came from; decides auto-add and
 /// `--assume-plaintext` eligibility.
@@ -51,6 +51,10 @@ pub struct Expanded {
     /// command: error for `encrypt`/`decrypt`, ignored for `check`,
     /// reported for `verify`).
     pub missing_explicit: Vec<String>,
+    /// Managed paths skipped because they are symlinks or special
+    /// files: never processed, but `rekey --prune` must treat them as
+    /// unverified content rather than converge past them.
+    pub skipped_special: Vec<String>,
     /// Directories to sweep for stale temp files: the domain root, the
     /// parents of all entries, and every directory visited.
     pub sweep_dirs: BTreeSet<PathBuf>,
@@ -64,8 +68,10 @@ pub fn expand(root: &Path, entries: &[(String, Origin)]) -> Result<Expanded> {
         files: BTreeMap::new(),
         missing_managed: Vec::new(),
         missing_explicit: Vec::new(),
+        skipped_special: Vec::new(),
         sweep_dirs: BTreeSet::from([root.to_path_buf()]),
         count: 0,
+        scanned: 0,
     };
     for (rel, origin) in entries {
         exp.add_entry(rel, *origin)?;
@@ -93,6 +99,7 @@ pub fn expand(root: &Path, entries: &[(String, Origin)]) -> Result<Expanded> {
         files: exp.files.into_values().collect(),
         missing_managed: exp.missing_managed,
         missing_explicit: exp.missing_explicit,
+        skipped_special: exp.skipped_special,
         sweep_dirs: exp.sweep_dirs,
     })
 }
@@ -103,8 +110,11 @@ struct Expander<'a> {
     files: BTreeMap<String, TargetFile>,
     missing_managed: Vec<String>,
     missing_explicit: Vec<String>,
+    skipped_special: Vec<String>,
     sweep_dirs: BTreeSet<PathBuf>,
     count: usize,
+    /// Directory entries examined so far (hostile-tree budget).
+    scanned: usize,
 }
 
 impl Expander<'_> {
@@ -145,7 +155,7 @@ impl Expander<'_> {
             if !rel.is_empty() {
                 self.check_boundary(rel, &abs)?;
             }
-            return self.walk_dir(rel, &abs, origin);
+            return self.walk_dir(rel, &abs, origin, 0);
         }
         if ft.is_file() {
             return self.add_file(rel, abs, origin, &md);
@@ -162,14 +172,18 @@ impl Expander<'_> {
             ))),
             Origin::Managed => {
                 report::warn(format!("skipping managed path `{rel}`: {kind}"));
+                self.skipped_special.push(rel.to_owned());
                 Ok(())
             }
         }
     }
 
-    /// For a managed entry, requires that no intermediate directory
-    /// between the root and the entry crosses a repository boundary or
-    /// holds a foreign domain config.
+    /// For a managed entry, requires that every intermediate directory
+    /// between the root and the entry is a real directory (never a
+    /// symlink) crossing no repository boundary and holding no foreign
+    /// domain config. A stored entry is re-checked on every run: a
+    /// directory replaced by a symlink since it was added must not
+    /// redirect operations outside the domain.
     fn check_ancestors(&self, rel: &str) -> Result<()> {
         let mut dir = self.root.to_path_buf();
         let Some((parents, _last)) = rel.rsplit_once('/') else {
@@ -177,8 +191,19 @@ impl Expander<'_> {
         };
         for comp in parents.split('/') {
             dir.push(comp);
-            if !dir.is_dir() {
+            let Ok(md) = dir.symlink_metadata() else {
                 return Ok(()); // Missing prefix: handled as a missing entry.
+            };
+            let ft = md.file_type();
+            if ft.is_symlink() {
+                return Err(Error::Usage(format!(
+                    "managed path `{rel}` passes through the symlink `{}`; \
+                     refusing to follow it outside the domain",
+                    report::escape_path(&dir)
+                )));
+            }
+            if !ft.is_dir() {
+                return Ok(()); // Not a directory prefix: the entry is missing.
             }
             self.check_boundary(rel, &dir)?;
         }
@@ -191,14 +216,14 @@ impl Expander<'_> {
         if dir.join(".git").symlink_metadata().is_ok() {
             return Err(Error::Usage(format!(
                 "`{rel}` lies inside the nested repository `{}`; it needs its own simple-encrypt domain",
-                dir.display()
+                report::escape_path(dir)
             )));
         }
         if dir.join(CONFIG_NAME).symlink_metadata().is_ok() {
             return Err(Error::Usage(format!(
                 "found a foreign `{CONFIG_NAME}` below the domain root, in `{}`; \
                  nested domains are not supported within one repository",
-                dir.display()
+                report::escape_path(dir)
             )));
         }
         Ok(())
@@ -242,8 +267,15 @@ impl Expander<'_> {
     }
 
     /// Recursively walks a directory in ascending name order, applying
-    /// the skip rules.
-    fn walk_dir(&mut self, rel: &str, abs: &Path, origin: Origin) -> Result<()> {
+    /// the skip rules. `depth` bounds recursion and every visited entry
+    /// counts against the scan budget, so hostile trees cannot exhaust
+    /// memory or time before the file cap applies.
+    fn walk_dir(&mut self, rel: &str, abs: &Path, origin: Origin, depth: usize) -> Result<()> {
+        if depth > MAX_WALK_DEPTH {
+            return Err(Error::Limit(format!(
+                "`{rel}`: directory nesting exceeds the {MAX_WALK_DEPTH}-level cap"
+            )));
+        }
         self.sweep_dirs.insert(abs.to_path_buf());
         // Children of an explicit directory are not "named".
         let child_origin = match origin {
@@ -252,6 +284,12 @@ impl Expander<'_> {
         };
         let mut names: Vec<std::ffi::OsString> = Vec::new();
         for entry in std::fs::read_dir(abs).map_err(|e| Error::io("listing", abs, e))? {
+            self.scanned += 1;
+            if self.scanned > MAX_SCANNED_ENTRIES {
+                return Err(Error::Limit(format!(
+                    "directory expansion examined more than {MAX_SCANNED_ENTRIES} entries"
+                )));
+            }
             names.push(entry.map_err(|e| Error::io("listing", abs, e))?.file_name());
         }
         names.sort_unstable();
@@ -278,7 +316,7 @@ impl Expander<'_> {
                 let Some(ns) = name_str else {
                     return Err(Error::Usage(format!(
                         "`{}`: file name is not valid UTF-8",
-                        child_abs.display()
+                        report::escape_path(&child_abs)
                     )));
                 };
                 let crel = child_rel(&ns);
@@ -294,7 +332,7 @@ impl Expander<'_> {
                          nested domains are not supported within one repository"
                     )));
                 }
-                self.walk_dir(&crel, &child_abs, child_origin)?;
+                self.walk_dir(&crel, &child_abs, child_origin, depth + 1)?;
                 continue;
             }
             // Non-directory entries with non-UTF-8 names cannot become
@@ -303,7 +341,7 @@ impl Expander<'_> {
             let Some(ns) = name_str else {
                 report::warn(format!(
                     "skipping `{}`: file name is not valid UTF-8",
-                    child_abs.display()
+                    report::escape_path(&child_abs)
                 ));
                 continue;
             };
@@ -312,7 +350,7 @@ impl Expander<'_> {
             if rel.is_empty() && ns == CONFIG_NAME {
                 continue;
             }
-            if ns.starts_with(TMP_PREFIX) {
+            if paths::is_temp_name(&ns) {
                 continue;
             }
             if ns == ".gitattributes" || ns == ".gitmodules" {
@@ -330,8 +368,10 @@ impl Expander<'_> {
                 self.add_file(&crel, child_abs, child_origin, &md)?;
             } else if md.file_type().is_symlink() {
                 report::warn(format!("skipping `{crel}`: a symlink"));
+                self.skipped_special.push(crel);
             } else {
                 report::warn(format!("skipping `{crel}`: not a regular file"));
+                self.skipped_special.push(crel);
             }
         }
         Ok(())
@@ -341,6 +381,7 @@ impl Expander<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consts::TMP_PREFIX;
 
     fn touch(path: &Path) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -399,6 +440,28 @@ mod tests {
         // caught too, not only files beneath it.
         let err = expand(root, &[("vendor".into(), Origin::Managed)]).unwrap_err();
         assert!(err.to_string().contains("nested repository"));
+    }
+
+    #[test]
+    fn managed_entry_through_symlinked_ancestor_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"x").unwrap();
+        std::fs::create_dir(root.join("managed")).unwrap();
+        // Replace the directory with a symlink pointing outside.
+        std::fs::remove_dir(root.join("managed")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("managed")).unwrap();
+
+        // The stored entry must not be followed out of the domain.
+        let err = expand(root, &[("managed/secret.txt".into(), Origin::Managed)]).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "got: {err}");
+        // A stored directory entry that is itself a symlink is skipped
+        // with a warning and recorded, not walked.
+        let exp = expand(root, &[("managed".into(), Origin::Managed)]).unwrap();
+        assert!(exp.files.is_empty());
+        assert_eq!(exp.skipped_special, ["managed"]);
     }
 
     #[test]

@@ -48,6 +48,7 @@ pub fn decrypt(opts: &DecryptOpts) -> Result<()> {
     }
     // Sweep the parents of all managed *and* explicit targets.
     fsops::sweep_temps(
+        domain.root(),
         expanded
             .sweep_dirs
             .iter()
@@ -92,6 +93,7 @@ pub fn decrypt(opts: &DecryptOpts) -> Result<()> {
                 file.rel, file.nlink
             ));
         }
+        domain.loaded.ensure_fresh()?;
         fsops::atomic_replace(&file.abs, &data.snap, &pt)?;
         Ok(Some(format!("decrypted {}", file.rel)))
     })

@@ -53,7 +53,9 @@ impl KdfParams {
     /// Whether this cost exceeds the defaults in any dimension (such a
     /// cost is announced before Argon2 runs).
     pub fn exceeds_default(&self) -> bool {
-        self.memory_kib > KDF_DEFAULT_MEMORY_KIB || self.iterations > KDF_DEFAULT_ITERATIONS
+        self.memory_kib > KDF_DEFAULT_MEMORY_KIB
+            || self.iterations > KDF_DEFAULT_ITERATIONS
+            || self.parallelism > KDF_DEFAULT_PARALLELISM
     }
 }
 

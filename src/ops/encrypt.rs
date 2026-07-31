@@ -53,6 +53,7 @@ pub fn encrypt(opts: &EncryptOpts) -> Result<()> {
     }
     // Sweep the parents of all managed *and* explicit targets.
     fsops::sweep_temps(
+        domain.root(),
         expanded
             .sweep_dirs
             .iter()
@@ -155,27 +156,39 @@ pub(crate) fn encrypt_pass(
     assume_plaintext: bool,
     auto_add: bool,
 ) -> Result<()> {
+    // Pre-register every explicit file that needs a managed entry in a
+    // single config rewrite, before any file is encrypted: an
+    // interruption can never leave an encrypted file untracked, and a
+    // directory of new files costs one rewrite instead of one per file.
+    // A file already covered by a managed directory entry is managed
+    // and gets no redundant entry; a registered file that is never
+    // encrypted (the run aborts early) is ordinary managed plaintext.
+    if auto_add {
+        let mut added: Vec<String> = Vec::new();
+        for file in files {
+            if file.explicit
+                && !domain
+                    .loaded
+                    .config
+                    .paths
+                    .iter()
+                    .any(|e| crate::paths::is_covered_by(&file.rel, e))
+                && insert_sorted(&mut domain.loaded.config.paths, &file.rel)
+            {
+                added.push(file.rel.clone());
+            }
+        }
+        if !added.is_empty() {
+            domain.loaded.rewrite()?;
+            for rel in &added {
+                report::out(format!("added {rel}"));
+            }
+        }
+    }
+
     run_serial(files, |file| {
         let data = fsops::read_capped(&file.abs, crate::consts::MAX_FILE_SIZE, "file")?;
         let action = plan(domain, keys, file, &data.content, assume_plaintext)?;
-
-        // Auto-add before encrypting (and for files that turn out to be
-        // already encrypted), so an interruption can never leave an
-        // encrypted file untracked. A file already covered by a managed
-        // directory entry is managed and gets no redundant entry.
-        if auto_add
-            && file.explicit
-            && !domain
-                .loaded
-                .config
-                .paths
-                .iter()
-                .any(|e| crate::paths::is_covered_by(&file.rel, e))
-            && insert_sorted(&mut domain.loaded.config.paths, &file.rel)
-        {
-            domain.loaded.rewrite()?;
-            report::out(format!("added {}", file.rel));
-        }
 
         match action {
             Action::Skip => Ok(Some(format!("skipped {} (already encrypted)", file.rel))),
@@ -183,6 +196,7 @@ pub(crate) fn encrypt_pass(
                 refuse_hard_links(file, "encrypting it")?;
                 let mode = pick_mode(&domain.loaded, &file.rel, &data.content);
                 let ct = super::encrypt_content(keys, &file.rel, mode, &data.content)?;
+                domain.loaded.ensure_fresh()?;
                 fsops::atomic_replace(&file.abs, &data.snap, &ct)?;
                 Ok(Some(format!("encrypted {}", file.rel)))
             }
@@ -195,6 +209,7 @@ pub(crate) fn encrypt_pass(
                 };
                 let mode = pick_mode(&domain.loaded, &file.rel, &pt);
                 let ct = super::encrypt_content(keys, &file.rel, mode, &pt)?;
+                domain.loaded.ensure_fresh()?;
                 fsops::atomic_replace(&file.abs, &data.snap, &ct)?;
                 let mode_note = if stored == Probe::TextV1 && mode == Mode::Binary {
                     " to binary mode"

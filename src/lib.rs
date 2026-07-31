@@ -1,8 +1,9 @@
 //! Internal library of the `simple-encrypt` binary.
 //!
-//! This crate-internal API exists so integration tests can drive the same
-//! code paths as the CLI. It is not a public library and carries no
-//! stability promise. The normative specification lives in `docs/`.
+//! The modules are `pub` only so the integration tests and the binary
+//! share one implementation; depending on this crate as a library is
+//! unsupported and every module may change without notice. The
+//! normative specification lives in `docs/`.
 
 pub mod binmode;
 pub mod config;
