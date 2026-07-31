@@ -29,6 +29,15 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+        # The zeroize features of aes/cmac must stay unified with the
+        # copies aes-siv actually uses (one version each), or the
+        # feature would silently apply to a version nothing uses.
+      - name: zeroize feature unification holds
+        run: |
+          cargo tree -e features --prefix none | grep -q '^aes feature "zeroize"'
+          cargo tree -e features --prefix none | grep -q '^cmac feature "zeroize"'
+          test "$(cargo tree -p aes --prefix none | grep -c '^aes ')" -eq 1
+          test "$(cargo tree -p cmac --prefix none | grep -c '^cmac ')" -eq 1
 
   msrv:
     runs-on: ubuntu-latest
