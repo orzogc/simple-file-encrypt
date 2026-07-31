@@ -194,8 +194,10 @@ This document is the entry point. Detailed specifications live in:
   API is not public and carries no stability promise.
 - **Dependencies** (intentionally lean): `clap` (derive CLI), `argon2`,
   `aes-siv` (RFC 5297 AEAD), `blake3`, `rand`, `zeroize`, `base64`,
-  `serde` + `toml`, `thiserror` (typed core errors), `rpassword`,
-  `libc` (Unix open flags). Advisory locking uses `std`'s native
+  `serde` + `toml`, `rpassword`, `libc` (Unix open flags). The
+  `zeroize` features of `argon2` and `cmac`/`aes` are enabled via
+  feature unification (see [crypto.md](crypto.md) hygiene). Advisory
+  locking uses `std`'s native
   `File::try_lock` (stable since 1.89); temp files are created by hand
   (`O_EXCL | O_NOFOLLOW`, CSPRNG names) so no temp-file crate is
   needed. Dev: `proptest`, `assert_cmd`, `tempfile`.
@@ -204,21 +206,29 @@ This document is the entry point. Detailed specifications live in:
   directory listings, with residual Unicode-normalization edge cases
   documented as fail-closed. Windows is neither tested nor supported.
 - **Testing**: unit tests (line splitting, path canonicalization, probe,
-  determinism, tamper rejection, text detection, KDF tier validation),
-  property tests (encrypt/decrypt round-trip is lossless for arbitrary
-  byte sequences), CLI integration tests (end-to-end flows,
-  `passwd`/`rekey` interruption and migration semantics, locking,
-  `check`/`verify`, git worktree and submodule `.git`-file boundaries),
-  a key-ring tamper matrix (swap / drop head, middle, or tail / insert /
+  determinism, tamper rejection, text detection, KDF tier validation,
+  bounded reads, temp-sweep matching and sweep symlink safety), property
+  tests (encrypt/decrypt round-trip is lossless for arbitrary byte
+  sequences), CLI integration tests (end-to-end flows, `rekey` rotation
+  and resume (`--continue`) semantics, locking, `check`/`verify`,
+  synthesized `.git`-file repository boundaries (the worktree/submodule
+  shape), and hostile filesystem states: symlinked managed ancestors,
+  non-regular configs, control-character paths, newline-dense probe
+  hits, broken-pipe output), a key-ring tamper matrix over two- and
+  three-entry rings (swap / drop head, middle, or tail / insert /
   duplicate / re-attach pre-prune wrappers → all rejected; whole-config
   rollback → cryptographically accepted by design and pinned as such;
   intact old-epoch file decrypts and migrates; mixed-epoch file fails;
   post-prune old-epoch file fails with the history hint), and golden
   fixtures with a fixed password/salt/domain key that pin the wire
   format and the derivation chain, so accidental format breaks fail
-  loudly.
-- **CI**: GitHub Actions on Linux + macOS: `cargo fmt --check`,
-  `cargo clippy -- -D warnings`, `cargo test`.
+  loudly. Kill- and fault-injection (crash mid-rename, post-rename
+  fsync failure) is covered by design review and the failure-semantics
+  spec, not by tests.
+- **CI**: GitHub Actions on Linux + macOS, with every action pinned to
+  a full commit SHA (Dependabot bumps them): `cargo fmt --check`,
+  `cargo clippy -- -D warnings`, `cargo test`, and a `cargo deny` job
+  for advisories and licenses. `unsafe_code` is denied crate-wide.
 
 ## Versioning
 

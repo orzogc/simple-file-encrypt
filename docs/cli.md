@@ -32,7 +32,10 @@ arguments must lie inside the domain root after canonicalization
 (containment checks are lexical; spellings come from directory
 enumeration — see [format.md](format.md)); an explicit argument that is
 a symlink — or any of whose components is detected to be one — is an
-error.
+error. Managed entries from the config are re-checked on every run: if
+any directory between the domain root and a stored entry has become a
+symlink, the command refuses to follow it instead of operating outside
+the domain.
 
 Nested domains are rejected within one repository: `init` refuses when
 the current directory, an ancestor, or a descendant directory already
@@ -82,8 +85,10 @@ cannot be obtained from any source is an error.
 
 Passwords must be valid UTF-8, non-empty, at most 4096 bytes, and are
 used as the exact bytes supplied — no Unicode normalization
-(see [crypto.md](crypto.md)). The password is checked by unwrapping the
-key ring before any file is touched; a mismatch aborts immediately.
+(see [crypto.md](crypto.md)). The stdin reader is itself bounded: it
+stops just past the limit instead of buffering an unbounded stream
+first. The password is checked by unwrapping the key ring before any
+file is touched; a mismatch aborts immediately.
 
 KDF-related global options, honored by every command that runs Argon2:
 `--allow-weak-kdf` and `--allow-expensive-kdf`
@@ -94,6 +99,14 @@ KDF-related global options, honored by every command that runs Argon2:
 - **Managed paths** (`paths` in the config) may be files or directories;
   directories are expanded recursively at run time. One invocation
   operates on at most 65536 files after expansion (hard error beyond).
+  Traversal itself is budgeted too: at most 2^20 directory entries
+  examined per expansion (and per `init` descendant scan) and at most
+  128 levels of nesting, so hostile trees cannot exhaust memory or time
+  before the file cap applies.
+- Canonical paths never contain control characters (see
+  [format.md](format.md)); a target whose name contains one is an
+  error, and any path the tool prints is control-character-escaped
+  regardless.
 - Only **regular files** are processed. During recursion, FIFOs,
   sockets, device nodes, and symlinks are skipped with a warning;
   naming one explicitly is an error.
@@ -105,12 +118,15 @@ KDF-related global options, honored by every command that runs Argon2:
   inside it resolve to no domain (domain resolution stops at repository
   boundaries — see above). The domain root itself is exempt, so a
   domain rooted in a linked worktree works.
-- During expansion the tool also skips the domain config itself, stale
-  `.simple-encrypt.tmp.*` files, and any file named `.gitattributes` or
-  `.gitmodules` — git must read those as plaintext, and encrypting
-  `.gitattributes` would destroy the very `-text` protection the
-  ciphertext depends on. Explicitly naming the domain config, a
-  `.gitattributes`, or a `.gitmodules` is an error.
+- During expansion the tool also skips the domain config itself, temp
+  files, and any file named `.gitattributes` or `.gitmodules` — git
+  must read those as plaintext, and encrypting `.gitattributes` would
+  destroy the very `-text` protection the ciphertext depends on.
+  Explicitly naming the domain config, a `.gitattributes`, or a
+  `.gitmodules` is an error. The temp-file namespace is exactly
+  `.simple-encrypt.tmp.<16 alphanumeric characters>`: such names are
+  reserved to the tool (skipped, swept when stale, refused as targets);
+  merely similar names are ordinary user files.
 - After expansion, targets with the same canonical path (a file named
   directly and again via a covering directory entry) are silently
   deduplicated. Two *different* canonical paths resolving to the same
@@ -127,14 +143,15 @@ KDF-related global options, honored by every command that runs Argon2:
 ### Encrypt-time bookkeeping (auto-add)
 
 `encrypt` with explicit arguments also works on files that are not yet
-managed. Each such **file** is added to `paths` (config rewritten
-atomically) *before* it is encrypted — and a file that turns out to be
-already encrypted (after passing the authentication check below) is
-added as well — so an interruption can never leave an encrypted file
-untracked. This keeps the managed list the source of truth for `status`,
-`check`, `verify`, and `rekey`, which must be able to find every
-encrypted file. Directories passed explicitly are expanded to files; the
-directory itself is not added.
+managed. Every such **file** is added to `paths` in a single atomic
+config rewrite *before* any file is encrypted — so an interruption can
+never leave an encrypted file untracked, and a directory of new files
+costs one rewrite instead of one per file. A file registered but never
+reached (the run aborts early) is simply managed plaintext. This keeps
+the managed list the source of truth for `status`, `check`, `verify`,
+and `rekey`, which must be able to find every encrypted file.
+Directories passed explicitly are expanded to files; the directory
+itself is not added.
 
 ### Probe, skip, migration, and collision rules
 
@@ -202,19 +219,29 @@ the error message names this cause.
   descriptor is fsynced again, and the directory is fsynced. Plaintext
   therefore never sits in a group- or world-readable temp file, and a
   crash between rename and `fchmod` leaves permissions too strict, not
-  too loose. Config rewrites use the same mechanism.
+  too loose. Config rewrites use the same mechanism. Once the rename
+  has happened the content is committed: a failure in the later steps
+  (chmod, fsync) is reported as a **warning naming what did happen**
+  (permissions left at `0600`, durability uncertain), never as if the
+  file were still in its old state.
 - Immediately before the rename, the tool re-checks that the target is
   still the file it read: same `(device, inode)`, size, and mtime. A
   mismatch (an editor or build tool rewrote it mid-operation) fails
   that file instead of destroying the concurrent change. The check is
   best-effort — a race within the window remains possible
-  (see [threat-model.md](threat-model.md)).
-- At the start of every exclusive-lock command, stale
-  `.simple-encrypt.tmp.*` files are deleted from the domain root and
-  from the parent directories of all managed and explicit targets — not
-  merely "when encountered", so a crashed run's temp next to a
-  single-file entry is found too. The lock guarantees they cannot
-  belong to a live instance.
+  (see [threat-model.md](threat-model.md)). The config gets the same
+  treatment: before writing any ciphertext, the tool verifies that
+  `.simple-encrypt.toml` is still the file it loaded, so a mid-run
+  replacement (a `git checkout` in another terminal) aborts the command
+  instead of producing ciphertext the on-disk config cannot decrypt.
+- At the start of every exclusive-lock command, stale temp files are
+  deleted from the domain root and from the parent directories of all
+  managed and explicit targets — not merely "when encountered", so a
+  crashed run's temp next to a single-file entry is found too. Only
+  names matching the reserved namespace exactly are removed, and only
+  from directories reachable from the root without crossing a symlink
+  (a replaced directory is warned about and skipped). The lock
+  guarantees the temps cannot belong to a live instance.
 - Multi-file operations that modify files (`encrypt`, `decrypt`,
   `rekey`) run serially and **stop at the first error**, then report
   three lists: completed, failed (with the reason), and not attempted.
@@ -367,7 +394,12 @@ Interruption anywhere is safe: both keys stay in the config, so every
 file remains decryptable, and `rekey --continue` — or a plain
 `encrypt`, which performs the same migration — finishes the job.
 Missing managed files are reported and left alone; they migrate
-whenever they reappear.
+whenever they reappear. After its migration pass, `rekey --continue`
+**fully authenticates every managed ciphertext under the current key**
+before reporting success: skip decisions authenticate only the first
+unit, so a mixed-epoch or deeply damaged file would otherwise pass
+silently. A file that fails this bar needs manual resolution (the error
+says so) — `--continue` never loops advice with `--prune`.
 
 Old ring entries are **kept by default**: complete files from any
 retained epoch — on other branches, in stashes, in missed files — stay
@@ -380,12 +412,15 @@ cost of retention is that the current password unlocks every retained
 epoch.
 
 `rekey --prune` drops the older entries once every managed encrypted
-file authenticates under the current key. It hard-errors when any
-exact managed path entry — file **or directory** — is missing from
+file fully authenticates under the current key. It hard-errors when
+any exact managed path entry — file **or directory** — is missing from
 disk: the path could return from a stash or branch still encrypted
-under an old key; `remove` the entry first if it is truly gone. For a
-directory entry that exists, prune can only verify the files currently
-visible beneath it — it cannot prove other branches hold none.
+under an old key; `remove` the entry first if it is truly gone. The
+same refusal applies to a managed entry that exists only as a symlink
+or special file, and to anything expansion had to skip: their content
+was never verified, so they are not convergence. For a directory entry
+that exists, prune can only verify the files currently visible beneath
+it — it cannot prove other branches hold none.
 Cryptographically, prune is a full ring rewrite: unwrap the whole
 ring, verify convergence, generate a fresh salt (and thus a fresh KEK
 from the same password), re-wrap the retained current key as a ring of
@@ -408,6 +443,7 @@ retroactively unpublishes that short of rewriting history.
 | 0 | success (including "nothing to do") |
 | 1 | failure: wrong password, authentication/format error, I/O error, usage error — and, for `check`/`verify`, "violations found" |
 | 2 | `check`/`verify` only: operational error while checking |
+| 141 | the output consumer went away (broken pipe) — the status a SIGPIPE-killed Unix tool would report, so a truncated `check \| head` can never pass silently |
 
 Usage errors exit 1 like every other failure; the implementation must
 override clap's default exit code 2, which would collide with the
@@ -460,9 +496,11 @@ passes when the export contains no domain at all. Note that
 `checkout-index` runs git's checkout conversions: the exported bytes
 equal the index blobs only where managed paths carry `-text` and no
 filters — exactly what the attributes recipe above establishes. With
-misconfigured attributes the gate still judges encryptedness correctly
-(the probe survives EOL noise), but it is no longer examining the
-literal index bytes. `mktemp -d` plus `umask 077` keep the export
+misconfigured attributes the export is no longer the literal index
+bytes, and the probe is byte-strict: EOL conversion makes valid
+ciphertext probe as *unrecognized*, so the gate **fails closed** and
+blocks the commit rather than passing anything suspect. `mktemp -d`
+plus `umask 077` keep the export
 private; staged plaintext briefly exists under `$TMPDIR` — point it at
 a tmpfs if that matters. A domain config must itself be tracked for the
 export to contain it — which it must be anyway, since ciphertext is

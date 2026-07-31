@@ -19,6 +19,8 @@ of a file: its path relative to the domain root (the directory containing
 - no leading `./`, no trailing `/`, no empty segments, no `.` or `..`
   segments;
 - valid UTF-8 (paths that are not valid UTF-8 are rejected);
+- no C0, DEL, or C1 control characters (so a file name can never inject
+  lines or terminal control sequences into the tool's output);
 - bytes used exactly as given — no Unicode normalization and no case
   folding.
 

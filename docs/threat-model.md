@@ -166,11 +166,13 @@ history.
   storage, this tool cannot provide that.
 - **Local race conditions (TOCTOU)**: path checks (symlink detection,
   containment) are lexical checks followed by separate opens; a local
-  attacker racing between them can redirect writes. Closing this needs
-  `openat2`-style descriptor-relative traversal, deliberately not done
-  in v1. This matters only against local active attackers, who are out
-  of scope anyway — stated here so the symlink checks are not mistaken
-  for a security boundary.
+  attacker racing between a check and its use can redirect that access.
+  Closing this needs `openat2`-style descriptor-relative traversal,
+  deliberately not done in v1. The **static** case is not conceded: a
+  directory already replaced by a symlink (e.g. by a hostile commit) is
+  detected and refused on every run, and the config must be a real,
+  non-symlinked regular file — the residual gap is only the race, which
+  matters against local active attackers who are out of scope anyway.
 - **Active attackers with an encryption oracle** beyond the confirmation
   attack above: the deterministic design concedes adaptive
   chosen-plaintext games.
@@ -187,12 +189,12 @@ history.
 | `SIMPLE_ENCRYPT_PASSWORD` in the environment | Visible to same-user processes via `/proc`; prefer the interactive prompt outside CI. |
 | Crash during decryption | May leave a `.simple-encrypt.tmp.*` containing plaintext (mode `0600`) until the next exclusive-lock run sweeps the domain root and all target directories; treat as a plaintext spill. |
 | Concurrent runs on one domain | Guarded by an advisory `flock` on the domain root directory; the second instance fails fast. Advisory locks may not work on network filesystems — avoid concurrent use there. |
-| Another program rewriting a file mid-operation | The advisory lock excludes only other simple-encrypt instances. Before replacing a file the tool re-checks `(device, inode)`, size, and mtime against what it read and fails that file on mismatch; a race inside that window can still lose the concurrent edit. |
+| Another program rewriting a file mid-operation | The advisory lock excludes only other simple-encrypt instances. Before replacing a file the tool re-checks `(device, inode)`, size, and mtime against what it read and fails that file on mismatch; the config is likewise re-verified against its load-time snapshot before any ciphertext is written, so a mid-run config swap (e.g. `git checkout`) aborts instead of producing undecryptable files. A race inside either window remains. |
 | git EOL or filter conversion | Text ciphertext is byte-exact and LF-framed: mark managed paths `-text` in `.gitattributes`, and never apply clean/smudge filters or `working-tree-encoding` to them. A CRLF checkout fails closed as a format error. The tool itself refuses to encrypt `.gitattributes` and `.gitmodules`. |
 | File metadata beyond mode bits | Only Unix permission bits survive temp + rename: ownership, POSIX ACLs, extended attributes, security labels, and file flags are not preserved and may alter access semantics — keep files that depend on them out of managed paths. |
 | Hard links | `encrypt` refuses files with link count > 1: the other links would keep a readable plaintext alias. Resolve the links first. |
 | Moving/renaming an encrypted file | Decryption fails (path-bound keys). Rename in plaintext state; the auth-failure message hints at this cause. |
-| Hostile config in a cloned repo | KDF cost is tiered (security floor, flag-gated ceiling, absolute hard caps) with checked arithmetic; above-default cost is announced before Argon2 runs; unknown keys and versions are rejected; path entries cannot escape the domain root; file-size, line-count, file-count, ring-size, and config-size limits bound memory and CPU. |
+| Hostile config in a cloned repo | The config must be a real regular file (no symlink, FIFO, or device) and is read under a hard byte cap; KDF cost is tiered (security floor, flag-gated ceiling, absolute hard caps) with checked arithmetic; above-default cost is announced before Argon2 runs; unknown keys and versions are rejected; path entries cannot escape the domain root (stored entries are re-checked for symlinked ancestors on every run, and temp-file sweeping never crosses a symlink); file-size, line-count, file-count, ring-size, config-size, and traversal limits bound memory and CPU. |
 | Hand-editing `paths` in the config | Deleting the entry of a still-encrypted file hides it from `rekey`, stranding it under the old domain key after a rotation. Use `remove`, which refuses exactly this. |
 | Plaintext crafted to start with the magic | Probe-only `check` would pass it. `encrypt` errors on such files unless the user explicitly passes `--assume-plaintext`; use `verify` for authenticated checking. |
 | Staged-but-plaintext content in git | Working-tree `check` cannot see the index; use the pre-commit recipe in [cli.md](cli.md), which exports the index with `git checkout-index` and runs `check` against the staged tree (staged config included). |
