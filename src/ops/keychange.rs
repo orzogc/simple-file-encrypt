@@ -81,15 +81,28 @@ pub fn rekey(mode: RekeyMode, gate: &KdfGate) -> Result<()> {
         .iter()
         .map(|p| (p.clone(), Origin::Managed))
         .collect();
-    let expanded = select::expand(domain.root(), &entries)?;
+    let expanded = select::expand(domain.root(), &entries, &domain.loaded.config.excludes)?;
     fsops::sweep_temps(domain.root(), expanded.sweep_dirs.clone());
 
     let password = pwinput::primary(false)?;
     let keys = super::unlock_ring(&domain.loaded, gate, &password)?;
 
+    // Excluded paths holding this domain's ciphertext are hidden from
+    // the migration pass: `--continue` and `--prune` refuse to converge
+    // past them; a fresh rekey warns, consistent with its tolerance for
+    // missing paths (both catch up once resolved).
+    let excluded_hits = scan_excluded_ciphertext(&keys, &expanded.excluded)?;
+
     match mode {
         RekeyMode::Prune => {
-            return prune(&mut domain, &password, gate, &keys, &expanded);
+            return prune(
+                &mut domain,
+                &password,
+                gate,
+                &keys,
+                &expanded,
+                &excluded_hits,
+            );
         }
         RekeyMode::Continue => {
             // Content that exists but could not be verified (a symlink
@@ -101,6 +114,9 @@ pub fn rekey(mode: RekeyMode, gate: &KdfGate) -> Result<()> {
                      was never verified — resolve it (or `remove` the covering entry) first",
                     skipped.rel
                 )));
+            }
+            if let Some(hit) = excluded_hits.first() {
+                return Err(Error::Usage(excluded_hit_message(hit)));
             }
             for missing in &expanded.missing_managed {
                 report::warn(format!(
@@ -124,6 +140,15 @@ pub fn rekey(mode: RekeyMode, gate: &KdfGate) -> Result<()> {
             return Ok(());
         }
         RekeyMode::Fresh => {}
+    }
+
+    for hit in &excluded_hits {
+        report::warn(format!(
+            "excluded path `{}` holds this domain's ciphertext (ring entry {}) and is hidden \
+             from migration; it stays on its old key — decrypt it or `remove --exclude` the \
+             covering entry",
+            hit.rel, hit.idx
+        ));
     }
 
     // Refuse to mint another key while an earlier rotation is unfinished.
@@ -193,6 +218,78 @@ fn find_old_epoch_file(keys: &[crypto::DomainKey], files: &[TargetFile]) -> Resu
     Ok(None)
 }
 
+/// An excluded path holding this domain's ciphertext, found by
+/// [`scan_excluded_ciphertext`].
+struct ExcludedHit {
+    /// Canonical relative path.
+    rel: String,
+    /// Ring entry its content authenticates under.
+    idx: usize,
+    /// Whether the whole file decrypts (vs. first unit only: damaged
+    /// or mixing key epochs).
+    fully: bool,
+}
+
+/// Scans the excluded files for content that authenticates under any
+/// ring key: such ciphertext is hidden from the migration pass, so key
+/// rotation must not silently converge past it. Foreign-looking probe
+/// hits (authenticating under no key) are exactly what
+/// `add --exclude --force` exists for and are ignored.
+fn scan_excluded_ciphertext(
+    keys: &[crypto::DomainKey],
+    excluded: &[select::ExcludedFile],
+) -> Result<Vec<ExcludedHit>> {
+    let mut hits = Vec::new();
+    for ex in excluded {
+        let prefix = fsops::read_prefix(&ex.abs, crate::consts::PROBE_PREFIX_LEN)?;
+        if !probe(&prefix).is_hit() {
+            continue;
+        }
+        let data = match fsops::read_capped(&ex.abs, crate::consts::MAX_FILE_SIZE, "file") {
+            Ok(data) => data,
+            // Both sides of the size cap are enforced, so an over-cap
+            // probe hit cannot be this domain's ciphertext: foreign,
+            // and foreign content never blocks rotation.
+            Err(Error::Limit(_)) => continue,
+            Err(e) => return Err(e),
+        };
+        let kind = probe(&data.content);
+        match super::classify_excluded_ciphertext(keys, &ex.rel, &data.content, kind) {
+            super::ExcludedCiphertext::Authentic(idx) => hits.push(ExcludedHit {
+                rel: ex.rel.clone(),
+                idx,
+                fully: true,
+            }),
+            super::ExcludedCiphertext::FirstUnitOnly(idx) => hits.push(ExcludedHit {
+                rel: ex.rel.clone(),
+                idx,
+                fully: false,
+            }),
+            super::ExcludedCiphertext::Foreign => {}
+        }
+    }
+    Ok(hits)
+}
+
+/// The convergence-refusal message for one excluded ciphertext hit.
+fn excluded_hit_message(hit: &ExcludedHit) -> String {
+    if hit.fully {
+        format!(
+            "excluded path `{}` still holds valid ciphertext of this domain (ring entry {}), \
+             hidden from migration — decrypt it (`decrypt {}`) or `remove --exclude` the \
+             covering entry first",
+            hit.rel, hit.idx, hit.rel
+        )
+    } else {
+        format!(
+            "excluded path `{}` holds this domain's ciphertext (first unit authenticates under \
+             ring entry {}) but does not fully decrypt — it is damaged or mixes key epochs; \
+             resolve it manually first",
+            hit.rel, hit.idx
+        )
+    }
+}
+
 /// Fully authenticates every encrypted managed file under the current
 /// ring key (entry 0). A first-unit check would miss mixed-epoch and
 /// deeply damaged files, so this is the convergence bar for
@@ -244,6 +341,7 @@ fn prune(
     gate: &KdfGate,
     keys: &[crypto::DomainKey],
     expanded: &select::Expanded,
+    excluded_hits: &[ExcludedHit],
 ) -> Result<()> {
     // Nothing to drop: no convergence check is needed at all.
     let dropped = domain.loaded.config.wrapped_keys.len() - 1;
@@ -280,6 +378,14 @@ fn prune(
             "managed path `{}` is a symlink or special file and was skipped, so its content \
              was never verified — resolve it (or `remove` the covering entry) before pruning",
             skipped.rel
+        )));
+    }
+    // Excluded paths holding this domain's ciphertext would be stranded
+    // for good by dropping the ring entries they authenticate under.
+    if let Some(hit) = excluded_hits.first() {
+        return Err(Error::Usage(format!(
+            "cannot prune: {}",
+            excluded_hit_message(hit)
         )));
     }
     // Every managed encrypted file must fully authenticate under the

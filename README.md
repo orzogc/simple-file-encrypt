@@ -97,6 +97,7 @@ secrets/**      -text
 | `encrypt` (`e`) `[PATHS…]` | Encrypt managed or given files in place (auto-adds new ones) |
 | `decrypt` (`d`) `[PATHS…]` | Decrypt managed or given files in place |
 | `add` / `remove <PATHS…>` | Maintain the managed list (no password needed) |
+| `add --exclude` / `remove --exclude <PATHS…>` | Maintain the never-encrypt list: excluded paths are skipped even under a managed directory |
 | `status` | Report each managed file's state (no password) |
 | `check [PATHS…]` | CI gate: exit 0 iff everything probes as encrypted (no password) |
 | `verify [PATHS…]` | Fully authenticate ciphertext in memory; `check && verify` is the complete gate |

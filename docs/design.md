@@ -223,10 +223,12 @@ confidentiality for line-level diff and merge.
   documented as fail-closed. Windows is neither tested nor supported.
 - **Testing**: unit tests (line splitting, path canonicalization, probe,
   determinism, tamper rejection, text detection, KDF tier validation,
-  bounded reads, temp-sweep matching and sweep symlink safety), property
+  bounded reads, temp-sweep matching and sweep symlink safety, exclusion
+  routing and its relaxed rules under excluded subtrees), property
   tests (encrypt/decrypt round-trip is lossless for arbitrary byte
   sequences), CLI integration tests (end-to-end flows, `rekey` rotation
   and resume (`--continue`) semantics, locking, `check`/`verify`,
+  `excludes` bookkeeping, stranded-ciphertext refusals and recovery,
   synthesized `.git`-file repository boundaries (the worktree/submodule
   shape), and hostile filesystem states: symlinked managed ancestors
   and domain roots (including argument-introduced ones), non-regular

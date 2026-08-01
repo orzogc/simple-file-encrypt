@@ -63,6 +63,7 @@ secrets/**      -text
 | `encrypt`（`e`）`[PATHS…]` | 就地加密托管或指定的文件（自动纳入托管清单） |
 | `decrypt`（`d`）`[PATHS…]` | 就地解密托管或指定的文件 |
 | `add` / `remove <PATHS…>` | 维护托管清单（无需密码） |
+| `add --exclude` / `remove --exclude <PATHS…>` | 维护排除清单：被排除的路径即使位于托管目录下也不会被加密 |
 | `status` | 报告每个托管文件的状态（无需密码） |
 | `check [PATHS…]` | CI 闸门：全部探测为已加密才退出 0（无需密码） |
 | `verify [PATHS…]` | 在内存中完整认证密文；`check && verify` 是完整闸门 |

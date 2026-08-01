@@ -39,7 +39,7 @@ pub fn decrypt(opts: &DecryptOpts) -> Result<()> {
             .map(|r| (r, Origin::Explicit { named: true }))
             .collect()
     };
-    let expanded = select::expand(domain.root(), &entries)?;
+    let expanded = select::expand(domain.root(), &entries, &domain.loaded.config.excludes)?;
     if let Some(missing) = expanded.missing_explicit.first() {
         return Err(Error::Usage(format!("`{missing}` does not exist on disk")));
     }
@@ -58,7 +58,28 @@ pub fn decrypt(opts: &DecryptOpts) -> Result<()> {
                 &domain.loaded.config.paths,
             )),
     );
-    if expanded.files.is_empty() {
+    // Excluded paths are decrypt's repair channel: ciphertext hidden by
+    // an exclusion (a hand edit, a merge, a checkout from history) is
+    // exactly what decrypt must return to plaintext. Probe hits count
+    // as work to do; excluded plaintext is skipped and exempt from
+    // `--require-encrypted` (its plaintext is intentional).
+    let mut recover: Vec<&select::ExcludedFile> = Vec::new();
+    for ex in &expanded.excluded {
+        let prefix = fsops::read_prefix(&ex.abs, crate::consts::PROBE_PREFIX_LEN)?;
+        match probe(&prefix) {
+            Probe::TextV1 | Probe::Binary => recover.push(ex),
+            Probe::TextUnrecognized => report::note(format!(
+                "`{}` is excluded and has an unrecognized `#simple-file-encrypt` header; left untouched",
+                ex.rel
+            )),
+            Probe::Plain => {
+                if ex.named {
+                    report::out(format!("skipped {} (excluded, not encrypted)", ex.rel));
+                }
+            }
+        }
+    }
+    if expanded.files.is_empty() && recover.is_empty() {
         report::out("nothing to do");
         return Ok(());
     }
@@ -96,5 +117,78 @@ pub fn decrypt(opts: &DecryptOpts) -> Result<()> {
         domain.loaded.ensure_fresh()?;
         fsops::atomic_replace(&file.abs, &data.snap, &pt)?;
         Ok(Some(format!("decrypted {}", file.rel)))
-    })
+    })?;
+
+    // Recovery pass over excluded probe hits: this domain's ciphertext
+    // is decrypted; content that fails authentication is noted and left
+    // untouched — deliberately excluded foreign-looking content must
+    // never block a full decrypt. I/O errors still abort.
+    for ex in recover {
+        let data = match fsops::read_capped(&ex.abs, crate::consts::MAX_FILE_SIZE, "file") {
+            Ok(data) => data,
+            // Both sides of the size cap are enforced, so an over-cap
+            // probe hit cannot be this domain's ciphertext.
+            Err(Error::Limit(_)) => {
+                report::note(format!(
+                    "`{}` is excluded and probes as encrypted but exceeds the file-size cap, so \
+                     it cannot be this domain's ciphertext; left untouched",
+                    ex.rel
+                ));
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let kind = probe(&data.content);
+        let result = match kind {
+            Probe::TextV1 => textmode::decrypt(keys.as_slice(), &ex.rel, &data.content),
+            Probe::Binary => binmode::decrypt(keys.as_slice(), &ex.rel, &data.content),
+            // The file changed since the prefix probe; leave it alone.
+            _ => continue,
+        };
+        match result {
+            Ok((pt, _)) => {
+                if ex.nlink > 1 {
+                    report::warn(format!(
+                        "`{}` has {} hard links; the other links keep the previous (encrypted) \
+                         content",
+                        ex.rel, ex.nlink
+                    ));
+                }
+                domain.loaded.ensure_fresh()?;
+                fsops::atomic_replace(&ex.abs, &data.snap, &pt)?;
+                report::out(format!("decrypted {} (excluded; recovered)", ex.rel));
+            }
+            Err(e @ Error::Io { .. }) => return Err(e),
+            Err(_) => {
+                // Ours-but-damaged and foreign content get distinct
+                // notes: the former needs manual resolution, and
+                // pointing at "foreign" would send the user the wrong
+                // way.
+                let first = match kind {
+                    Probe::TextV1 => {
+                        textmode::authenticate_first(keys.as_slice(), &ex.rel, &data.content).ok()
+                    }
+                    Probe::Binary => {
+                        binmode::authenticate_first(keys.as_slice(), &ex.rel, &data.content).ok()
+                    }
+                    _ => None,
+                };
+                if let Some(idx) = first {
+                    report::note(format!(
+                        "`{}` is excluded and holds this domain's ciphertext (first unit \
+                         authenticates under ring entry {idx}) but does not fully decrypt — \
+                         damaged or mixing key epochs; left untouched, resolve it manually",
+                        ex.rel
+                    ));
+                } else {
+                    report::note(format!(
+                        "`{}` is excluded and probes as encrypted but does not authenticate \
+                         under this domain's keys; left untouched",
+                        ex.rel
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }

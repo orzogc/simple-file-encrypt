@@ -31,6 +31,17 @@ pub fn encrypt(opts: &EncryptOpts) -> Result<()> {
         ));
     }
     let (mut domain, rels) = super::open_domain(&opts.paths, true)?;
+    // Naming an excluded path is a contradiction: encrypting it would
+    // create exactly the stranded ciphertext exclusion hides from
+    // `rekey`, so there is no override — the fix is `remove --exclude`.
+    for rel in &rels {
+        if let Some(via) = domain.loaded.config.covering_exclude(rel) {
+            return Err(Error::Usage(format!(
+                "cannot encrypt `{rel}`: it is excluded (covered by the excludes entry `{via}`); \
+                 run `remove --exclude {via}` first"
+            )));
+        }
+    }
     let entries: Vec<(String, Origin)> = if rels.is_empty() {
         domain
             .loaded
@@ -44,7 +55,7 @@ pub fn encrypt(opts: &EncryptOpts) -> Result<()> {
             .map(|r| (r, Origin::Explicit { named: true }))
             .collect()
     };
-    let expanded = select::expand(domain.root(), &entries)?;
+    let expanded = select::expand(domain.root(), &entries, &domain.loaded.config.excludes)?;
     if let Some(missing) = expanded.missing_explicit.first() {
         return Err(Error::Usage(format!("`{missing}` does not exist on disk")));
     }
@@ -63,6 +74,12 @@ pub fn encrypt(opts: &EncryptOpts) -> Result<()> {
                 &domain.loaded.config.paths,
             )),
     );
+    if !expanded.excluded.is_empty() {
+        report::note(format!(
+            "skipping {} excluded file(s)",
+            expanded.excluded.len()
+        ));
+    }
     if expanded.files.is_empty() {
         report::out("nothing to do");
         return Ok(());

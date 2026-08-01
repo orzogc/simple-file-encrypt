@@ -282,6 +282,50 @@ where
     Ok(())
 }
 
+/// How content under an excluded path that probes as ciphertext relates
+/// to this domain's key ring. Exclusion hides a file from `encrypt` and
+/// `rekey` migration, so its holding *our* ciphertext is a stranding
+/// hazard — while deliberately excluded foreign-looking content (the
+/// `add --exclude --force` use case) must stay ignorable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExcludedCiphertext {
+    /// Fully decrypts under the given ring entry: stranded ciphertext.
+    Authentic(usize),
+    /// Only the first unit authenticates (under the given ring entry):
+    /// ours, but damaged or mixing key epochs — manual resolution.
+    FirstUnitOnly(usize),
+    /// Authenticates under no ring key: foreign or moved content.
+    Foreign,
+}
+
+/// Classifies an excluded probe hit against the ring. `kind` must be
+/// the probe of `content`; unrecognized headers are `Foreign` (they
+/// cannot be v1 ciphertext of this domain).
+pub(crate) fn classify_excluded_ciphertext(
+    keys: &[DomainKey],
+    rel: &str,
+    content: &[u8],
+    kind: crate::probe::Probe,
+) -> ExcludedCiphertext {
+    use crate::probe::Probe;
+    let (full, first) = match kind {
+        Probe::TextV1 => (
+            crate::textmode::decrypt(keys, rel, content).map(|(_, idx)| idx),
+            crate::textmode::authenticate_first(keys, rel, content),
+        ),
+        Probe::Binary => (
+            crate::binmode::decrypt(keys, rel, content).map(|(_, idx)| idx),
+            crate::binmode::authenticate_first(keys, rel, content),
+        ),
+        _ => return ExcludedCiphertext::Foreign,
+    };
+    match (full, first) {
+        (Ok(idx), _) => ExcludedCiphertext::Authentic(idx),
+        (Err(_), Ok(idx)) => ExcludedCiphertext::FirstUnitOnly(idx),
+        (Err(_), Err(_)) => ExcludedCiphertext::Foreign,
+    }
+}
+
 /// Refuses to replace a file with more than one hard link when
 /// (re-)encrypting: the other links would keep a stale alias.
 pub fn refuse_hard_links(file: &TargetFile, action: &str) -> Result<()> {

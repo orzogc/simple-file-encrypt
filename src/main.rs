@@ -80,8 +80,14 @@ enum Command {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
         /// Also mark the paths as `force_binary` (always binary mode).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "exclude")]
         binary: bool,
+        /// Add the paths to `excludes` (never encrypted) instead of the managed list.
+        #[arg(long)]
+        exclude: bool,
+        /// With --exclude: skip the refusal for content that probes as encrypted.
+        #[arg(long, requires = "exclude")]
+        force: bool,
     },
     /// Remove exact entries from the managed list.
     Remove {
@@ -89,11 +95,14 @@ enum Command {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
         /// Skip the still-encrypted refusal (the file becomes invisible to `rekey`).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "exclude")]
         force: bool,
         /// Remove the paths from `force_binary` instead of the managed list.
-        #[arg(long, conflicts_with = "force")]
+        #[arg(long, conflicts_with_all = ["force", "exclude"])]
         binary: bool,
+        /// Remove the paths from `excludes` instead of the managed list.
+        #[arg(long)]
+        exclude: bool,
     },
     /// Report the state of every managed file (no password).
     Status,
@@ -166,12 +175,18 @@ fn main() -> ExitCode {
                     require_encrypted,
                     gate,
                 }),
-                Command::Add { paths, binary } => ops::add(&paths, binary),
+                Command::Add {
+                    paths,
+                    binary,
+                    exclude,
+                    force,
+                } => ops::add(&paths, binary, exclude, force),
                 Command::Remove {
                     paths,
                     force,
                     binary,
-                } => ops::remove(&paths, force, binary),
+                    exclude,
+                } => ops::remove(&paths, force, binary, exclude),
                 Command::Status => ops::status(),
                 Command::Passwd { kdf } => ops::passwd(&ops::PasswdOpts {
                     memory_kib: kdf.memory_kib,

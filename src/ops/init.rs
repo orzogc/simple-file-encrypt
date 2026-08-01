@@ -153,6 +153,7 @@ pub fn init(opts: &InitOpts) -> Result<()> {
         kdf,
         paths: Vec::new(),
         force_binary: Vec::new(),
+        excludes: Vec::new(),
     };
     create_config(&cwd, &cfg)?;
     report::out(format!(

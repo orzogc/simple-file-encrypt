@@ -159,6 +159,28 @@ KDF-related global options, honored by every command that runs Argon2:
   migrating. `decrypt` only warns in the mirror case.
 - `force_binary` applies to a file when its canonical relative path
   equals an entry or is under a directory entry.
+- **Excluded paths** (`excludes` in the config, maintained by
+  `add --exclude` / `remove --exclude`) are never selected for
+  encryption, however reached: during managed-list *and* explicit
+  directory expansion, a file whose canonical relative path equals an
+  entry or lies under a directory entry is recorded as excluded instead
+  of selected (so auto-add never registers it). Coverage is the same
+  lexical rule as `force_binary`. An `excludes` entry may not equal or
+  cover an exact `paths` entry (see [format.md](format.md)); the
+  intended shape is an exclusion strictly below a managed directory.
+- Excluded **directories are still traversed** — read-only scans, key
+  rotation, and `decrypt` must be able to see what exclusion hides —
+  but beneath one the strict rules are relaxed: symlinks and special
+  files are ignored silently (they are not recorded as unverified
+  content), and names that are non-UTF-8 or contain control characters
+  are tolerated and ignored rather than hard errors — such names cannot
+  hold ciphertext recoverable at their path, and the exclusion already
+  declares the content off-limits. A foreign
+  `.simple-file-encrypt.toml` stays a hard error (a structural
+  violation, not an encryption choice), and nested repositories are
+  still never entered. Traversal budgets apply unchanged, so a huge
+  excluded tree can exceed them; the tool targets small secret sets.
+  Excluded files do not count toward the 65536-file operation cap.
 
 ### Encrypt-time bookkeeping (auto-add)
 
@@ -309,13 +331,29 @@ exist on disk is an error. `--assume-plaintext` as specified above.
 The password is read only when there is work to do: an empty target
 set prints `nothing to do` and exits 0 without it.
 
+Files reached through expansion that are covered by an `excludes` entry
+are skipped without being probed or read, summarized in one count note.
+**Naming an excluded path explicitly is a hard error** with no
+override: encrypting it would create exactly the stranded ciphertext
+that exclusion hides from `rekey` — the fix is `remove --exclude`.
+
 ### `decrypt [PATHS…]` (alias `d`)
 
 Mirror of `encrypt` plus `--require-encrypted` (see above), including
 the password-only-when-needed contract. Does not modify the managed
 list.
 
-### `add [--binary] <PATHS…>`
+Excluded paths are decrypt's **repair channel** for ciphertext hidden
+by an exclusion (a hand-edited config, a merge, a checkout from
+history): an excluded file that probes as encrypted and authenticates
+under a ring key is decrypted normally (reported as recovered), and
+counts as work to do for the password contract. One that fails
+authentication is noted and left untouched — deliberately excluded
+foreign-looking content (see `add --exclude --force`) must never block
+a full `decrypt`. Excluded plaintext is skipped (silently unless named)
+and exempt from `--require-encrypted`: its plaintext is intentional.
+
+### `add [--binary | --exclude [--force]] <PATHS…>`
 
 Canonicalize each path and insert it into `paths` (files or
 directories; deduplicated, sorted). An entry already covered by a
@@ -336,7 +374,33 @@ later `add --binary`. New marks are appended, preserving any
 hand-maintained order. A text-mode ciphertext under a newly marked
 path is migrated to binary by the next `encrypt`.
 
-### `remove [--binary] <PATHS…>`
+Adding a path covered by an `excludes` entry (with or without
+`--binary`) is refused: managing it is a contradiction — run
+`remove --exclude` first.
+
+With `--exclude` (conflicts with `--binary`), each path goes to
+`excludes` instead of the managed list: it is never encrypted, even
+under a managed directory. Needs no password. The same bookkeeping
+rules apply (deduplicated and sorted; an entry covered by an existing
+excludes entry is reported, a real directory entry collapses entries it
+now covers, a missing path is warned about but accepted). Two refusals
+protect against stranding:
+
+- a path that **would fully shadow an exact managed entry** (equal to
+  it, or a directory covering it) is refused — `remove` the managed
+  entries first, which itself refuses to strand ciphertext;
+- a path whose content (or, for a directory, any file beneath it)
+  **probes as encrypted** is refused — decrypt first, so exclusion
+  cannot hide live ciphertext from `encrypt` and `rekey`.
+  `--force` (valid only with `--exclude`) skips this probe refusal,
+  with a warning: it exists for content that only *looks* encrypted —
+  plaintext colliding with the probe, or foreign ciphertext copied into
+  the domain — which would otherwise block every `encrypt` run over its
+  directory, and which exclusion is the clean way to manage. If the
+  content really is this domain's ciphertext, `verify` and
+  `rekey --continue`/`--prune` will flag it, and `decrypt` recovers it.
+
+### `remove [--binary | --exclude] <PATHS…>`
 
 Remove exact entries from `paths`. Refuses to remove an entry whose
 file probes as encrypted (or, for a directory entry, that covers any
@@ -356,6 +420,13 @@ so the file stays managed and reverts to automatic mode choice.
 Existing binary ciphertext is **not** re-encrypted automatically —
 decrypt and re-encrypt to change its mode.
 
+With `--exclude` (conflicts with `--binary` and `--force`), remove
+exact entries from `excludes`: the paths become eligible for encryption
+again (the warning says so — the next `encrypt` run encrypts them where
+managed or explicitly targeted). A path covered by a broader excludes
+entry but not itself an entry is an error naming that entry; an entry
+that does not exist is an error.
+
 ### `status`
 
 For every managed file (directories expanded), print its state —
@@ -363,9 +434,11 @@ For every managed file (directories expanded), print its state —
 path that exists only as a symlink or other non-regular file), or
 `unrecognized` (a `#simple-file-encrypt`-prefixed first line that is no
 exact v1 header) — plus a `binary` marker where `force_binary` applies
-or the stored mode is binary. Needs no password. Exit code 0
-regardless of states (it is a report, not a gate); an I/O error while
-probing aborts with exit 1.
+or the stored mode is binary. Excluded plaintext is intentional and not
+listed (a large excluded tree would flood the report); an excluded file
+that probes as encrypted is an anomaly and gets an `excluded` line.
+Needs no password. Exit code 0 regardless of states (it is a report,
+not a gate); an I/O error while probing aborts with exit 1.
 
 ### `check [PATHS…]`
 
@@ -382,6 +455,12 @@ content that merely starts with the encryption magic, and it knows
 nothing about decryptability. Use `verify` for authenticated checking;
 use the pre-commit recipe below to run `check` against the **staged
 tree** rather than the working tree.
+
+Excluded paths are exempt (managed or explicitly named): their
+plaintext is intentional, and a keyless probe cannot tell this domain's
+stranded ciphertext from deliberately excluded foreign-looking content.
+`verify` and `rekey --continue`/`--prune` are the authoritative gates
+for that state.
 
 ### `verify [PATHS…]`
 
@@ -404,6 +483,15 @@ ever existed; whole-file integrity is what binary mode's file tag
 provides. This is also the
 command that detects deep corruption (`encrypt`'s skip check only
 authenticates the first unit).
+
+`verify` is also the authoritative gate for excluded paths, which
+`check` exempts: an excluded file that probes as encrypted is
+authenticated against the ring. If it decrypts under any ring key —
+or its first unit authenticates but the file does not fully decrypt
+(damaged or mixing key epochs) — that is **this domain's ciphertext
+hidden from migration**, reported as a failure; content that
+authenticates under no key is deliberately excluded foreign-looking
+material and is only noted. Excluded plaintext is not reported at all.
 
 ### `passwd` (alias `p`)
 
@@ -466,6 +554,14 @@ says so) — `--continue` never loops advice with `--prune`. It likewise
 refuses to declare completion while a managed path exists only as a
 symlink or special file: its content was never verified.
 
+Excluded paths are checked against the ring on every `rekey`: content
+there that authenticates under any ring key (fully, or first-unit-only)
+is this domain's ciphertext **hidden from the migration pass**. A fresh
+`rekey` warns and proceeds (consistent with its tolerance for missing
+paths); `--continue` and `--prune` refuse — the fix is `decrypt` (which
+recovers excluded ciphertext) or `remove --exclude`. Excluded content
+that authenticates under no key is foreign and never blocks rotation.
+
 A fresh `rekey`, by contrast, may start a new epoch while managed
 paths are missing or skipped: exit 0 then means the epoch started and
 everything *processed* was migrated — not that every managed path was
@@ -492,7 +588,12 @@ same refusal applies to a managed entry that exists only as a symlink
 or special file, and to anything expansion had to skip: their content
 was never verified, so they are not convergence. For a directory entry
 that exists, prune can only verify the files currently visible beneath
-it — it cannot prove other branches hold none.
+it — it cannot prove other branches hold none. The same on-disk-only
+visibility applies to excluded paths: prune checks the excluded files
+present at that moment, so an excluded ciphertext deleted from the
+working tree (the state `add --exclude --force` warns about) is beyond
+its reach and returns stranded if restored after a prune — recover such
+files with `decrypt` *before* deleting or pruning.
 Cryptographically, prune is a full ring rewrite: unwrap the whole
 ring, verify convergence, generate a fresh salt (and thus a fresh KEK
 from the same password), re-wrap the retained current key as a ring of

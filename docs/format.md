@@ -78,6 +78,14 @@ paths = [
     "secrets",
 ]
 
+# Excluded paths: files and directories (recursive) never selected for
+# encryption, even under a managed directory. Maintained by the tool:
+# ascending byte order, deduplicated. Older versions of
+# simple-file-encrypt refuse a config that carries this key.
+excludes = [
+    "secrets/README.md",
+]
+
 # Maintained by hand or by `add --binary` / `remove --binary`: paths
 # (files or directories) always encrypted in binary (whole-file) mode,
 # even if their content looks like text. The tool only appends/removes.
@@ -111,18 +119,30 @@ Validation on load (all failures are hard errors):
   config generation is detected.
 - `algorithm` must be `"argon2id"`. Parameter tiers (validity floor,
   security floor, resource ceiling): see [crypto.md](crypto.md).
-- Every `paths` / `force_binary` entry must be a valid canonical relative
-  path; a hand-edited entry that violates the rules (e.g. a trailing `/`)
-  is a load-time error. A trailing `/` in command-line input is stripped
-  before storing.
+- Every `paths` / `force_binary` / `excludes` entry must be a valid
+  canonical relative path; a hand-edited entry that violates the rules
+  (e.g. a trailing `/`) is a load-time error. A trailing `/` in
+  command-line input is stripped before storing.
 - No entry may target tool- or git-critical files: an entry with any
   component named `.git`, or whose final component is `.gitattributes`,
   `.gitmodules`, or `.simple-file-encrypt.toml`, is a load-time error — the
   managed list must never claim paths that every command would refuse
-  to touch.
-- `paths` and `force_binary` may be empty or absent (treated as empty).
-- The config file itself must not exceed 1 MiB, and `paths` plus
-  `force_binary` together must not exceed 65536 entries.
+  to touch (and an `excludes` entry for them would be misleading: they
+  are never encrypted anyway).
+- No `excludes` entry may equal or cover an exact `paths` entry: a fully
+  shadowed managed entry is a contradiction (it could never be
+  selected), and hand-editing one in could strand still-encrypted
+  content — a load-time error. An `excludes` entry strictly below a
+  managed *directory* entry is the intended use. A `force_binary` entry
+  covered by an exclusion is allowed: the mark is dormant while the
+  exclusion stands and applies again once it is removed.
+- `paths`, `force_binary`, and `excludes` may be empty or absent
+  (treated as empty). The tool omits the `excludes` key entirely when
+  the list is empty, so configs not using the feature remain loadable
+  by tool versions that predate it; a config that carries the key is
+  rejected by those versions as an unknown field (fail-closed).
+- The config file itself must not exceed 1 MiB, and `paths`,
+  `force_binary`, and `excludes` together must not exceed 65536 entries.
 
 `init` creates the config with `O_EXCL`; `add`, `remove`, `passwd`,
 `rekey`, and `encrypt` (auto-add) rewrite it atomically (temp + rename).
@@ -130,7 +150,9 @@ The tool writes the form above with entries in ascending byte order,
 deduplicated.
 `force_binary` is maintained by hand and by `add --binary` /
 `remove --binary`; the tool only appends to or removes exact entries
-from it, so the existing order is preserved verbatim.
+from it, so the existing order is preserved verbatim. `excludes` is
+maintained by `add --exclude` / `remove --exclude` (see
+[cli.md](cli.md)) and kept sorted like `paths`.
 
 ## Ciphertext probe
 
@@ -264,7 +286,7 @@ Hostile inputs must exhaust neither memory nor CPU. Hard limits
 | Directory recursion depth | 128 | expansion, `init` descendant scan |
 | Path bytes retained per expansion (selected files, visited directories, skipped specials, missing entries) | 64 MiB | expansion |
 | Config file size | 1 MiB | config load |
-| `paths` + `force_binary` entries | 65536 | config load |
+| `paths` + `force_binary` + `excludes` entries | 65536 | config load |
 | `wrapped_keys` entries | 64 | config load |
 | Password length | 4096 bytes | all password input |
 

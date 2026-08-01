@@ -1759,3 +1759,434 @@ fn case_insensitive_volume_respells_paths() {
         r.stdout
     );
 }
+
+// ---------------------------------------------------------------------
+// Excludes
+// ---------------------------------------------------------------------
+
+#[test]
+fn exclude_add_remove_bookkeeping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/keep.txt", b"keep\n");
+    write_file(root, "d/skip.txt", b"skip\n");
+    init_domain(root);
+
+    // The empty config renders no `excludes` key at all, so configs not
+    // using the feature stay loadable by older versions.
+    assert!(!read_config(root).contains("excludes"));
+
+    let r = run_nopw(root, &["add", "--exclude", "d/skip.txt"]).expect_code(0);
+    assert_contains(&r.stdout, "excluded d/skip.txt");
+    assert_contains(&read_config(root), "excludes = [");
+    assert_contains(&read_config(root), "\"d/skip.txt\"");
+
+    // Duplicate excludes are reported, not duplicated.
+    let r = run_nopw(root, &["add", "--exclude", "d/skip.txt"]).expect_code(0);
+    assert_contains(&r.stdout, "already excluded");
+
+    // A real directory entry collapses the entries it covers.
+    let r = run_nopw(root, &["add", "--exclude", "d"]).expect_code(0);
+    assert_contains(
+        &r.stdout,
+        "now covered by `d`; dropped the redundant excludes entry",
+    );
+    assert_contains(&r.stdout, "excluded d");
+    assert!(!read_config(root).contains("\"d/skip.txt\""));
+    let r = run_nopw(root, &["add", "--exclude", "d/skip.txt"]).expect_code(0);
+    assert_contains(&r.stdout, "already covered by the excludes entry `d`");
+
+    // Removal errors: covered-but-not-an-entry, and not-an-entry.
+    let r = run_nopw(root, &["remove", "--exclude", "d/skip.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "covered by the excludes entry `d`");
+    let r = run_nopw(root, &["remove", "--exclude", "stray.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "not an excludes entry");
+
+    let r = run_nopw(root, &["remove", "--exclude", "d"]).expect_code(0);
+    assert_contains(&r.stdout, "removed d from excludes");
+    assert_contains(&r.stderr, "eligible for encryption again");
+    // Empty again: the key disappears from the rendered config.
+    assert!(!read_config(root).contains("excludes"));
+
+    // A not-yet-existing path can be excluded (pre-declared), warned.
+    let r = run_nopw(root, &["add", "--exclude", "ghost.txt"]).expect_code(0);
+    assert_contains(&r.stderr, "does not exist on disk");
+    run_nopw(root, &["remove", "--exclude", "ghost.txt"]).expect_code(0);
+
+    // The domain root cannot be excluded.
+    let r = run_nopw(root, &["add", "--exclude", "."]).expect_code(1);
+    assert_contains(&r.stderr, "domain root");
+
+    // Flag combinations rejected by the CLI.
+    run_nopw(root, &["add", "--exclude", "--binary", "d/skip.txt"]).expect_code(1);
+    run_nopw(root, &["add", "--force", "d/skip.txt"]).expect_code(1);
+    run_nopw(root, &["remove", "--exclude", "--force", "d"]).expect_code(1);
+    run_nopw(root, &["remove", "--exclude", "--binary", "d"]).expect_code(1);
+}
+
+#[test]
+fn exclude_refuses_contradictions_with_the_managed_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/s.txt", b"secret\n");
+    write_file(root, "other.txt", b"other\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d/s.txt"]).expect_code(0);
+
+    // Excluding an exact managed entry (or a directory covering one)
+    // would fully shadow it: refused, `remove` first.
+    let r = run_nopw(root, &["add", "--exclude", "d/s.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "would fully shadow the managed entry (d/s.txt)");
+    let r = run_nopw(root, &["add", "--exclude", "d"]).expect_code(1);
+    assert_contains(&r.stderr, "would fully shadow the managed entry (d/s.txt)");
+
+    run_nopw(root, &["remove", "d/s.txt"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "d/s.txt"]).expect_code(0);
+
+    // The reverse direction: an excluded path cannot be managed.
+    let r = run_nopw(root, &["add", "d/s.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "it is excluded");
+    let r = run_nopw(root, &["add", "--binary", "d/s.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "it is excluded");
+    // Managing a directory *above* an exclusion is the intended use.
+    let r = run_nopw(root, &["add", "d"]).expect_code(0);
+    assert_contains(&r.stdout, "added d");
+
+    // A hand-edited contradiction fails closed at load time: append the
+    // managed entry to the existing `excludes` block by hand.
+    run_nopw(root, &["add", "other.txt"]).expect_code(0);
+    let cfg = read_config(root);
+    let broken = cfg.replace("\"d/s.txt\",", "\"d/s.txt\",\n    \"other.txt\",");
+    assert_ne!(broken, cfg);
+    fs::write(config_path(root), broken).unwrap();
+    let r = run_nopw(root, &["status"]).expect_code(1);
+    assert_contains(&r.stderr, "contradiction");
+}
+
+#[test]
+fn encrypt_skips_excluded_paths_and_refuses_naming_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/keep.txt", b"keep\n");
+    write_file(root, "d/skip.txt", b"skip\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "d/skip.txt"]).expect_code(0);
+
+    // Managed expansion skips the excluded file (with a count note).
+    let r = run_pw(root, PW, &["encrypt"]).expect_code(0);
+    assert_contains(&r.stdout, "encrypted d/keep.txt");
+    assert_contains(&r.stderr, "skipping 1 excluded file(s)");
+    assert!(!r.stdout.contains("d/skip.txt"));
+    assert_eq!(read_file(root, "d/skip.txt"), b"skip\n");
+
+    // The keyless gate treats excluded plaintext as intentional, both
+    // via the managed list and via explicit arguments.
+    run_nopw(root, &["check"]).expect_code(0);
+    run_nopw(root, &["check", "d"]).expect_code(0);
+    run_nopw(root, &["check", "d/skip.txt"]).expect_code(0);
+
+    // Naming an excluded path is a hard error, --assume-plaintext or not.
+    let r = run_pw(root, PW, &["encrypt", "d/skip.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "it is excluded");
+    let r = run_pw(root, PW, &["encrypt", "--assume-plaintext", "d/skip.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "it is excluded");
+
+    // Explicit directory expansion filters exclusions and never
+    // auto-adds excluded files.
+    write_file(root, "e/x.txt", b"x\n");
+    write_file(root, "e/y.txt", b"y\n");
+    run_nopw(root, &["add", "--exclude", "e/y.txt"]).expect_code(0);
+    let r = run_pw(root, PW, &["encrypt", "e"]).expect_code(0);
+    assert_contains(&r.stdout, "added e/x.txt");
+    assert_contains(&r.stdout, "encrypted e/x.txt");
+    // The excluded file is not auto-added: it appears in the `excludes`
+    // block only, never in `paths`.
+    let cfg = read_config(root);
+    let start = cfg.find("paths = [").unwrap();
+    let paths_block = &cfg[start..start + cfg[start..].find(']').unwrap()];
+    assert!(paths_block.contains("e/x.txt"), "{cfg}");
+    assert!(!paths_block.contains("e/y.txt"), "{cfg}");
+    assert_eq!(read_file(root, "e/y.txt"), b"y\n");
+
+    // A managed directory whose whole content is excluded is "nothing
+    // to do" — and needs no password (none is supplied here).
+    let tmp2 = tempfile::tempdir().unwrap();
+    let root2 = tmp2.path();
+    write_file(root2, "d2/only.txt", b"only\n");
+    init_domain(root2);
+    run_nopw(root2, &["add", "d2"]).expect_code(0);
+    run_nopw(root2, &["add", "--exclude", "d2/only.txt"]).expect_code(0);
+    let r = run_nopw(root2, &["encrypt"]).expect_code(0);
+    assert_contains(&r.stdout, "nothing to do");
+}
+
+#[test]
+fn exclude_refuses_encrypted_content_and_decrypt_recovers_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/s.txt", b"secret\n");
+    write_file(root, "d/sub/t.txt", b"tee\n");
+    write_file(root, "d/other.txt", b"other\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+
+    // Excluding a path that probes as encrypted is refused: the
+    // ciphertext would be hidden from `encrypt` and `rekey`.
+    let r = run_nopw(root, &["add", "--exclude", "d/s.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "probes as encrypted; decrypt it first");
+    assert_contains(&r.stderr, "`add --exclude --force` overrides");
+    // A directory covering encrypted files is refused the same way.
+    let r = run_nopw(root, &["add", "--exclude", "d/sub"]).expect_code(1);
+    assert_contains(&r.stderr, "d/sub/t.txt");
+    assert_contains(&r.stderr, "probes as encrypted");
+
+    // --force creates the stranded state, loudly.
+    let r = run_nopw(root, &["add", "--exclude", "--force", "d/s.txt"]).expect_code(0);
+    assert_contains(&r.stderr, "force-excluding");
+
+    // `status` reports the anomaly; `check` stays exempt (keyless, it
+    // cannot tell stranded from foreign); `verify` is authoritative.
+    let r = run_nopw(root, &["status"]).expect_code(0);
+    assert!(status_line(&r.stdout, "excluded", "d/s.txt"));
+    run_nopw(root, &["check"]).expect_code(0);
+    let r = run_pw(root, PW, &["verify"]).expect_code(1);
+    assert_contains(&r.stdout, "FAILED d/s.txt");
+    assert_contains(&r.stdout, "excluded path holds valid ciphertext");
+
+    // `remove` of the covering directory entry still sees the hidden
+    // ciphertext and refuses to strand it further.
+    let r = run_nopw(root, &["remove", "d"]).expect_code(1);
+    assert_contains(&r.stderr, "decrypt it first");
+
+    // `decrypt` is the repair channel: the stranded file is recovered.
+    let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
+    assert_contains(&r.stdout, "decrypted d/s.txt (excluded; recovered)");
+    assert_eq!(read_file(root, "d/s.txt"), b"secret\n");
+    let r = run_pw(root, PW, &["verify"]).expect_code(0);
+    assert!(!r.stdout.contains("FAILED"));
+    let r = run_nopw(root, &["status"]).expect_code(0);
+    assert!(!status_line(&r.stdout, "excluded", "d/s.txt"));
+
+    // Re-encrypting leaves the excluded file alone now.
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    assert_eq!(read_file(root, "d/s.txt"), b"secret\n");
+}
+
+#[test]
+fn exclude_manages_foreign_looking_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/real.txt", b"real\n");
+    let mut fake = BIN_MAGIC.to_vec();
+    fake.extend_from_slice(b"not really ciphertext");
+    write_file(root, "d/fake.bin", &fake);
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+
+    // A probe collision inside a managed directory blocks every
+    // encrypt run — the situation excludes exist to resolve.
+    let r = run_pw(root, PW, &["encrypt"]).expect_code(1);
+    assert_contains(&r.stderr, "d/fake.bin");
+
+    run_nopw(root, &["add", "--exclude", "--force", "d/fake.bin"]).expect_code(0);
+    let r = run_pw(root, PW, &["encrypt"]).expect_code(0);
+    assert_contains(&r.stdout, "encrypted d/real.txt");
+
+    // `status` surfaces the probe hit as an `excluded` line (keyless,
+    // it cannot tell foreign from stranded); excluded plaintext under
+    // `d` would not be listed at all.
+    let r = run_nopw(root, &["status"]).expect_code(0);
+    assert!(status_line(&r.stdout, "excluded", "d/fake.bin"));
+
+    // decrypt leaves it untouched (noted, never a hard error that
+    // would block the run).
+    let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
+    assert_contains(&r.stdout, "decrypted d/real.txt");
+    assert_contains(&r.stderr, "does not authenticate");
+    assert_eq!(read_file(root, "d/fake.bin"), fake);
+
+    // The gates pass over it: check is exempt, verify authenticates it
+    // as foreign and ignores it.
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    run_nopw(root, &["check"]).expect_code(0);
+    let r = run_pw(root, PW, &["verify"]).expect_code(0);
+    assert_contains(&r.stdout, "ignored");
+
+    // Key rotation converges past foreign content: it holds nothing of
+    // this domain to strand.
+    run_pw(root, PW, &["rekey"]).expect_code(0);
+    run_pw(root, PW, &["rekey", "--prune"]).expect_code(0);
+    assert_eq!(read_file(root, "d/fake.bin"), fake);
+}
+
+#[test]
+fn rekey_convergence_refuses_excluded_ciphertext() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/s.txt", b"secret\n");
+    write_file(root, "d/other.txt", b"other\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "--force", "d/s.txt"]).expect_code(0);
+
+    // A fresh rekey proceeds but warns: the excluded ciphertext stays
+    // on its old key.
+    let r = run_pw(root, PW, &["rekey"]).expect_code(0);
+    assert_contains(&r.stderr, "hidden from migration");
+    assert_eq!(wrapped_keys_of(root).len(), 2);
+
+    // Convergence claims refuse it.
+    let r = run_pw(root, PW, &["rekey", "--continue"]).expect_code(1);
+    assert_contains(&r.stderr, "still holds valid ciphertext of this domain");
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot prune");
+    assert_eq!(wrapped_keys_of(root).len(), 2);
+
+    // Recover the file (explicitly named, still excluded), then the
+    // rotation can finish and prune.
+    let r = run_pw(root, PW, &["decrypt", "d/s.txt"]).expect_code(0);
+    assert_contains(&r.stdout, "decrypted d/s.txt (excluded; recovered)");
+    let r = run_pw(root, PW, &["rekey", "--continue"]).expect_code(0);
+    assert_contains(&r.stdout, "rotation complete");
+    run_pw(root, PW, &["rekey", "--prune"]).expect_code(0);
+    assert_eq!(wrapped_keys_of(root).len(), 1);
+    assert_eq!(read_file(root, "d/s.txt"), b"secret\n");
+}
+
+#[test]
+fn exclude_probes_tolerate_hostile_names_in_hands_off_trees() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/real.txt", b"real\n");
+    fs::create_dir_all(root.join("d/weird")).unwrap();
+    fs::write(
+        root.join("d/weird").join(OsStr::from_bytes(b"bad\xffname")),
+        b"plain",
+    )
+    .unwrap();
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+
+    // Excluding a plaintext tree that contains a non-UTF-8 name — the
+    // kind of content this feature exists to fence off — must work
+    // without `--force`: the probe walks the candidate as if it were
+    // already excluded, so the relaxed name rules apply.
+    run_nopw(root, &["add", "--exclude", "d/weird"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+
+    // `remove` of the covering managed entry probes through the
+    // excluded subtree without tripping the strict name rules: it is
+    // refused for the real ciphertext, not for the hostile name…
+    let r = run_nopw(root, &["remove", "d"]).expect_code(1);
+    assert_contains(&r.stderr, "d/real.txt");
+    assert_contains(&r.stderr, "decrypt it first");
+    // …and succeeds normally once everything is plaintext, without
+    // needing `remove --force` (which would skip that protection).
+    run_pw(root, PW, &["decrypt"]).expect_code(0);
+    run_nopw(root, &["remove", "d"]).expect_code(0);
+}
+
+#[test]
+fn oversize_excluded_probe_hits_are_foreign_by_construction() {
+    use std::io::Write as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/real.txt", b"real\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+
+    // A sparse file over the 256 MiB cap that starts with the binary
+    // magic: it probes as encrypted but cannot be this domain's
+    // ciphertext (both sides of the cap are enforced at crypto time).
+    fs::create_dir_all(root.join("d")).unwrap();
+    let mut f = fs::File::create(root.join("d/huge.bin")).unwrap();
+    f.write_all(&BIN_MAGIC).unwrap();
+    f.set_len(256 * 1024 * 1024 + 1).unwrap();
+    drop(f);
+    run_nopw(root, &["add", "--exclude", "--force", "d/huge.bin"]).expect_code(0);
+
+    // Deliberately excluded oversize content must block nothing.
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
+    assert_contains(&r.stderr, "cannot be this domain's ciphertext");
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    let r = run_pw(root, PW, &["verify"]).expect_code(0);
+    assert_contains(&r.stdout, "ignored");
+    run_pw(root, PW, &["rekey"]).expect_code(0);
+    run_pw(root, PW, &["rekey", "--continue"]).expect_code(0);
+    run_pw(root, PW, &["rekey", "--prune"]).expect_code(0);
+}
+
+#[test]
+fn damaged_excluded_ciphertext_is_reported_as_ours() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/s.txt", b"one\ntwo\n");
+    write_file(root, "d/other.txt", b"other\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "--force", "d/s.txt"]).expect_code(0);
+
+    // Damage the second unit: the first still authenticates, so the
+    // content is provably this domain's — not foreign.
+    let ct = String::from_utf8(read_file(root, "d/s.txt")).unwrap();
+    let mut lines: Vec<String> = ct.lines().map(str::to_owned).collect();
+    let c = lines[2].remove(0);
+    lines[2].insert(0, if c == 'A' { 'B' } else { 'A' });
+    fs::write(root.join("d/s.txt"), lines.join("\n") + "\n").unwrap();
+
+    let r = run_pw(root, PW, &["verify"]).expect_code(1);
+    assert_contains(&r.stdout, "FAILED d/s.txt");
+    assert_contains(&r.stdout, "first unit authenticates");
+    let r = run_pw(root, PW, &["rekey", "--continue"]).expect_code(1);
+    assert_contains(&r.stderr, "does not fully decrypt");
+
+    // decrypt leaves it untouched with a note that points at damage,
+    // not at foreign content.
+    let damaged = read_file(root, "d/s.txt");
+    let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
+    assert_contains(&r.stderr, "damaged or mixing key epochs");
+    assert_eq!(read_file(root, "d/s.txt"), damaged);
+}
+
+#[test]
+fn decrypt_exempts_excluded_paths_from_require_encrypted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/enc.txt", b"enc\n");
+    write_file(root, "d/note.md", b"plain notes\n");
+    write_file(root, "d/odd.txt", b"#simple-file-encrypt v9 x\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "d/note.md"]).expect_code(0);
+    // The unrecognized header probes as encrypted: --force required.
+    run_nopw(root, &["add", "--exclude", "--force", "d/odd.txt"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+
+    // Excluded plaintext and unrecognized content are exempt from
+    // --require-encrypted; the managed file still decrypts.
+    let r = run_pw(root, PW, &["decrypt", "--require-encrypted"]).expect_code(0);
+    assert_contains(&r.stdout, "decrypted d/enc.txt");
+    assert_contains(&r.stderr, "unrecognized `#simple-file-encrypt` header");
+    assert_eq!(read_file(root, "d/note.md"), b"plain notes\n");
+    assert_eq!(read_file(root, "d/odd.txt"), b"#simple-file-encrypt v9 x\n");
+
+    // A domain whose only content is excluded non-recoverable material:
+    // nothing to do, and no password is read (none is supplied).
+    let tmp2 = tempfile::tempdir().unwrap();
+    let root2 = tmp2.path();
+    write_file(root2, "d2/odd.txt", b"#simple-file-encrypt v9 x\n");
+    init_domain(root2);
+    run_nopw(root2, &["add", "d2"]).expect_code(0);
+    run_nopw(root2, &["add", "--exclude", "--force", "d2/odd.txt"]).expect_code(0);
+    let r = run_nopw(root2, &["decrypt"]).expect_code(0);
+    assert_contains(&r.stdout, "nothing to do");
+}

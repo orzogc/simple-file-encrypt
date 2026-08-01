@@ -53,7 +53,7 @@ fn scan_entries(managed: &[String], rels: Vec<String>) -> Vec<(String, Origin)> 
 pub fn status() -> Result<()> {
     let (domain, _) = super::open_domain(&[], false)?;
     let entries = scan_entries(&domain.loaded.config.paths, Vec::new());
-    let expanded = select::expand(domain.root(), &entries)?;
+    let expanded = select::expand(domain.root(), &entries, &domain.loaded.config.excludes)?;
 
     let mut lines: Vec<(String, String)> = Vec::new();
     for missing in &expanded.missing_managed {
@@ -100,6 +100,18 @@ pub fn status() -> Result<()> {
             ),
         ));
     }
+    // Excluded plaintext is intentional and not listed (a large
+    // excluded tree would flood the report); an excluded probe hit is
+    // an anomaly worth a line — stranded or foreign-looking content.
+    for ex in &expanded.excluded {
+        let prefix = fsops::read_prefix(&ex.abs, crate::consts::PROBE_PREFIX_LEN)?;
+        if probe(&prefix).is_hit() {
+            lines.push((
+                ex.rel.clone(),
+                format!("excluded     {} (probes as encrypted)", ex.rel),
+            ));
+        }
+    }
     lines.sort();
     for (_, line) in lines {
         report::out(line);
@@ -113,8 +125,13 @@ pub fn status() -> Result<()> {
 pub fn check(arg_paths: &[PathBuf]) -> Result<ScanOutcome> {
     let (domain, rels) = super::open_domain(arg_paths, false)?;
     let entries = scan_entries(&domain.loaded.config.paths, rels);
-    let expanded = select::expand(domain.root(), &entries)?;
+    let expanded = select::expand(domain.root(), &entries, &domain.loaded.config.excludes)?;
 
+    // Excluded paths are exempt from the gate: their plaintext is
+    // intentional, and a keyless probe cannot tell this domain's
+    // stranded ciphertext from deliberately excluded foreign-looking
+    // content. `verify` and `rekey --continue`/`--prune` are the
+    // authoritative gates for that state.
     let mut violations = 0usize;
     let mut operational = 0usize;
     for file in &expanded.files {
@@ -163,7 +180,7 @@ pub fn check(arg_paths: &[PathBuf]) -> Result<ScanOutcome> {
 pub fn verify(arg_paths: &[PathBuf], gate: &KdfGate) -> Result<ScanOutcome> {
     let (domain, rels) = super::open_domain(arg_paths, false)?;
     let entries = scan_entries(&domain.loaded.config.paths, rels);
-    let expanded = select::expand(domain.root(), &entries)?;
+    let expanded = select::expand(domain.root(), &entries, &domain.loaded.config.excludes)?;
     let keys = super::read_password_and_unlock(&domain.loaded, gate)?;
 
     for missing in expanded
@@ -227,6 +244,68 @@ pub fn verify(arg_paths: &[PathBuf], gate: &KdfGate) -> Result<ScanOutcome> {
             Err(e) => {
                 failures += 1;
                 report::out(format!("FAILED {}: {e}", file.rel));
+            }
+        }
+    }
+    // Excluded paths: exclusion hides a file from `encrypt` and `rekey`
+    // migration, so holding *this domain's* ciphertext there is a
+    // stranding hazard — a failure. Content that authenticates under no
+    // ring key is deliberately excluded foreign-looking material and is
+    // only noted (that is what `add --exclude --force` is for).
+    for ex in &expanded.excluded {
+        let result =
+            fsops::read_prefix(&ex.abs, crate::consts::PROBE_PREFIX_LEN).and_then(|prefix| {
+                match probe(&prefix) {
+                    Probe::Plain => Ok(None),
+                    kind => {
+                        match fsops::read_capped(&ex.abs, crate::consts::MAX_FILE_SIZE, "file") {
+                            Ok(data) => Ok(Some(super::classify_excluded_ciphertext(
+                                &keys,
+                                &ex.rel,
+                                &data.content,
+                                kind,
+                            ))),
+                            // Both sides of the size cap are enforced,
+                            // so an over-cap probe hit cannot be this
+                            // domain's ciphertext.
+                            Err(Error::Limit(_)) => Ok(Some(super::ExcludedCiphertext::Foreign)),
+                            Err(e) => Err(e),
+                        }
+                    }
+                }
+            });
+        match result {
+            Ok(None) => {}
+            Ok(Some(super::ExcludedCiphertext::Authentic(idx))) => {
+                failures += 1;
+                report::out(format!(
+                    "FAILED {}: excluded path holds valid ciphertext of this domain (ring entry \
+                     {idx}); decrypt it or `remove --exclude` the covering entry (`{}`)",
+                    ex.rel, ex.via
+                ));
+            }
+            Ok(Some(super::ExcludedCiphertext::FirstUnitOnly(idx))) => {
+                failures += 1;
+                report::out(format!(
+                    "FAILED {}: excluded path holds this domain's ciphertext (first unit \
+                     authenticates under ring entry {idx}) but does not fully decrypt — damaged \
+                     or mixing key epochs; resolve it manually",
+                    ex.rel
+                ));
+            }
+            Ok(Some(super::ExcludedCiphertext::Foreign)) => {
+                report::out(format!(
+                    "excluded {} (probes as encrypted but does not authenticate; ignored)",
+                    ex.rel
+                ));
+            }
+            Err(e @ Error::Io { .. }) => {
+                operational += 1;
+                report::errline(format!("error verifying `{}`: {e}", ex.rel));
+            }
+            Err(e) => {
+                failures += 1;
+                report::out(format!("FAILED {}: {e}", ex.rel));
             }
         }
     }

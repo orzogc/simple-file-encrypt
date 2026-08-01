@@ -104,7 +104,7 @@ pub const MAX_PATH_BYTES: usize = 64 * 1024 * 1024;
 /// Hard cap on the config file size: 1 MiB.
 pub const MAX_CONFIG_SIZE: u64 = 1024 * 1024;
 
-/// Hard cap on `paths` plus `force_binary` entries together.
+/// Hard cap on `paths`, `force_binary`, and `excludes` entries together.
 pub const MAX_CONFIG_ENTRIES: usize = 65536;
 
 /// Hard cap on key-ring entries.

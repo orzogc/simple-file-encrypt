@@ -53,6 +53,25 @@ pub struct SkippedSpecial {
     pub symlink: bool,
 }
 
+/// A regular file covered by an `excludes` entry: never selected for
+/// encryption, but recorded so commands can see what exclusion hides —
+/// `decrypt` recovers stranded ciphertext, `verify` and
+/// `rekey --continue`/`--prune` refuse to converge past it, `status`
+/// reports it.
+#[derive(Debug, Clone)]
+pub struct ExcludedFile {
+    /// Canonical relative path.
+    pub rel: String,
+    /// Absolute on-disk path.
+    pub abs: PathBuf,
+    /// The `excludes` entry covering this file.
+    pub via: String,
+    /// Whether the file was literally named on the command line.
+    pub named: bool,
+    /// Hard-link count at scan time.
+    pub nlink: u64,
+}
+
 /// The result of expanding one invocation's entries.
 #[derive(Debug)]
 pub struct Expanded {
@@ -68,6 +87,10 @@ pub struct Expanded {
     /// files: never processed, but `rekey --prune` must treat them as
     /// unverified content rather than converge past them.
     pub skipped_special: Vec<SkippedSpecial>,
+    /// Regular files covered by an `excludes` entry, in ascending
+    /// canonical-path order: never selected, but visible to the
+    /// commands that must see what exclusion hides.
+    pub excluded: Vec<ExcludedFile>,
     /// Directories to sweep for stale temp files: the domain root, the
     /// parents of all entries, and every directory visited.
     pub sweep_dirs: BTreeSet<PathBuf>,
@@ -102,19 +125,28 @@ const MAX_SPECIAL_WARNINGS: usize = 20;
 
 /// Expands entries (canonical relative paths tagged with their origin)
 /// into the target file list. `""` denotes the domain root directory.
-pub fn expand(root: &Path, entries: &[(String, Origin)]) -> Result<Expanded> {
-    expand_with_budgets(root, entries, Budgets::DEFAULT)
+/// `excludes` must be sorted, deduplicated canonical relative paths
+/// (the loaded config form); covered files are recorded, not selected.
+pub fn expand(root: &Path, entries: &[(String, Origin)], excludes: &[String]) -> Result<Expanded> {
+    expand_with_budgets(root, entries, excludes, Budgets::DEFAULT)
 }
 
 /// [`expand`] with injectable budgets (see [`Budgets`]).
 fn expand_with_budgets(
     root: &Path,
     entries: &[(String, Origin)],
+    excludes: &[String],
     budgets: Budgets,
 ) -> Result<Expanded> {
+    debug_assert!(
+        excludes.is_sorted(),
+        "excludes must be sorted for exact-match lookup"
+    );
     let mut exp = Expander {
         root,
+        excludes,
         files: BTreeMap::new(),
+        excluded: BTreeMap::new(),
         missing_managed: Vec::new(),
         missing_explicit: Vec::new(),
         skipped_special: Vec::new(),
@@ -162,6 +194,7 @@ fn expand_with_budgets(
         missing_managed: exp.missing_managed,
         missing_explicit: exp.missing_explicit,
         skipped_special: exp.skipped_special,
+        excluded: exp.excluded.into_values().collect(),
         sweep_dirs: exp.sweep_dirs,
     })
 }
@@ -169,7 +202,10 @@ fn expand_with_budgets(
 /// Internal expansion state.
 struct Expander<'a> {
     root: &'a Path,
+    /// Sorted, deduplicated `excludes` entries in force.
+    excludes: &'a [String],
     files: BTreeMap<String, TargetFile>,
+    excluded: BTreeMap<String, ExcludedFile>,
     missing_managed: Vec<String>,
     missing_explicit: Vec<String>,
     skipped_special: Vec<SkippedSpecial>,
@@ -184,7 +220,56 @@ struct Expander<'a> {
     budgets: Budgets,
 }
 
-impl Expander<'_> {
+impl<'a> Expander<'a> {
+    /// The `excludes` entry covering `rel` (exact or an ancestor), if
+    /// any. Used once per expansion entry; during a walk, ancestor
+    /// coverage is carried by the walk state and children need only
+    /// [`Self::exact_exclude`].
+    fn covering_exclude(&self, rel: &str) -> Option<&'a str> {
+        let excludes: &'a [String] = self.excludes;
+        excludes
+            .iter()
+            .find(|e| paths::is_covered_by(rel, e))
+            .map(String::as_str)
+    }
+
+    /// The `excludes` entry exactly equal to `rel`, if any.
+    fn exact_exclude(&self, rel: &str) -> Option<&'a str> {
+        let excludes: &'a [String] = self.excludes;
+        excludes
+            .binary_search_by(|e| e.as_str().cmp(rel))
+            .ok()
+            .map(|i| excludes[i].as_str())
+    }
+
+    /// Records one excluded regular file, deduplicating repeats.
+    fn add_excluded(
+        &mut self,
+        rel: &str,
+        abs: PathBuf,
+        named: bool,
+        via: &str,
+        md: &std::fs::Metadata,
+    ) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        if let Some(existing) = self.excluded.get_mut(rel) {
+            existing.named |= named;
+            return Ok(());
+        }
+        self.charge_path(rel.len())?;
+        self.excluded.insert(
+            rel.to_owned(),
+            ExcludedFile {
+                rel: rel.to_owned(),
+                abs,
+                via: via.to_owned(),
+                named,
+                nlink: md.nlink(),
+            },
+        );
+        Ok(())
+    }
+
     /// Charges `len` bytes against the retained-path budget. Every path
     /// the expansion keeps — selected file, sweep directory, skipped
     /// special, or missing entry — is charged, so no result collection
@@ -257,20 +342,46 @@ impl Expander<'_> {
             }
             Err(e) => return Err(Error::io("inspecting", &abs, e)),
         };
+        // The domain root (`""`) is never covered; managed entries
+        // cannot be covered either (a load-time contradiction), so a
+        // hit here means an explicit argument inside an exclusion.
+        let excluded_via = self.covering_exclude(rel);
         let ft = md.file_type();
         if ft.is_dir() {
+            if let Some(via) = excluded_via {
+                // An excluded directory is still walked — `decrypt`
+                // recovery and `verify`/`rekey` convergence must see
+                // what exclusion hides — but a nested repository is
+                // never entered, silently here (nothing would be
+                // selected from it anyway).
+                if paths::exists_probe(&abs.join(".git"))? {
+                    return Ok(());
+                }
+                self.check_foreign_config(rel, &abs)?;
+                return self.walk_dir(rel, &abs, origin, 0, Some(via));
+            }
             // The entry itself may be a nested-repository root or hold a
             // foreign config (the domain root is exempt); ancestors were
             // checked above, children are checked during the walk.
             if !rel.is_empty() {
                 self.check_boundary(rel, &abs)?;
             }
-            return self.walk_dir(rel, &abs, origin, 0);
+            return self.walk_dir(rel, &abs, origin, 0, None);
         }
         if ft.is_file() {
+            if let Some(via) = excluded_via {
+                let named = matches!(origin, Origin::Explicit { named: true });
+                return self.add_excluded(rel, abs, named, via, &md);
+            }
             return self.add_file(rel, abs, origin, &md);
         }
-        // Symlink or special file (FIFO, socket, device).
+        // Symlink or special file (FIFO, socket, device). Under an
+        // exclusion it is simply not the tool's business: not selected,
+        // not warned about, and not recorded as unverified content (it
+        // cannot hold ciphertext recoverable at this path).
+        if excluded_via.is_some() {
+            return Ok(());
+        }
         let kind = if ft.is_symlink() {
             "a symlink"
         } else {
@@ -340,6 +451,12 @@ impl Expander<'_> {
                 report::escape_path(dir)
             )));
         }
+        self.check_foreign_config(rel, dir)
+    }
+
+    /// Errors when `dir` holds a foreign domain config. A structural
+    /// domain violation, checked even under an exclusion.
+    fn check_foreign_config(&self, _rel: &str, dir: &Path) -> Result<()> {
         if paths::exists_probe(&dir.join(CONFIG_NAME))? {
             return Err(Error::Usage(format!(
                 "found a foreign `{CONFIG_NAME}` below the domain root, in `{}`; \
@@ -395,7 +512,24 @@ impl Expander<'_> {
     /// the file cap applies. Entries are streamed, never collected: the
     /// final list order comes from `files` being a `BTreeMap`, so no
     /// per-directory name vector (or its sorting) is needed.
-    fn walk_dir(&mut self, rel: &str, abs: &Path, origin: Origin, depth: usize) -> Result<()> {
+    ///
+    /// `excluded_via` carries the covering `excludes` entry when this
+    /// directory lies inside an exclusion. Beneath one, regular files
+    /// are recorded as excluded instead of selected, and the strict
+    /// name rules are relaxed: symlinks, special files, and names that
+    /// are non-UTF-8 or contain control characters are ignored
+    /// silently — they cannot hold ciphertext recoverable at their
+    /// path, and exclusion already declares the content off-limits. A
+    /// foreign domain config stays a hard error, and nested
+    /// repositories are still never entered. Budgets apply unchanged.
+    fn walk_dir(
+        &mut self,
+        rel: &str,
+        abs: &Path,
+        origin: Origin,
+        depth: usize,
+        excluded_via: Option<&'a str>,
+    ) -> Result<()> {
         if depth > MAX_WALK_DEPTH {
             return Err(Error::Limit(format!(
                 "`{rel}`: directory nesting exceeds the {MAX_WALK_DEPTH}-level cap"
@@ -436,17 +570,29 @@ impl Expander<'_> {
             }
             if md.file_type().is_dir() {
                 let Some(ns) = name_str else {
+                    if excluded_via.is_some() {
+                        continue;
+                    }
                     return Err(Error::Usage(format!(
                         "`{}`: file name is not valid UTF-8",
                         report::escape_path(&child_abs)
                     )));
                 };
-                reject_control_name(&child_abs, &ns)?;
+                if excluded_via.is_some() {
+                    if paths::has_control(&ns) {
+                        continue;
+                    }
+                } else {
+                    reject_control_name(&child_abs, &ns)?;
+                }
                 let crel = child_rel(&ns);
                 // A subdirectory with a `.git` entry is a nested
-                // repository: never entered.
+                // repository: never entered (silently so under an
+                // exclusion — nothing would be selected from it).
                 if paths::exists_probe(&child_abs.join(".git"))? {
-                    report::note(format!("skipping nested repository `{crel}`"));
+                    if excluded_via.is_none() {
+                        report::note(format!("skipping nested repository `{crel}`"));
+                    }
                     continue;
                 }
                 if paths::exists_probe(&child_abs.join(CONFIG_NAME))? {
@@ -455,20 +601,32 @@ impl Expander<'_> {
                          nested domains are not supported within one repository"
                     )));
                 }
-                self.walk_dir(&crel, &child_abs, child_origin, depth + 1)?;
+                let child_via = excluded_via.or_else(|| self.exact_exclude(&crel));
+                self.walk_dir(&crel, &child_abs, child_origin, depth + 1, child_via)?;
                 continue;
             }
             // Non-directory entries with non-UTF-8 names cannot become
             // canonical paths (key derivation would have no stable
             // input); refuse rather than silently leave plaintext
             // behind — naming one explicitly already fails at minting.
+            // Under an exclusion the plaintext is intentional, so such
+            // names are tolerated and ignored instead.
             let Some(ns) = name_str else {
+                if excluded_via.is_some() {
+                    continue;
+                }
                 return Err(Error::Usage(format!(
                     "`{}`: file name is not valid UTF-8; simple-file-encrypt refuses such names",
                     report::escape_path(&child_abs)
                 )));
             };
-            reject_control_name(&child_abs, &ns)?;
+            if excluded_via.is_some() {
+                if paths::has_control(&ns) {
+                    continue;
+                }
+            } else {
+                reject_control_name(&child_abs, &ns)?;
+            }
             // The domain config itself, temp files, and git metadata
             // files are never processed.
             if rel.is_empty() && ns == CONFIG_NAME {
@@ -488,8 +646,14 @@ impl Expander<'_> {
                 )));
             }
             let crel = child_rel(&ns);
+            let via = excluded_via.or_else(|| self.exact_exclude(&crel));
             if md.file_type().is_file() {
-                self.add_file(&crel, child_abs, child_origin, &md)?;
+                match via {
+                    Some(v) => self.add_excluded(&crel, child_abs, false, v, &md)?,
+                    None => self.add_file(&crel, child_abs, child_origin, &md)?,
+                }
+            } else if via.is_some() {
+                // Symlink or special file under an exclusion: hands-off.
             } else if md.file_type().is_symlink() {
                 let msg = format!("skipping `{crel}`: a symlink");
                 self.skip_special(crel, true, msg)?;
@@ -543,7 +707,12 @@ mod tests {
         touch(&root.join("vendor/.git"));
         touch(&root.join("vendor/secret.txt"));
 
-        let exp = expand(root, &[(String::new(), Origin::Explicit { named: true })]).unwrap();
+        let exp = expand(
+            root,
+            &[(String::new(), Origin::Explicit { named: true })],
+            &[],
+        )
+        .unwrap();
         let rels: Vec<&str> = exp.files.iter().map(|f| f.rel.as_str()).collect();
         assert_eq!(rels, ["a/y.txt", "a/z.txt", "b.txt"]);
         assert!(exp.files.iter().all(|f| f.explicit && !f.named));
@@ -559,10 +728,10 @@ mod tests {
         let root = tmp.path();
         touch(&root.join("sub/x.txt"));
         touch(&root.join("sub").join(CONFIG_NAME));
-        let err = expand(root, &[(String::new(), Origin::Managed)]).unwrap_err();
+        let err = expand(root, &[(String::new(), Origin::Managed)], &[]).unwrap_err();
         assert!(err.to_string().contains("foreign"));
         // A managed entry reaching through it errors too.
-        let err = expand(root, &[("sub/x.txt".into(), Origin::Managed)]).unwrap_err();
+        let err = expand(root, &[("sub/x.txt".into(), Origin::Managed)], &[]).unwrap_err();
         assert!(err.to_string().contains("foreign"));
     }
 
@@ -572,11 +741,11 @@ mod tests {
         let root = tmp.path();
         touch(&root.join("vendor/.git"));
         touch(&root.join("vendor/inner.txt"));
-        let err = expand(root, &[("vendor/inner.txt".into(), Origin::Managed)]).unwrap_err();
+        let err = expand(root, &[("vendor/inner.txt".into(), Origin::Managed)], &[]).unwrap_err();
         assert!(err.to_string().contains("nested repository"));
         // The directory entry itself being a nested-repository root is
         // caught too, not only files beneath it.
-        let err = expand(root, &[("vendor".into(), Origin::Managed)]).unwrap_err();
+        let err = expand(root, &[("vendor".into(), Origin::Managed)], &[]).unwrap_err();
         assert!(err.to_string().contains("nested repository"));
     }
 
@@ -593,11 +762,11 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("managed")).unwrap();
 
         // The stored entry must not be followed out of the domain.
-        let err = expand(root, &[("managed/secret.txt".into(), Origin::Managed)]).unwrap_err();
+        let err = expand(root, &[("managed/secret.txt".into(), Origin::Managed)], &[]).unwrap_err();
         assert!(err.to_string().contains("symlink"), "got: {err}");
         // A stored directory entry that is itself a symlink is skipped
         // with a warning and recorded, not walked.
-        let exp = expand(root, &[("managed".into(), Origin::Managed)]).unwrap();
+        let exp = expand(root, &[("managed".into(), Origin::Managed)], &[]).unwrap();
         assert!(exp.files.is_empty());
         let skipped: Vec<&str> = exp.skipped_special.iter().map(|s| s.rel.as_str()).collect();
         assert_eq!(skipped, ["managed"]);
@@ -611,9 +780,9 @@ mod tests {
         touch(&root.join("d/evil\nINJECTED"));
         // Recursion must not mint a control-char path into the file
         // list — neither via a managed directory nor an explicit one.
-        let err = expand(root, &[("d".into(), Origin::Managed)]).unwrap_err();
+        let err = expand(root, &[("d".into(), Origin::Managed)], &[]).unwrap_err();
         assert!(err.to_string().contains("control character"), "got: {err}");
-        let err = expand(root, &[("d".into(), Origin::Explicit { named: true })]).unwrap_err();
+        let err = expand(root, &[("d".into(), Origin::Explicit { named: true })], &[]).unwrap_err();
         assert!(err.to_string().contains("control character"), "got: {err}");
     }
 
@@ -624,9 +793,9 @@ mod tests {
         touch(&root.join("a"));
         // A stored entry whose ancestor became a regular file must get
         // a clear conflict message, not a raw ENOTDIR I/O error.
-        let err = expand(root, &[("a/b".into(), Origin::Managed)]).unwrap_err();
+        let err = expand(root, &[("a/b".into(), Origin::Managed)], &[]).unwrap_err();
         assert!(err.to_string().contains("not a directory"), "got: {err}");
-        let err = expand(root, &[("a/b/c".into(), Origin::Managed)]).unwrap_err();
+        let err = expand(root, &[("a/b/c".into(), Origin::Managed)], &[]).unwrap_err();
         assert!(err.to_string().contains("not a directory"), "got: {err}");
     }
 
@@ -652,6 +821,7 @@ mod tests {
         let err = expand_with_budgets(
             root,
             std::slice::from_ref(&all),
+            &[],
             tiny(usize::MAX, usize::MAX, base + 4),
         )
         .unwrap_err();
@@ -666,6 +836,7 @@ mod tests {
         let err = expand_with_budgets(
             root,
             std::slice::from_ref(&all),
+            &[],
             tiny(usize::MAX, usize::MAX, base + 4),
         )
         .unwrap_err();
@@ -679,6 +850,7 @@ mod tests {
         let err = expand_with_budgets(
             root,
             std::slice::from_ref(&all),
+            &[],
             tiny(usize::MAX, usize::MAX, base + 4),
         )
         .unwrap_err();
@@ -691,6 +863,7 @@ mod tests {
         let err = expand_with_budgets(
             root,
             &[("missing-very-long-entry".into(), Origin::Managed)],
+            &[],
             tiny(usize::MAX, usize::MAX, base + 4),
         )
         .unwrap_err();
@@ -700,7 +873,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         touch(&root.join("ok.txt"));
-        let exp = expand_with_budgets(root, &[all], Budgets::DEFAULT).unwrap();
+        let exp = expand_with_budgets(root, &[all], &[], Budgets::DEFAULT).unwrap();
         assert_eq!(exp.files.len(), 1);
     }
 
@@ -716,6 +889,7 @@ mod tests {
         let err = expand_with_budgets(
             root,
             std::slice::from_ref(&all),
+            &[],
             tiny(2, usize::MAX, usize::MAX),
         )
         .unwrap_err();
@@ -724,6 +898,7 @@ mod tests {
         let err = expand_with_budgets(
             root,
             std::slice::from_ref(&all),
+            &[],
             tiny(usize::MAX, 2, usize::MAX),
         )
         .unwrap_err();
@@ -732,7 +907,7 @@ mod tests {
             "got: {err}"
         );
 
-        let exp = expand_with_budgets(root, &[all], tiny(3, 3, usize::MAX)).unwrap();
+        let exp = expand_with_budgets(root, &[all], &[], tiny(3, 3, usize::MAX)).unwrap();
         assert_eq!(exp.files.len(), 3);
     }
 
@@ -746,7 +921,7 @@ mod tests {
         // Every special is recorded for scans and rotation even though
         // only the first MAX_SPECIAL_WARNINGS were individually warned
         // about (stderr behavior is covered by the CLI tests).
-        let exp = expand(root, &[(String::new(), Origin::Managed)]).unwrap();
+        let exp = expand(root, &[(String::new(), Origin::Managed)], &[]).unwrap();
         assert_eq!(exp.skipped_special.len(), MAX_SPECIAL_WARNINGS + 5);
     }
 
@@ -764,6 +939,7 @@ mod tests {
                 ("gone.txt".into(), Origin::Managed),
                 ("gone2.txt".into(), Origin::Explicit { named: true }),
             ],
+            &[],
         )
         .unwrap();
         assert_eq!(exp.files.len(), 1);
@@ -773,7 +949,180 @@ mod tests {
 
         // Hard-linked pair under two canonical paths: error.
         std::fs::hard_link(root.join("a/x.txt"), root.join("a/link.txt")).unwrap();
-        let err = expand(root, &[("a".into(), Origin::Managed)]).unwrap_err();
+        let err = expand(root, &[("a".into(), Origin::Managed)], &[]).unwrap_err();
         assert!(err.to_string().contains("same file"));
+    }
+
+    #[test]
+    fn excludes_route_files_out_of_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(&root.join("keep.txt"));
+        touch(&root.join("skip.txt"));
+        touch(&root.join("sub/a.txt"));
+        touch(&root.join("exdir/b.txt"));
+        touch(&root.join("exdir/deeper/c.txt"));
+        let excludes = ["exdir".to_owned(), "skip.txt".to_owned()];
+
+        let exp = expand(
+            root,
+            &[(String::new(), Origin::Explicit { named: true })],
+            &excludes,
+        )
+        .unwrap();
+        let rels: Vec<&str> = exp.files.iter().map(|f| f.rel.as_str()).collect();
+        assert_eq!(rels, ["keep.txt", "sub/a.txt"]);
+        let ex: Vec<(&str, &str)> = exp
+            .excluded
+            .iter()
+            .map(|e| (e.rel.as_str(), e.via.as_str()))
+            .collect();
+        assert_eq!(
+            ex,
+            [
+                ("exdir/b.txt", "exdir"),
+                ("exdir/deeper/c.txt", "exdir"),
+                ("skip.txt", "skip.txt"),
+            ]
+        );
+        // Children reached through the root walk are not "named".
+        assert!(exp.excluded.iter().all(|e| !e.named));
+        // Excluded directories are still visited (their temps are swept).
+        assert!(exp.sweep_dirs.contains(&root.join("exdir/deeper")));
+
+        // A directly named excluded file is routed, flagged as named.
+        let exp = expand(
+            root,
+            &[("skip.txt".into(), Origin::Explicit { named: true })],
+            &excludes,
+        )
+        .unwrap();
+        assert!(exp.files.is_empty());
+        assert_eq!(exp.excluded.len(), 1);
+        assert!(exp.excluded[0].named);
+
+        // A named directory inside an exclusion is walked in excluded
+        // mode: everything beneath it is excluded, nothing selected.
+        let exp = expand(
+            root,
+            &[("exdir/deeper".into(), Origin::Explicit { named: true })],
+            &excludes,
+        )
+        .unwrap();
+        assert!(exp.files.is_empty());
+        let ex: Vec<&str> = exp.excluded.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(ex, ["exdir/deeper/c.txt"]);
+    }
+
+    #[test]
+    fn excluded_subtrees_relax_name_and_special_rules() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(&root.join("exdir/ok.txt"));
+        std::os::unix::fs::symlink("/nonexistent", root.join("exdir/link")).unwrap();
+        // Non-UTF-8 and control-character names: hard errors during a
+        // normal walk, tolerated and ignored beneath an exclusion.
+        std::fs::write(
+            root.join("exdir").join(OsStr::from_bytes(b"bad\xff.txt")),
+            b"x",
+        )
+        .unwrap();
+        touch(&root.join("exdir/evil\nname"));
+        let excludes = ["exdir".to_owned()];
+
+        let exp = expand(root, &[(String::new(), Origin::Managed)], &excludes).unwrap();
+        assert!(exp.files.is_empty());
+        // Only the clean regular file is recorded; the symlink and the
+        // hostile names are silently ignored — in particular they never
+        // reach `skipped_special`, so they cannot block `rekey --prune`.
+        let ex: Vec<&str> = exp.excluded.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(ex, ["exdir/ok.txt"]);
+        assert!(exp.skipped_special.is_empty());
+
+        // The same names outside an exclusion stay hard errors.
+        let err = expand(root, &[(String::new(), Origin::Managed)], &[]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not valid UTF-8") || msg.contains("control character"),
+            "got: {msg}"
+        );
+
+        // A named excluded symlink is a silent no-op, not the usual
+        // "only regular files" error: exclusion means hands-off.
+        let exp = expand(
+            root,
+            &[("exdir/link".into(), Origin::Explicit { named: true })],
+            &excludes,
+        )
+        .unwrap();
+        assert!(exp.files.is_empty() && exp.excluded.is_empty());
+    }
+
+    #[test]
+    fn excluded_subtrees_keep_domain_boundaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // A nested repository inside an exclusion is never entered.
+        touch(&root.join("exdir/vendor/.git"));
+        touch(&root.join("exdir/vendor/inner.txt"));
+        touch(&root.join("exdir/ok.txt"));
+        let excludes = ["exdir".to_owned()];
+        let exp = expand(root, &[(String::new(), Origin::Managed)], &excludes).unwrap();
+        let ex: Vec<&str> = exp.excluded.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(ex, ["exdir/ok.txt"]);
+        // An excluded entry that is itself a nested-repository root is
+        // silently skipped, not walked.
+        let exp = expand(
+            root,
+            &[("exdir/vendor".into(), Origin::Explicit { named: true })],
+            &["exdir".to_owned()],
+        )
+        .unwrap();
+        assert!(exp.files.is_empty() && exp.excluded.is_empty());
+
+        // A foreign domain config is a hard error even under an
+        // exclusion: a structural violation, not an encryption choice.
+        touch(&root.join("exdir/sub").join(CONFIG_NAME));
+        let err = expand(root, &[(String::new(), Origin::Managed)], &excludes).unwrap_err();
+        assert!(err.to_string().contains("foreign"), "got: {err}");
+    }
+
+    #[test]
+    fn exclusion_uses_boundary_aware_coverage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(&root.join("ex/inner.txt"));
+        touch(&root.join("extra.txt"));
+        // `extra.txt` shares the byte prefix `ex` but is not covered.
+        let exp = expand(
+            root,
+            &[(String::new(), Origin::Managed)],
+            &["ex".to_owned()],
+        )
+        .unwrap();
+        let rels: Vec<&str> = exp.files.iter().map(|f| f.rel.as_str()).collect();
+        assert_eq!(rels, ["extra.txt"]);
+        let ex: Vec<&str> = exp.excluded.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(ex, ["ex/inner.txt"]);
+    }
+
+    #[test]
+    fn excluded_paths_are_charged_against_budgets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let base = root.as_os_str().len();
+        touch(&root.join("exdir/some-long-excluded-name.txt"));
+        let err = expand_with_budgets(
+            root,
+            &[(String::new(), Origin::Managed)],
+            &["exdir".to_owned()],
+            tiny(usize::MAX, usize::MAX, base + 8),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("path budget"), "got: {err}");
     }
 }

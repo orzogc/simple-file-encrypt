@@ -24,6 +24,8 @@ struct RawConfig {
     paths: Vec<String>,
     #[serde(default)]
     force_binary: Vec<String>,
+    #[serde(default)]
+    excludes: Vec<String>,
 }
 
 /// Raw `[kdf]` table.
@@ -51,6 +53,13 @@ pub struct Config {
     /// `add --binary` / `remove --binary`; the loaded order is
     /// preserved verbatim on rewrite (the tool only appends/removes).
     pub force_binary: Vec<String>,
+    /// Excluded paths: canonical relative paths (files or directories,
+    /// recursive) never selected for encryption; kept sorted and
+    /// deduplicated. An entry that equals or covers an exact `paths`
+    /// entry is a load-time error (a fully shadowed managed entry is a
+    /// contradiction); an entry strictly below a managed directory
+    /// entry is the intended use.
+    pub excludes: Vec<String>,
 }
 
 impl Config {
@@ -66,6 +75,53 @@ impl Config {
     pub fn is_managed(&self, rel: &str) -> bool {
         self.paths.binary_search_by(|e| e.as_str().cmp(rel)).is_ok()
     }
+
+    /// Returns the `excludes` entry covering this canonical relative
+    /// path (an exact entry or a covering directory entry), if any.
+    pub fn covering_exclude(&self, rel: &str) -> Option<&str> {
+        self.excludes
+            .iter()
+            .find(|e| paths::is_covered_by(rel, e))
+            .map(String::as_str)
+    }
+}
+
+/// Returns a managed `paths` entry that `exclude` equals or covers, if
+/// any. `paths_sorted` must be in ascending byte order: entries covered
+/// by `exclude` are `exclude` itself and the contiguous run prefixed by
+/// `exclude` + `/`, so two binary searches replace a full scan.
+fn find_shadowed_entry<'a>(paths_sorted: &'a [String], exclude: &str) -> Option<&'a str> {
+    if let Ok(i) = paths_sorted.binary_search_by(|p| p.as_str().cmp(exclude)) {
+        return Some(&paths_sorted[i]);
+    }
+    let prefix = format!("{exclude}/");
+    let i = paths_sorted.partition_point(|p| p.as_str() < prefix.as_str());
+    (i < paths_sorted.len() && paths_sorted[i].starts_with(&prefix))
+        .then(|| paths_sorted[i].as_str())
+}
+
+/// Rejects a config whose `excludes` fully shadow a managed entry: such
+/// an entry could never be selected, which is a contradiction, and —
+/// worse — hand-editing one in could strand still-encrypted content
+/// outside `rekey`'s reach. Both lists must be sorted.
+fn check_exclude_contradictions(paths_sorted: &[String], excludes_sorted: &[String]) -> Result<()> {
+    for exclude in excludes_sorted {
+        if let Some(shadowed) = find_shadowed_entry(paths_sorted, exclude) {
+            return Err(Error::Config(format!(
+                "`excludes` entry `{}` {} the managed `paths` entry `{}`; a fully shadowed managed \
+                 entry is a contradiction — `remove` the managed entry or `remove --exclude` the \
+                 exclusion",
+                crate::report::escape_str(exclude),
+                if shadowed == exclude {
+                    "equals"
+                } else {
+                    "covers"
+                },
+                crate::report::escape_str(shadowed),
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// A config loaded from disk, with the snapshot used to detect
@@ -168,9 +224,15 @@ pub fn parse(content: &[u8]) -> Result<Config> {
     }
     let kdf = validate_kdf_structural(raw.kdf.memory_kib, raw.kdf.iterations, raw.kdf.parallelism)?;
 
-    if raw.paths.len().saturating_add(raw.force_binary.len()) > MAX_CONFIG_ENTRIES {
+    if raw
+        .paths
+        .len()
+        .saturating_add(raw.force_binary.len())
+        .saturating_add(raw.excludes.len())
+        > MAX_CONFIG_ENTRIES
+    {
         return Err(Error::Config(format!(
-            "`paths` plus `force_binary` exceed {MAX_CONFIG_ENTRIES} entries"
+            "`paths`, `force_binary`, and `excludes` together exceed {MAX_CONFIG_ENTRIES} entries"
         )));
     }
     for entry in &raw.paths {
@@ -179,9 +241,16 @@ pub fn parse(content: &[u8]) -> Result<Config> {
     for entry in &raw.force_binary {
         validate_entry("force_binary", entry)?;
     }
+    for entry in &raw.excludes {
+        validate_entry("excludes", entry)?;
+    }
     let mut managed = raw.paths;
     managed.sort_unstable();
     managed.dedup();
+    let mut excludes = raw.excludes;
+    excludes.sort_unstable();
+    excludes.dedup();
+    check_exclude_contradictions(&managed, &excludes)?;
 
     Ok(Config {
         salt,
@@ -189,6 +258,7 @@ pub fn parse(content: &[u8]) -> Result<Config> {
         kdf,
         paths: managed,
         force_binary: raw.force_binary,
+        excludes,
     })
 }
 
@@ -244,13 +314,18 @@ fn render_list(out: &mut String, name: &str, entries: &[String]) {
     out.push_str("]\n");
 }
 
-/// Renders the config in the tool's stable form. `paths` is written in
-/// ascending byte order, deduplicated; `force_binary` verbatim. The
-/// `[kdf]` table comes last so every other key stays top-level.
+/// Renders the config in the tool's stable form. `paths` and `excludes`
+/// are written in ascending byte order, deduplicated (`excludes` only
+/// when non-empty, so configs not using the feature stay loadable by
+/// older versions); `force_binary` verbatim. The `[kdf]` table comes
+/// last so every other key stays top-level.
 pub fn render(cfg: &Config) -> String {
     let mut paths_sorted = cfg.paths.clone();
     paths_sorted.sort_unstable();
     paths_sorted.dedup();
+    let mut excludes_sorted = cfg.excludes.clone();
+    excludes_sorted.sort_unstable();
+    excludes_sorted.dedup();
 
     let mut out = String::with_capacity(1024);
     out.push_str(
@@ -279,6 +354,16 @@ pub fn render(cfg: &Config) -> String {
     );
     render_list(&mut out, "paths", &paths_sorted);
     out.push('\n');
+    if !excludes_sorted.is_empty() {
+        out.push_str(
+            "# Excluded paths: files and directories (recursive) never selected for\n\
+             # encryption, even under a managed directory. Maintained by the tool:\n\
+             # ascending byte order, deduplicated. Older versions of\n\
+             # simple-file-encrypt refuse a config that carries this key.\n",
+        );
+        render_list(&mut out, "excludes", &excludes_sorted);
+        out.push('\n');
+    }
     out.push_str(
         "# Maintained by hand or by `add --binary` / `remove --binary`: paths\n\
          # (files or directories) always encrypted in binary (whole-file) mode,\n\
@@ -298,11 +383,27 @@ pub fn render(cfg: &Config) -> String {
 /// would reject: the write side enforces the entry-count and file-size
 /// caps too, so the tool can never brick its own domain.
 fn render_checked(cfg: &Config) -> Result<String> {
-    if cfg.paths.len().saturating_add(cfg.force_binary.len()) > MAX_CONFIG_ENTRIES {
+    if cfg
+        .paths
+        .len()
+        .saturating_add(cfg.force_binary.len())
+        .saturating_add(cfg.excludes.len())
+        > MAX_CONFIG_ENTRIES
+    {
         return Err(Error::Limit(format!(
-            "the config would hold more than {MAX_CONFIG_ENTRIES} `paths` plus `force_binary` entries"
+            "the config would hold more than {MAX_CONFIG_ENTRIES} `paths`, `force_binary`, and \
+             `excludes` entries"
         )));
     }
+    // The write side enforces the shadowing rule too: the tool must
+    // never produce a config that `load` would reject.
+    let mut paths_sorted = cfg.paths.clone();
+    paths_sorted.sort_unstable();
+    paths_sorted.dedup();
+    let mut excludes_sorted = cfg.excludes.clone();
+    excludes_sorted.sort_unstable();
+    excludes_sorted.dedup();
+    check_exclude_contradictions(&paths_sorted, &excludes_sorted)?;
     let rendered = render(cfg);
     if rendered.len() as u64 > MAX_CONFIG_SIZE {
         return Err(Error::Limit(format!(
@@ -349,6 +450,8 @@ impl LoadedConfig {
         self.snap = replaced.snap.expect("checked above");
         self.config.paths.sort_unstable();
         self.config.paths.dedup();
+        self.config.excludes.sort_unstable();
+        self.config.excludes.dedup();
         Ok(())
     }
 
@@ -385,6 +488,7 @@ mod tests {
             kdf: KdfParams::DEFAULT,
             paths: vec!["b.txt".into(), "a dir/©.txt".into()],
             force_binary: vec!["zz".into(), "blob.bin".into()],
+            excludes: Vec::new(),
         }
     }
 
@@ -401,6 +505,98 @@ mod tests {
         );
         // force_binary preserved verbatim, order included.
         assert_eq!(parsed.force_binary, cfg.force_binary);
+    }
+
+    #[test]
+    fn excludes_round_trip_and_omission_when_empty() {
+        // Without excludes the key is absent, so configs not using the
+        // feature stay loadable by older tool versions.
+        assert!(!render(&sample()).contains("excludes"));
+
+        let mut cfg = sample();
+        cfg.paths = vec!["secrets".into()];
+        cfg.excludes = vec![
+            "secrets/readme.md".into(),
+            "other/skip".into(),
+            "secrets/readme.md".into(), // duplicate: dropped on render
+        ];
+        let rendered = render(&cfg);
+        assert!(rendered.contains("excludes = ["));
+        let parsed = parse(rendered.as_bytes()).unwrap();
+        assert_eq!(
+            parsed.excludes,
+            vec!["other/skip".to_string(), "secrets/readme.md".to_string()]
+        );
+        // Coverage lookup finds exact and directory entries.
+        assert_eq!(parsed.covering_exclude("other/skip/x"), Some("other/skip"));
+        assert_eq!(
+            parsed.covering_exclude("secrets/readme.md"),
+            Some("secrets/readme.md")
+        );
+        assert_eq!(parsed.covering_exclude("secrets/token"), None);
+        assert_eq!(parsed.covering_exclude(""), None);
+    }
+
+    #[test]
+    fn excludes_entries_are_validated_like_paths() {
+        let mut cfg = sample();
+        cfg.excludes = vec!["ok.txt".into()];
+        let good = render(&cfg);
+        // Non-canonical entry.
+        let bad = good.replace("\"ok.txt\"", "\"a/../ok.txt\"");
+        assert!(matches!(parse(bad.as_bytes()), Err(Error::Config(_))));
+        // Forbidden entry: git- and tool-critical names are never
+        // encrypted anyway, so claiming them is refused as misleading.
+        let bad = good.replace("\"ok.txt\"", "\".gitattributes\"");
+        assert!(matches!(parse(bad.as_bytes()), Err(Error::Config(_))));
+        let bad = good.replace("\"ok.txt\"", "\".git/x\"");
+        assert!(matches!(parse(bad.as_bytes()), Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn shadowed_managed_entries_are_contradictions() {
+        // An exclude equal to an exact managed entry: load-time error.
+        let mut cfg = sample();
+        cfg.excludes = vec!["b.txt".into()];
+        let err = parse(render(&cfg).as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("contradiction"), "got: {err}");
+
+        // An exclude covering an exact managed entry: same error.
+        let mut cfg = sample();
+        cfg.excludes = vec!["a dir".into()];
+        let err = parse(render(&cfg).as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("covers"), "got: {err}");
+
+        // The write side refuses the same shape, so the tool can never
+        // brick its own domain.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = sample();
+        cfg.excludes = vec!["b.txt".into()];
+        assert!(create_new(dir.path(), &cfg).is_err());
+
+        // An exclude strictly below a managed directory entry is the
+        // intended use; a shadowed `force_binary` entry is a dormant
+        // preference (it applies again once the exclusion is removed).
+        let mut cfg = sample();
+        cfg.paths = vec!["secrets".into()];
+        cfg.excludes = vec!["secrets/readme.md".into(), "zz".into()];
+        assert!(parse(render(&cfg).as_bytes()).is_ok());
+
+        // Sibling with a common prefix is not coverage (`ab` vs `a`).
+        let mut cfg = sample();
+        cfg.paths = vec!["ab".into()];
+        cfg.excludes = vec!["a".into()];
+        assert!(parse(render(&cfg).as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn entry_cap_counts_excludes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = sample();
+        cfg.paths.clear();
+        cfg.force_binary.clear();
+        cfg.excludes = (0..=MAX_CONFIG_ENTRIES).map(|i| format!("e{i}")).collect();
+        assert!(matches!(create_new(dir.path(), &cfg), Err(Error::Limit(_))));
     }
 
     #[test]
