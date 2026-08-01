@@ -45,8 +45,12 @@ Two classes, with very different coverage:
   (random tokens, cryptographic keys, sufficiently long and
   unpredictable private text) is protected by the password and KDF;
   low-entropy, high-frequency, or format-predictable lines can be
-  identified or confirmed without any key (see the leakage inventory).
-  Do not read "encrypted" as "hidden" for structure or boilerplate.
+  identified by frequency and position analysis alone, and confirmed
+  outright given a known-plaintext dictionary or an encryption oracle
+  at the same path — no key needed in either case, though ciphertext
+  alone does not let an attacker test arbitrary guesses (see the
+  leakage inventory). Do not read "encrypted" as "hidden" for
+  structure or boilerplate.
 - **Unit authenticity**: no ciphertext unit (line, empty-file marker, or
   chunk) that was never legitimately produced for that exact file path
   can be created without the key; tampering with a unit's bytes is
@@ -56,8 +60,10 @@ Two classes, with very different coverage:
   recombining chunks from different versions is detected. Only
   whole-file rollback to a complete older ciphertext survives.
 - **Wrong-password detection**: unwrapping the key ring fails fast,
-  before any managed target or ciphertext is touched (stale temp-file
-  cleanup may run first).
+  before any selected file's content is read or replaced. Target
+  discovery (directory listings and file metadata) and stale temp-file
+  cleanup run earlier — they need no key and write nothing but the
+  temp deletions.
 - **Deterministic re-encryption**: within one key epoch, unchanged
   plaintext never churns ciphertext; `passwd` and KDF upgrades churn
   nothing at all. `rekey` starts a new epoch and rewrites every

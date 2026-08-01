@@ -70,9 +70,10 @@ This document is the entry point. Detailed specifications live in:
   the same path. Encrypted files are recognized by magic, not by
   extension.
 - **Determinism**: ciphertext is a pure function of
-  `(domain key, canonical relative path, content)` — no timestamps, no
-  randomness at encryption time, no caches. The password, salt, and KDF
-  parameters only gate access to the domain key.
+  `(domain key, canonical relative path, mode, content)` — no
+  timestamps, no randomness at encryption time, no caches. The
+  password, salt, and KDF parameters only gate access to the domain
+  key.
 
 ## Key design decisions
 
@@ -138,9 +139,11 @@ This document is the entry point. Detailed specifications live in:
    the complexity.
 9. **Hostile-input budgets everywhere.** KDF parameters are validated in
    three tiers (validity, security floor, resource ceiling) with
-   explicit override flags; file, line, config, and password sizes are
-   hard-capped; base64 must be canonical so every plaintext has exactly
-   one valid ciphertext.
+   explicit override flags; file, line, config, password, and traversal
+   sizes are hard-capped; base64 must be canonical so, in a fixed mode,
+   every plaintext has exactly one valid ciphertext (the same content
+   has different valid ciphertexts in text and binary mode — see
+   [format.md](format.md)).
 
 ## Comparison with git-simple-encrypt
 
@@ -178,10 +181,12 @@ This document is the entry point. Detailed specifications live in:
   spill — and note that in-place encryption never securely erases old
   plaintext from disk, snapshots, or git history.
 - **Memory model.** Files are processed whole in memory, with a 256 MiB
-  hard cap and a 2²² cap on lines per text file; peak memory is a small
-  multiple of the file size (input, output, and encoding buffers
-  coexist). The tool targets small secret files; it is not a streaming
-  encryptor.
+  hard cap and a 2²² cap on lines per text file; peak memory is a
+  bounded multiple of the file size — a small one for typical content
+  (input, output, and encoding buffers coexist), but newline-dense
+  text adds per-line bookkeeping and can reach ~17–20x the input size
+  (see [format.md](format.md)). The tool targets small secret files;
+  it is not a streaming encryptor.
 - **Large line-count files.** Each line costs ~22 bytes plus one third
   of its own length (base64); a file with hundreds of thousands of lines
   grows noticeably. Use `force_binary` for such files.
@@ -232,16 +237,21 @@ This document is the entry point. Detailed specifications live in:
   test-only thread-local hook; kill/crash mid-rename remains covered
   by design review and the failure-semantics spec, not by tests.
 - **CI**: GitHub Actions on Linux + macOS, with every action pinned to
-  a full commit SHA (Dependabot bumps them): `cargo fmt --check`,
+  a full commit SHA (Dependabot bumps them) and every cargo invocation
+  `--locked` (a manifest/lockfile mismatch fails instead of silently
+  regenerating the lock): `cargo fmt --check`,
   `cargo clippy -- -D warnings`, `cargo test`, a `cargo deny` job for
   advisories and licenses, a feature-unification assertion that the
   `zeroize` features of `aes`/`cmac` apply to the single version of
   each crate in the tree, full test runs against both musl release
   targets (`x86_64` and `aarch64` Linux, statically linked — C
   compilation for blake3's aarch64 NEON goes through the
-  cargo-zigbuild shims in `ci/`), and a short `cargo fuzz` smoke over
-  the config parser and both ciphertext decoders (targets in `fuzz/`,
-  corpus cached between runs).
+  cargo-zigbuild shims in `ci/`, with the Zig toolchain download
+  verified against a SHA-256 pinned in-repo), and a short `cargo fuzz`
+  smoke over the config parser and both ciphertext decoders (targets
+  in `fuzz/`; the corpus is cached between runs, committed seeds in
+  `fuzz/seeds/` guarantee format-boundary coverage on a cold cache,
+  and crash inputs are uploaded as artifacts).
   `unsafe_code` is denied crate-wide.
 - **Release**: pushing a `v*` tag runs the whole CI suite (reused via
   `workflow_call`), then builds stripped release archives

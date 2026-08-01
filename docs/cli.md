@@ -75,7 +75,9 @@ mid-operation re-validation below for other programs.
 ## Password input
 
 `encrypt`, `decrypt`, `verify`, `passwd`, `rekey`, and `init` need the
-password; `add`, `remove`, `status`, and `check` never do.
+password — `encrypt` and `decrypt` only when at least one regular file
+is selected (their nothing-to-do contract below); `add`, `remove`,
+`status`, and `check` never do.
 
 Sources, in priority order:
 
@@ -98,8 +100,9 @@ used as the exact bytes supplied — no Unicode normalization
 (see [crypto.md](crypto.md)). The stdin reader is itself bounded: it
 stops just past the limit instead of buffering an unbounded stream
 first. The password is checked by unwrapping the key ring before any
-managed target or ciphertext is touched (stale-temp sweeping may run
-earlier); a mismatch aborts immediately.
+selected file's content is read or replaced; target expansion
+(directory listings and file metadata only) and stale-temp sweeping
+run earlier. A mismatch aborts immediately.
 
 KDF-related global options, honored by every command that runs Argon2:
 `--allow-weak-kdf` and `--allow-expensive-kdf`
@@ -111,9 +114,11 @@ KDF-related global options, honored by every command that runs Argon2:
   directories are expanded recursively at run time. One invocation
   operates on at most 65536 files after expansion (hard error beyond).
   Traversal itself is budgeted too: at most 2^20 directory entries
-  examined per expansion (and per `init` descendant scan) and at most
-  128 levels of nesting, so hostile trees cannot exhaust memory or time
-  before the file cap applies.
+  examined per expansion (and per `init` descendant scan), at most
+  128 levels of nesting, and at most 64 MiB of retained path bytes —
+  selected files, visited directories, skipped symlinks/specials, and
+  missing entries all count — so hostile trees cannot exhaust memory
+  or time before the file cap applies.
 - Canonical paths never contain control characters (see
   [format.md](format.md)); a target or recursively discovered name
   containing one is a hard error, and any path the tool prints is
@@ -122,8 +127,9 @@ KDF-related global options, honored by every command that runs Argon2:
   so it is refused rather than skipped — never silently left as
   plaintext behind an otherwise-passing gate.
 - Only **regular files** are processed. During recursion, FIFOs,
-  sockets, device nodes, and symlinks are skipped with a warning;
-  naming one explicitly is an error.
+  sockets, device nodes, and symlinks are skipped with a warning
+  (individual warnings are capped at a small number per run; a longer
+  tail is summarized in one line); naming one explicitly is an error.
 - Any directory entry named `.git` — file or directory (linked
   worktrees and submodules use a `.git` *file*) — is always skipped and
   cannot be named explicitly. A **subdirectory** containing a `.git`

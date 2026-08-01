@@ -259,6 +259,7 @@ Hostile inputs must exhaust neither memory nor CPU. Hard limits
 | Files per operation (after expansion) | 65536 | all commands |
 | Directory entries examined per expansion or `init` scan | 1048576 (2²⁰) | expansion, `init` descendant scan |
 | Directory recursion depth | 128 | expansion, `init` descendant scan |
+| Path bytes retained per expansion (selected files, visited directories, skipped specials, missing entries) | 64 MiB | expansion |
 | Config file size | 1 MiB | config load |
 | `paths` + `force_binary` entries | 65536 | config load |
 | `wrapped_keys` entries | 64 | config load |
