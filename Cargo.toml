@@ -1,11 +1,11 @@
 [package]
-name = "simple-encrypt"
+name = "simple-file-encrypt"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
 description = "Encrypt and decrypt local files in place with a single password, producing git-friendly (line-diffable, deterministic) ciphertext"
-repository = "https://github.com/orzogc/simple-encrypt"
+repository = "https://github.com/orzogc/simple-file-encrypt"
 
 [dependencies]
 aes-siv = "0.7.0"

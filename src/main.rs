@@ -1,4 +1,4 @@
-//! The `simple-encrypt` CLI: argument parsing and exit-code mapping.
+//! The `simple-file-encrypt` CLI: argument parsing and exit-code mapping.
 //! Command semantics live in the library's `ops` module; the normative
 //! specification is `docs/cli.md`.
 
@@ -7,13 +7,13 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
-use simple_encrypt::crypto::KdfGate;
-use simple_encrypt::{ops, report};
+use simple_file_encrypt::crypto::KdfGate;
+use simple_file_encrypt::{ops, report};
 
 /// Encrypt and decrypt local files in place with a single password,
 /// producing git-friendly (line-diffable, deterministic) ciphertext.
 #[derive(Parser)]
-#[command(name = "simple-encrypt", version, about, max_term_width = 100)]
+#[command(name = "simple-file-encrypt", version, about, max_term_width = 100)]
 struct Cli {
     /// Accept KDF parameters below the security floor.
     #[arg(long, global = true)]
@@ -50,7 +50,7 @@ struct KdfArgs {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create `.simple-encrypt.toml` in the current directory.
+    /// Create `.simple-file-encrypt.toml` in the current directory.
     Init {
         #[command(flatten)]
         kdf: KdfArgs,
@@ -139,7 +139,7 @@ fn main() -> ExitCode {
 
     // check/verify map every setup failure to exit 2 ("operational
     // error while checking"); other commands exit 1 on any failure.
-    let scanned: Result<ops::ScanOutcome, simple_encrypt::Error> = match &cli.command {
+    let scanned: Result<ops::ScanOutcome, simple_file_encrypt::Error> = match &cli.command {
         Command::Check { paths } => ops::check(paths),
         Command::Verify { paths } => ops::verify(paths, &gate),
         _ => {

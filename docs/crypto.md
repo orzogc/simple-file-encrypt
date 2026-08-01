@@ -1,4 +1,4 @@
-# simple-encrypt — Cryptographic Design
+# simple-file-encrypt — Cryptographic Design
 
 This document specifies every cryptographic operation. Byte-level file
 layouts are in [format.md](format.md); accepted leakage is treated fully in
@@ -93,13 +93,13 @@ file_tag_key = blake3::derive_key(CTX_FILE_TAG, file_km)      # binary only
 Context and associated-data strings (globally unique, frozen for v1):
 
 ```
-AD_WRAP(n,i) = "github.com/orzogc/simple-encrypt v1 domain key wrap" || le64(n) || le64(i)
+AD_WRAP(n,i) = "github.com/orzogc/simple-file-encrypt v1 domain key wrap" || le64(n) || le64(i)
                (n = ring length at wrap time, i = entry index)
-CTX_UNIT     = "github.com/orzogc/simple-encrypt v1 unit key"
-CTX_FILE_TAG = "github.com/orzogc/simple-encrypt v1 binary file tag key"
-AD_TEXT      = "github.com/orzogc/simple-encrypt v1 text unit"
-AD_TEXT_EMPTY= "github.com/orzogc/simple-encrypt v1 text empty file"
-AD_BIN_PREFIX= "github.com/orzogc/simple-encrypt v1 binary chunk"
+CTX_UNIT     = "github.com/orzogc/simple-file-encrypt v1 unit key"
+CTX_FILE_TAG = "github.com/orzogc/simple-file-encrypt v1 binary file tag key"
+AD_TEXT      = "github.com/orzogc/simple-file-encrypt v1 text unit"
+AD_TEXT_EMPTY= "github.com/orzogc/simple-file-encrypt v1 text empty file"
+AD_BIN_PREFIX= "github.com/orzogc/simple-file-encrypt v1 binary chunk"
 ```
 
 Notes:

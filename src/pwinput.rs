@@ -51,7 +51,7 @@ pub fn read_password(
     validate(read_stdin_line(what)?, what)
 }
 
-/// Reads the primary password: `SIMPLE_ENCRYPT_PASSWORD`, prompt, or the
+/// Reads the primary password: `SIMPLE_FILE_ENCRYPT_PASSWORD`, prompt, or the
 /// next stdin line.
 pub fn primary(confirm_on_tty: bool) -> Result<Zeroizing<String>> {
     let confirm = if confirm_on_tty {
@@ -67,7 +67,7 @@ pub fn old_password() -> Result<Zeroizing<String>> {
     read_password(ENV_PASSWORD, "Old password: ", None, "old password")
 }
 
-/// Reads `passwd`'s new password: `SIMPLE_ENCRYPT_NEW_PASSWORD`, prompt
+/// Reads `passwd`'s new password: `SIMPLE_FILE_ENCRYPT_NEW_PASSWORD`, prompt
 /// twice, or the next stdin line.
 pub fn new_password() -> Result<Zeroizing<String>> {
     read_password(

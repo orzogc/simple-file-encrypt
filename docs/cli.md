@@ -1,6 +1,6 @@
-# simple-encrypt — CLI Semantics
+# simple-file-encrypt — CLI Semantics
 
-Binary name: `simple-encrypt`. Subcommands: `init`, `encrypt` (`e`),
+Binary name: `simple-file-encrypt`. Subcommands: `init`, `encrypt` (`e`),
 `decrypt` (`d`), `add`, `remove`, `status`, `check`, `verify`,
 `passwd` (`p`), `rekey`.
 
@@ -11,7 +11,7 @@ promised machine interface.
 ## Domain resolution
 
 Every command except `init` locates the **domain config** by walking up
-from a starting directory until a `.simple-encrypt.toml` is found:
+from a starting directory until a `.simple-file-encrypt.toml` is found:
 
 - with explicit path arguments: from the argument itself when it is a
   directory, otherwise from its parent directory (so `encrypt .` at the
@@ -48,7 +48,7 @@ has a config — the ancestor scan follows the same repository-boundary
 rule as domain resolution (it stops where the walk above stops), and
 the descendant scan does not enter nested repositories, so a config
 outside the current repository never blocks `init` (a submodule gets
-its own domain). Traversal treats a foreign `.simple-encrypt.toml`
+its own domain). Traversal treats a foreign `.simple-file-encrypt.toml`
 below the domain root as a hard error.
 
 ## Locking
@@ -69,7 +69,7 @@ in a child) cannot both succeed and create nested domains; outside a
 repository there is no shared lock point and that residual race is
 accepted. Advisory locks may be ineffective on
 some network filesystems; do not run concurrent instances there. The
-lock excludes other simple-encrypt instances only — see the
+lock excludes other simple-file-encrypt instances only — see the
 mid-operation re-validation below for other programs.
 
 ## Password input
@@ -81,7 +81,7 @@ is selected (their nothing-to-do contract below); `add`, `remove`,
 
 Sources, in priority order:
 
-1. `SIMPLE_ENCRYPT_PASSWORD` environment variable (may be visible to
+1. `SIMPLE_FILE_ENCRYPT_PASSWORD` environment variable (may be visible to
    other same-user processes via `/proc`;
    see [threat-model.md](threat-model.md));
 2. interactive prompt without echo when stdin is a TTY — `init` and the
@@ -90,7 +90,7 @@ Sources, in priority order:
    confirmation) — for pipes and scripts.
 
 `passwd` needs two passwords. The old one comes from the sources above;
-the new one comes from `SIMPLE_ENCRYPT_NEW_PASSWORD` when set, otherwise
+the new one comes from `SIMPLE_FILE_ENCRYPT_NEW_PASSWORD` when set, otherwise
 it is prompted twice on a TTY, otherwise it is read as the next line of
 stdin (a script pipes both passwords on two lines). A password that
 cannot be obtained from any source is an error.
@@ -144,7 +144,7 @@ KDF-related global options, honored by every command that runs Argon2:
   destroy the very `-text` protection the ciphertext depends on.
   Explicitly naming the domain config, a `.gitattributes`, or a
   `.gitmodules` is an error. The temp-file namespace is exactly
-  `.simple-encrypt.tmp.<16 alphanumeric characters>`: such names are
+  `.simple-file-encrypt.tmp.<16 alphanumeric characters>`: such names are
   reserved to the tool (skipped, swept when stale, refused as targets);
   merely similar names are ordinary user files.
 - After expansion, targets with the same canonical path (a file named
@@ -184,7 +184,7 @@ For each candidate file, `encrypt` branches on the probe
   (below). Failure → hard error: foreign ciphertext, corrupted, moved
   from another path — or plaintext that happens to begin with
   `BIN_MAGIC` (see `--assume-plaintext`).
-- **First line starts with `#simple-encrypt`**: a first line that is
+- **First line starts with `#simple-file-encrypt`**: a first line that is
   not an exact v1 header form is a hard error — ciphertext from a
   newer tool, or colliding plaintext; version fail-closed is never
   relaxed implicitly. For an exact v1 header, authenticate the
@@ -213,7 +213,7 @@ authentication is treated as plaintext and encrypted normally. A
 successful authentication is never overridden — valid ciphertext of
 this domain cannot be double-encrypted. This is also the only way to
 manage plaintext that genuinely starts with `BIN_MAGIC` or a
-`#simple-encrypt` line.
+`#simple-file-encrypt` line.
 
 The authentication check on skipped files costs one SIV verification
 per ring key tried, not a full decryption.
@@ -221,7 +221,7 @@ per ring key tried, not a full decryption.
 `decrypt` ignores `force_binary` (the mode comes from the ciphertext):
 no probe hit → skip with a note (or a hard error under
 `--require-encrypted`, for scripts that must not silently pass a
-plaintext or magic-stripped file); a `#simple-encrypt` first line that
+plaintext or magic-stripped file); a `#simple-file-encrypt` first line that
 is not an exact v1 header form → hard error; a marker header → decrypts
 to an empty file; otherwise decrypt, trying ring keys in order, with
 authentication, format, or version failures as hard errors. The ring
@@ -231,7 +231,7 @@ the error message names this cause.
 
 ## Atomicity and failure semantics
 
-- Every file replacement writes `.simple-encrypt.tmp.<16 random alnum>`
+- Every file replacement writes `.simple-file-encrypt.tmp.<16 random alnum>`
   in the target's directory, created `0600` with `O_EXCL | O_NOFOLLOW`;
   content is written and fsynced, the temp is renamed over the target
   **while still `0600`**, then the target's original permission bits
@@ -256,7 +256,7 @@ the error message names this cause.
   best-effort — a race within the window remains possible
   (see [threat-model.md](threat-model.md)). The config gets the same
   treatment: before writing any ciphertext, the tool verifies that
-  `.simple-encrypt.toml` is still the file it loaded, so a mid-run
+  `.simple-file-encrypt.toml` is still the file it loaded, so a mid-run
   replacement (a `git checkout` in another terminal) aborts the command
   instead of producing ciphertext the on-disk config cannot decrypt.
 - At the start of every exclusive-lock command, stale temp files are
@@ -289,7 +289,7 @@ the error message names this cause.
 
 ### `init`
 
-Create `.simple-encrypt.toml` in the current directory (refusal rules
+Create `.simple-file-encrypt.toml` in the current directory (refusal rules
 under Domain resolution): prompt for the password (twice on a TTY),
 generate a random 16-byte salt and 32-byte domain key, wrap the domain
 key as the ring's sole entry, and write the config with default KDF
@@ -361,7 +361,7 @@ decrypt and re-encrypt to change its mode.
 For every managed file (directories expanded), print its state —
 `encrypted`, `plaintext`, `missing`, `symlink`/`special` (a managed
 path that exists only as a symlink or other non-regular file), or
-`unrecognized` (a `#simple-encrypt`-prefixed first line that is no
+`unrecognized` (a `#simple-file-encrypt`-prefixed first line that is no
 exact v1 header) — plus a `binary` marker where `force_binary` applies
 or the stored mode is binary. Needs no password. Exit code 0
 regardless of states (it is a report, not a gate); an I/O error while
@@ -373,7 +373,7 @@ Gate for CI and hooks: exit 0 when every managed file that exists on
 disk is encrypted (probe only — `check` needs no password and therefore
 cannot verify decryptability), exit 1 listing every offender (plaintext,
 a symlink or special managed path — its content was never probed — or
-an unrecognized `#simple-encrypt`-prefixed header), exit 2 on
+an unrecognized `#simple-file-encrypt`-prefixed header), exit 2 on
 operational errors. With arguments, the given files and directories are
 checked instead, managed or not. Missing files are ignored.
 
@@ -559,8 +559,8 @@ tmp=$(mktemp -d)
 trap 'rm -rf -- "$tmp"' EXIT
 git checkout-index --all --prefix="$tmp/"
 while IFS= read -r -d '' cfg; do
-    (cd "$(dirname "$cfg")" && simple-encrypt check) || exit 1
-done < <(find "$tmp" -type f -name .simple-encrypt.toml -print0)
+    (cd "$(dirname "$cfg")" && simple-file-encrypt check) || exit 1
+done < <(find "$tmp" -type f -name .simple-file-encrypt.toml -print0)
 ```
 
 This checks each staged config together with its staged contents, and
@@ -584,19 +584,19 @@ its config.
 ### Typical flow
 
 ```console
-$ simple-encrypt init                 # once per repository
-$ simple-encrypt add .env secrets/
-$ simple-encrypt e                    # encrypt everything managed
+$ simple-file-encrypt init                 # once per repository
+$ simple-file-encrypt add .env secrets/
+$ simple-file-encrypt e                    # encrypt everything managed
 $ git add -A && git commit
-$ simple-encrypt d                    # work on plaintext locally
-$ simple-encrypt e                    # re-encrypt before committing again
+$ simple-file-encrypt d                    # work on plaintext locally
+$ simple-file-encrypt e                    # re-encrypt before committing again
 ```
 
 Rename a managed file while it is *plaintext* (path-bound keys):
 
 ```console
-$ simple-encrypt d secrets/old.env
+$ simple-file-encrypt d secrets/old.env
 $ git mv secrets/old.env secrets/new.env
-$ simple-encrypt remove secrets/old.env   # if it was an exact entry
-$ simple-encrypt e secrets/new.env        # auto-adds the new path
+$ simple-file-encrypt remove secrets/old.env   # if it was an exact entry
+$ simple-file-encrypt e secrets/new.env        # auto-adds the new path
 ```

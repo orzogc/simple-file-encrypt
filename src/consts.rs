@@ -5,10 +5,10 @@
 pub const FORMAT_VERSION: u64 = 1;
 
 /// Domain config file name; the directory containing it is the domain root.
-pub const CONFIG_NAME: &str = ".simple-encrypt.toml";
+pub const CONFIG_NAME: &str = ".simple-file-encrypt.toml";
 
 /// Prefix of temporary files used for atomic replacement.
-pub const TMP_PREFIX: &str = ".simple-encrypt.tmp.";
+pub const TMP_PREFIX: &str = ".simple-file-encrypt.tmp.";
 
 /// Number of random alphanumeric characters in a temp-file name.
 pub const TMP_RAND_LEN: usize = 16;
@@ -39,10 +39,10 @@ pub const FILE_TAG_LEN: usize = 32;
 pub const CHUNK_SIZE: usize = 65536;
 
 /// Text-mode probe prefix: any first line starting with this is a probe hit.
-pub const TEXT_MAGIC_PREFIX: &str = "#simple-encrypt";
+pub const TEXT_MAGIC_PREFIX: &str = "#simple-file-encrypt";
 
 /// Exact v1 text header line content (without the terminating newline).
-pub const TEXT_HEADER_V1: &str = "#simple-encrypt v1 text";
+pub const TEXT_HEADER_V1: &str = "#simple-file-encrypt v1 text";
 
 /// Binary-mode magic: `"\x89SENC\r\n\x1a"`.
 pub const BIN_MAGIC: [u8; 8] = [0x89, 0x53, 0x45, 0x4E, 0x43, 0x0D, 0x0A, 0x1A];
@@ -105,7 +105,7 @@ pub const KDF_DEFAULT_ITERATIONS: u32 = 3;
 pub const KDF_DEFAULT_PARALLELISM: u32 = 1;
 
 /// Environment variable providing the (old) password non-interactively.
-pub const ENV_PASSWORD: &str = "SIMPLE_ENCRYPT_PASSWORD";
+pub const ENV_PASSWORD: &str = "SIMPLE_FILE_ENCRYPT_PASSWORD";
 
 /// Environment variable providing `passwd`'s new password non-interactively.
-pub const ENV_NEW_PASSWORD: &str = "SIMPLE_ENCRYPT_NEW_PASSWORD";
+pub const ENV_NEW_PASSWORD: &str = "SIMPLE_FILE_ENCRYPT_NEW_PASSWORD";

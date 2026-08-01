@@ -1,6 +1,6 @@
-# simple-encrypt — Design Overview
+# simple-file-encrypt — Design Overview
 
-`simple-encrypt` is a command-line tool that encrypts and decrypts local
+`simple-file-encrypt` is a command-line tool that encrypts and decrypts local
 files in place with a single password. It is designed so that encrypted
 files behave well inside a git repository — ciphertext is line-diffable,
 mergeable, and deterministic — while the tool itself never talks to git.
@@ -45,7 +45,7 @@ This document is the entry point. Detailed specifications live in:
 ## Core concepts
 
 - **Domain**: a directory tree rooted at the directory containing a
-  `.simple-encrypt.toml` file (the **domain config**). Every operation
+  `.simple-file-encrypt.toml` file (the **domain config**). Every operation
   resolves its targets to exactly one domain by walking up from the
   target path (like git discovering `.git`), stopping at repository
   boundaries. Nested domains are rejected within one repository.
@@ -147,7 +147,7 @@ This document is the entry point. Detailed specifications live in:
 
 ## Comparison with git-simple-encrypt
 
-| | git-simple-encrypt | simple-encrypt |
+| | git-simple-encrypt | simple-file-encrypt |
 |---|---|---|
 | Granularity | whole file (64 KiB chunks, AAD chain) | per line (text), chunked + file tag (binary) |
 | Cipher | XChaCha20-Poly1305, derived nonces | AES-SIV (RFC 5297), nonce-free |
@@ -164,7 +164,7 @@ This document is the entry point. Detailed specifications live in:
 ## Operational consequences
 
 - **Config and ciphertext are a pair.** Copying an encrypted file out of
-  the domain (or losing `.simple-encrypt.toml`) makes it undecryptable.
+  the domain (or losing `.simple-file-encrypt.toml`) makes it undecryptable.
   In git they live in the same repository, which is the intended
   deployment.
 - **`passwd` is not revocation.** The old wrapped ring stays in git
@@ -174,7 +174,7 @@ This document is the entry point. Detailed specifications live in:
 - **Renames require plaintext.** Decrypt → move → re-encrypt. Decrypting
   a moved ciphertext fails authentication (path-bound keys); the error
   message hints at this cause.
-- **Crash windows.** A crash can leave a stale `.simple-encrypt.tmp.*`
+- **Crash windows.** A crash can leave a stale `.simple-file-encrypt.tmp.*`
   file (mode `0600`; during decryption it contains plaintext). Every
   exclusive-lock run sweeps the domain root and all target parent
   directories. Treat a crash during decryption as a potential plaintext
@@ -194,7 +194,7 @@ This document is the entry point. Detailed specifications live in:
 ## Engineering
 
 - **Language**: Rust, edition 2024, MSRV 1.89 (`std` file locking).
-- **Crate shape**: single binary crate `simple-encrypt` with an internal
+- **Crate shape**: single binary crate `simple-file-encrypt` with an internal
   `lib.rs` so integration tests can call the library API. The library
   API is not public and carries no stability promise.
 - **Dependencies** (intentionally lean): `clap` (derive CLI), `argon2`,

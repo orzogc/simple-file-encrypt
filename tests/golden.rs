@@ -3,9 +3,9 @@
 //! ciphertext). If any of these change, the format has changed:
 //! that requires a version bump, not a fixture update.
 
-use simple_encrypt::crypto::{self, FileKeys, KdfParams};
-use simple_encrypt::error::Error;
-use simple_encrypt::{binmode, hexutil, textmode};
+use simple_file_encrypt::crypto::{self, FileKeys, KdfParams};
+use simple_file_encrypt::error::Error;
+use simple_file_encrypt::{binmode, hexutil, textmode};
 use zeroize::Zeroizing;
 
 const GOLDEN_SALT: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
@@ -17,14 +17,14 @@ const GOLDEN_KDF: KdfParams = KdfParams {
 const GOLDEN_PATH: &str = "dir/hello.txt";
 
 const KEK_HEX: &str = "02c85df2805a75428bbb03c08c1ee8401a80f901ccb292840b461fb155de711034578f33a42046f0626e49727e1471ff053b7b488c03eef858a486f9aa80f9ec";
-const WRAP0_HEX: &str = "2cbad57de77b5107a846b30cf3546d5c59686dc97c9519aaa7f377f4548707e275f362c3bbf6fc6dac51d7c92c601c31";
-const WRAP1_HEX: &str = "ffdc403cb5677ffa74f4b64f6f773ac6d26aeeaf12755b507e3aaea9f993539ed84202d88d790ed26d21ec476e6fc6fd";
+const WRAP0_HEX: &str = "eba06ed3bcd06a23298afab93ea32b5a813b10b9b0ff42362d14617523b7adaaef980a61e1cc0c6cff90647d0c672bb2";
+const WRAP1_HEX: &str = "ff5d885824eed72f246882eb407610ee63b1c2f1dcdc9be359377e38acb68156a9681c4098903662bff2384ae84277ee";
 const TEXT_CT: &str =
-    "#simple-encrypt v1 text\nacMIkanpzdkzFyPmbQ6L7LZLCB/F\n8Vi0tcGqcGiE6FKLVjsBh7pwVkKo\n";
-const EMPTY_CT: &str = "#simple-encrypt v1 text NZxiLoqGBlG4/6x8mgFkQQ\n";
-const BIN_CT_HEX: &str = "8953454e430d0a1a01000000000000003ed1f462de5d93e2c3c6a35b5b6e270c32e4eccb251ffd077f9f103b03efc782b7ede02e7ccf7709b57e1b6917a73d0b184a0f8624aeef4692a8a309d173";
+    "#simple-file-encrypt v1 text\nsLEZnqFE/IDpOOFx9phV4JIKmr9x\n9lDpBk9esSXSIPKYGsK7OKdusULV\n";
+const EMPTY_CT: &str = "#simple-file-encrypt v1 text YQ8q13UJE6xg2QvQEmsLCg\n";
+const BIN_CT_HEX: &str = "8953454e430d0a1a0100000000000000a0f6677b3308242740f945f253d33bbede3d7cdb6e7f32e73dd36922326df716de0a2e0a308a12f95b69dbcfb52ff2e2c6f37402cc54671bab73f0a877a2";
 const BIG_CT_LEN: usize = 65716;
-const BIG_CT_B3: &str = "6918037cd572b2cea3daa7e70d0b7b87df07ca85c7bb3007e3ec8a7a6997fa1e";
+const BIG_CT_B3: &str = "23c14c8aa77021d6ed8a5e60ec8c3c58e7bb665910862e6ec057ca46942c565f";
 
 fn golden_file_key() -> Zeroizing<[u8; 32]> {
     Zeroizing::new([0x42u8; 32])

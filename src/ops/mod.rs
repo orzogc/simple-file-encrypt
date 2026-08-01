@@ -59,7 +59,7 @@ pub fn open_domain(args: &[PathBuf], exclusive: bool) -> Result<(Domain, Vec<Str
             let start = paths::resolution_start(&abs)?;
             let this = paths::discover_domain(&start)?.ok_or_else(|| {
                 Error::Usage(format!(
-                    "`{}` is outside any simple-encrypt domain (no `.simple-encrypt.toml` found)",
+                    "`{}` is outside any simple-file-encrypt domain (no `.simple-file-encrypt.toml` found)",
                     report::escape_path(arg)
                 ))
             })?;
@@ -79,7 +79,7 @@ pub fn open_domain(args: &[PathBuf], exclusive: bool) -> Result<(Domain, Vec<Str
         }
     }
     let root = root.ok_or_else(|| {
-        Error::Usage("not inside a simple-encrypt domain (no `.simple-encrypt.toml` found up to the repository boundary)".into())
+        Error::Usage("not inside a simple-file-encrypt domain (no `.simple-file-encrypt.toml` found up to the repository boundary)".into())
     })?;
     // The discovered root must be a real directory: a symlinked root
     // would make the lexical containment checks of `mint` meaningless

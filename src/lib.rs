@@ -1,4 +1,4 @@
-//! Internal library of the `simple-encrypt` binary.
+//! Internal library of the `simple-file-encrypt` binary.
 //!
 //! The modules are `pub` only so the integration tests and the binary
 //! share one implementation; depending on this crate as a library is

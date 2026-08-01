@@ -1,8 +1,8 @@
-# simple-encrypt
+# simple-file-encrypt
 
 [简体中文](README_zh-CN.md)
 
-`simple-encrypt` encrypts and decrypts local files in place with a
+`simple-file-encrypt` encrypts and decrypts local files in place with a
 single password, producing ciphertext that behaves well inside a git
 repository: text files are encrypted **per line, deterministically**, so
 ciphertext is line-diffable and mergeable, and re-encrypting unchanged
@@ -40,7 +40,7 @@ If you need to hide file structure and change patterns, use
 
 - One password wraps random 32-byte **domain keys** (Argon2id →
   AES-CMAC-SIV key wrap) stored in a committed config,
-  `.simple-encrypt.toml`. Ciphertext is useless without that config —
+  `.simple-file-encrypt.toml`. Ciphertext is useless without that config —
   keep them together in the same repository.
 - Every unit (a text line, an empty-file marker, or a 64 KiB binary
   chunk) is encrypted with **AES-CMAC-SIV (RFC 5297, AES-256)** under a
@@ -59,12 +59,12 @@ If you need to hide file structure and change patterns, use
 
 ```console
 $ cd your-repo
-$ simple-encrypt init                 # once; prompts for the password
-$ simple-encrypt add .env secrets/
-$ simple-encrypt e                    # encrypt everything managed
+$ simple-file-encrypt init                 # once; prompts for the password
+$ simple-file-encrypt add .env secrets/
+$ simple-file-encrypt e                    # encrypt everything managed
 $ git add -A && git commit
-$ simple-encrypt d                    # work on plaintext locally
-$ simple-encrypt e                    # re-encrypt before committing
+$ simple-file-encrypt d                    # work on plaintext locally
+$ simple-file-encrypt e                    # re-encrypt before committing
 ```
 
 Mark managed paths `-text` in `.gitattributes` so git never converts
@@ -79,7 +79,7 @@ secrets/**      -text
 
 | Command | Effect |
 |---|---|
-| `init` | Create `.simple-encrypt.toml` in the current directory |
+| `init` | Create `.simple-file-encrypt.toml` in the current directory |
 | `encrypt` (`e`) `[PATHS…]` | Encrypt managed or given files in place (auto-adds new ones) |
 | `decrypt` (`d`) `[PATHS…]` | Decrypt managed or given files in place |
 | `add` / `remove <PATHS…>` | Maintain the managed list (no password needed) |

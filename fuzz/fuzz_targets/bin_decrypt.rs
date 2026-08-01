@@ -10,8 +10,8 @@ fuzz_target!(|data: &[u8]| {
     // authentication are exercised; malformed input must fail, never
     // panic.
     let mut input = Vec::with_capacity(data.len() + 8);
-    input.extend_from_slice(&simple_encrypt::consts::BIN_MAGIC);
+    input.extend_from_slice(&simple_file_encrypt::consts::BIN_MAGIC);
     input.extend_from_slice(data);
-    let _ = simple_encrypt::binmode::authenticate_first(&keys, "fuzz", &input);
-    let _ = simple_encrypt::binmode::decrypt(&keys, "fuzz", &input);
+    let _ = simple_file_encrypt::binmode::authenticate_first(&keys, "fuzz", &input);
+    let _ = simple_file_encrypt::binmode::decrypt(&keys, "fuzz", &input);
 });

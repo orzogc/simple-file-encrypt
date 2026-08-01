@@ -13,7 +13,7 @@ fuzz_target!(|data: &[u8]| {
     // input must fail, never panic.
     let mut input = Vec::with_capacity(data.len() + 48);
     if data.first().is_some_and(|b| b & 1 == 1) {
-        input.extend_from_slice(b"#simple-encrypt v1 text ");
+        input.extend_from_slice(b"#simple-file-encrypt v1 text ");
         for (i, v) in data.iter().skip(1).take(22).enumerate() {
             if i == 21 {
                 // Canonical final character (four trailing bits zero).
@@ -25,9 +25,9 @@ fuzz_target!(|data: &[u8]| {
         input.push(b'\n');
         input.extend_from_slice(data.get(23..).unwrap_or(&[]));
     } else {
-        input.extend_from_slice(b"#simple-encrypt v1 text\n");
+        input.extend_from_slice(b"#simple-file-encrypt v1 text\n");
         input.extend_from_slice(data.get(1..).unwrap_or(&[]));
     }
-    let _ = simple_encrypt::textmode::authenticate_first(&keys, "fuzz", &input);
-    let _ = simple_encrypt::textmode::decrypt(&keys, "fuzz", &input);
+    let _ = simple_file_encrypt::textmode::authenticate_first(&keys, "fuzz", &input);
+    let _ = simple_file_encrypt::textmode::decrypt(&keys, "fuzz", &input);
 });

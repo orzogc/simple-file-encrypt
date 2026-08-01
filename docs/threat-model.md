@@ -1,4 +1,4 @@
-# simple-encrypt — Threat Model
+# simple-file-encrypt — Threat Model
 
 This tool makes a deliberate, unusual trade: it encrypts text files line
 by line, deterministically, so that ciphertext diffs and merges like
@@ -192,11 +192,11 @@ history.
 
 | Risk | Stance |
 |---|---|
-| Losing `.simple-encrypt.toml` | Ciphertext is undecryptable without it (salt and the wrapped key ring live there). It is committed next to the ciphertext; git is the backup. |
-| `SIMPLE_ENCRYPT_PASSWORD` in the environment | Visible to same-user processes via `/proc`; prefer the interactive prompt outside CI. |
-| Crash during decryption | May leave a `.simple-encrypt.tmp.*` containing plaintext (mode `0600`) until the next exclusive-lock run sweeps the domain root and the parent directories of *its* targets — a temp next to an unmanaged explicit target is removed only once that directory takes part in a later operation; treat as a plaintext spill. |
+| Losing `.simple-file-encrypt.toml` | Ciphertext is undecryptable without it (salt and the wrapped key ring live there). It is committed next to the ciphertext; git is the backup. |
+| `SIMPLE_FILE_ENCRYPT_PASSWORD` in the environment | Visible to same-user processes via `/proc`; prefer the interactive prompt outside CI. |
+| Crash during decryption | May leave a `.simple-file-encrypt.tmp.*` containing plaintext (mode `0600`) until the next exclusive-lock run sweeps the domain root and the parent directories of *its* targets — a temp next to an unmanaged explicit target is removed only once that directory takes part in a later operation; treat as a plaintext spill. |
 | Concurrent runs on one domain | Guarded by an advisory `flock` on the domain root directory; the second instance fails fast. Advisory locks may not work on network filesystems — avoid concurrent use there. |
-| Another program rewriting a file mid-operation | The advisory lock excludes only other simple-encrypt instances. Before replacing a file the tool re-checks `(device, inode)`, size, and mtime against what it read and fails that file on mismatch; the config is likewise re-verified against its load-time snapshot before any ciphertext is written, so a mid-run config swap (e.g. `git checkout`) aborts instead of producing undecryptable files. A race inside either window remains. |
+| Another program rewriting a file mid-operation | The advisory lock excludes only other simple-file-encrypt instances. Before replacing a file the tool re-checks `(device, inode)`, size, and mtime against what it read and fails that file on mismatch; the config is likewise re-verified against its load-time snapshot before any ciphertext is written, so a mid-run config swap (e.g. `git checkout`) aborts instead of producing undecryptable files. A race inside either window remains. |
 | git EOL or filter conversion | Text ciphertext is byte-exact and LF-framed: mark managed paths `-text` in `.gitattributes`, and never apply clean/smudge filters or `working-tree-encoding` to them. A CRLF checkout fails closed as a format error. The tool itself refuses to encrypt `.gitattributes` and `.gitmodules`. |
 | File metadata beyond mode bits | Only Unix permission bits survive temp + rename: ownership, POSIX ACLs, extended attributes, security labels, and file flags are not preserved and may alter access semantics — keep files that depend on them out of managed paths. |
 | Hard links | `encrypt` refuses files with link count > 1: the other links would keep a readable plaintext alias. Resolve the links first. |
@@ -211,7 +211,7 @@ history.
 
 - Need line-diffable encrypted files in git, and the leakage above is
   acceptable for your data (typical: high-entropy tokens, personal
-  configs in a private repo) → **simple-encrypt**.
+  configs in a private repo) → **simple-file-encrypt**.
 - Need to hide file structure and change patterns, want whole-file
   encryption with transactional robustness →
   **git-simple-encrypt**.

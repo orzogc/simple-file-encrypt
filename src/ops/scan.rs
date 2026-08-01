@@ -198,7 +198,7 @@ pub fn verify(arg_paths: &[PathBuf], gate: &KdfGate) -> Result<ScanOutcome> {
             Probe::Plain => Ok(None),
             Probe::TextUnrecognized => Err(Error::format(
                 file.rel.clone(),
-                "the first line starts with `#simple-encrypt` but is no exact v1 header",
+                "the first line starts with `#simple-file-encrypt` but is no exact v1 header",
             )),
             Probe::TextV1 => {
                 let data = fsops::read_capped(&file.abs, crate::consts::MAX_FILE_SIZE, "file")?;

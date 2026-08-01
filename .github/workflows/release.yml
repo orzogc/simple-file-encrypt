@@ -70,10 +70,10 @@ jobs:
       - name: Package
         run: |
           set -euo pipefail
-          stage="simple-encrypt-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          stage="simple-file-encrypt-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir -p "$stage"
-          cp "target/${{ matrix.target }}/release/simple-encrypt" "$stage/"
-          strip "$stage/simple-encrypt"
+          cp "target/${{ matrix.target }}/release/simple-file-encrypt" "$stage/"
+          strip "$stage/simple-file-encrypt"
           cp README.md LICENSE "$stage/"
           tar -czf "${stage}.tar.gz" "$stage"
           if command -v sha256sum >/dev/null; then
@@ -83,16 +83,16 @@ jobs:
           fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: simple-encrypt-${{ matrix.target }}
+          name: simple-file-encrypt-${{ matrix.target }}
           path: |
-            simple-encrypt-*.tar.gz
-            simple-encrypt-*.tar.gz.sha256
+            simple-file-encrypt-*.tar.gz
+            simple-file-encrypt-*.tar.gz.sha256
           retention-days: 1
         # Keyless (Sigstore) build provenance: consumers can verify the
         # archives came from this repo's release.yml on this tag.
       - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with:
-          subject-path: simple-encrypt-*.tar.gz
+          subject-path: simple-file-encrypt-*.tar.gz
 
   release:
     needs: build
@@ -102,7 +102,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          pattern: simple-encrypt-*
+          pattern: simple-file-encrypt-*
           merge-multiple: true
       - name: Publish to GitHub Releases
         env:
@@ -112,4 +112,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --verify-tag \
             --generate-notes \
-            simple-encrypt-*.tar.gz simple-encrypt-*.tar.gz.sha256
+            simple-file-encrypt-*.tar.gz simple-file-encrypt-*.tar.gz.sha256

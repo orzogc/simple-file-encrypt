@@ -12,7 +12,7 @@ pub enum Probe {
     Binary,
     /// First line is one of the two exact v1 text header forms.
     TextV1,
-    /// First line starts with `#simple-encrypt` but is no exact v1
+    /// First line starts with `#simple-file-encrypt` but is no exact v1
     /// header: newer-tool ciphertext or colliding plaintext.
     TextUnrecognized,
     /// No probe hit: treated as plaintext.
@@ -86,38 +86,47 @@ mod tests {
     #[test]
     fn probe_classification() {
         assert_eq!(probe(b"\x89SENC\r\n\x1a\x01rest"), Probe::Binary);
-        assert_eq!(probe(b"#simple-encrypt v1 text\nAAAA"), Probe::TextV1);
-        assert_eq!(probe(b"#simple-encrypt v1 text\n"), Probe::TextV1);
+        assert_eq!(probe(b"#simple-file-encrypt v1 text\nAAAA"), Probe::TextV1);
+        assert_eq!(probe(b"#simple-file-encrypt v1 text\n"), Probe::TextV1);
         // Both exact forms are newline-terminated.
-        assert_eq!(probe(b"#simple-encrypt v1 text"), Probe::TextUnrecognized);
+        assert_eq!(
+            probe(b"#simple-file-encrypt v1 text"),
+            Probe::TextUnrecognized
+        );
         // Marker form: exactly 22 base64 chars after one space, with a
         // canonical final character (four trailing bits zero).
-        let marker = "#simple-encrypt v1 text AAAAAAAAAAAAAAAAAAAAAA\n";
+        let marker = "#simple-file-encrypt v1 text AAAAAAAAAAAAAAAAAAAAAA\n";
         assert_eq!(probe(marker.as_bytes()), Probe::TextV1);
         assert_eq!(
-            probe(b"#simple-encrypt v1 text AAAAAAAAAAAAAAAAAAAAAB\n"),
+            probe(b"#simple-file-encrypt v1 text AAAAAAAAAAAAAAAAAAAAAB\n"),
             Probe::TextUnrecognized
         );
         assert_eq!(
-            probe(b"#simple-encrypt v1 text AAAAAAAAAAAAAAAAAAAAAA"),
+            probe(b"#simple-file-encrypt v1 text AAAAAAAAAAAAAAAAAAAAAA"),
             Probe::TextUnrecognized
         );
         // Wrong marker length, extra spaces, or other suffixes are unrecognized.
         assert_eq!(
-            probe(b"#simple-encrypt v1 text AAAA\n"),
+            probe(b"#simple-file-encrypt v1 text AAAA\n"),
             Probe::TextUnrecognized
         );
         assert_eq!(
-            probe(b"#simple-encrypt v1 text  \n"),
+            probe(b"#simple-file-encrypt v1 text  \n"),
             Probe::TextUnrecognized
         );
-        assert_eq!(probe(b"#simple-encrypt v2 text\n"), Probe::TextUnrecognized);
-        assert_eq!(probe(b"#simple-encrypted\n"), Probe::TextUnrecognized);
-        assert_eq!(probe(b"#simple-encrypt"), Probe::TextUnrecognized);
+        assert_eq!(
+            probe(b"#simple-file-encrypt v2 text\n"),
+            Probe::TextUnrecognized
+        );
+        assert_eq!(probe(b"#simple-file-encrypted\n"), Probe::TextUnrecognized);
+        assert_eq!(probe(b"#simple-file-encrypt"), Probe::TextUnrecognized);
         // No hit.
         assert_eq!(probe(b"hello\n"), Probe::Plain);
         assert_eq!(probe(b""), Probe::Plain);
-        assert_eq!(probe(b"#simple\n#simple-encrypt v1 text\n"), Probe::Plain);
+        assert_eq!(
+            probe(b"#simple\n#simple-file-encrypt v1 text\n"),
+            Probe::Plain
+        );
         // Truncated magic is plain.
         assert_eq!(probe(b"\x89SENC\r\n"), Probe::Plain);
     }

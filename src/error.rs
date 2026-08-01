@@ -55,7 +55,7 @@ pub enum Error {
     /// KDF parameters violate a validation tier.
     Kdf(String),
 
-    /// Another simple-encrypt instance holds the domain lock.
+    /// Another simple-file-encrypt instance holds the domain lock.
     Locked {
         /// The domain root directory.
         root: PathBuf,
@@ -82,7 +82,7 @@ impl std::fmt::Display for Error {
                 write!(f, "{op} `{}`: {source}", crate::report::escape_path(path))
             }
             Error::Config(msg) => write!(f, "config error: {msg}"),
-            Error::NewerVersion(msg) => write!(f, "{msg}; upgrade simple-encrypt"),
+            Error::NewerVersion(msg) => write!(f, "{msg}; upgrade simple-file-encrypt"),
             Error::Format { path, msg } | Error::Auth { path, msg } => {
                 write!(f, "`{}`: {msg}", crate::report::escape_str(path))
             }
@@ -97,7 +97,7 @@ impl std::fmt::Display for Error {
             ),
             Error::Locked { root } => write!(
                 f,
-                "another simple-encrypt instance is running on `{}`",
+                "another simple-file-encrypt instance is running on `{}`",
                 crate::report::escape_path(root)
             ),
             Error::Kdf(msg) | Error::Password(msg) | Error::Usage(msg) | Error::Limit(msg) => {

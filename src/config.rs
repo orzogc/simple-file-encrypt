@@ -1,4 +1,4 @@
-//! The domain config `.simple-encrypt.toml`: strict loading and
+//! The domain config `.simple-file-encrypt.toml`: strict loading and
 //! validation, and the stable rendered form the tool writes
 //! (see `docs/format.md`).
 
@@ -254,7 +254,7 @@ pub fn render(cfg: &Config) -> String {
 
     let mut out = String::with_capacity(1024);
     out.push_str(
-        "# Managed by simple-encrypt. `salt`, `wrapped_keys`, and [kdf] are\n\
+        "# Managed by simple-file-encrypt. `salt`, `wrapped_keys`, and [kdf] are\n\
          # security-critical: do not edit them by hand.\n",
     );
     out.push_str(&format!("version = {FORMAT_VERSION}\n\n"));
@@ -356,7 +356,7 @@ impl LoadedConfig {
     /// snapshot taken at load (or the last rewrite): another program
     /// replaced it mid-operation, so ciphertext written under the
     /// in-memory ring might be undecryptable by the on-disk config. The
-    /// advisory lock excludes other simple-encrypt instances, not git
+    /// advisory lock excludes other simple-file-encrypt instances, not git
     /// or editors; a race inside the stat window remains (accepted, see
     /// `docs/threat-model.md`).
     pub fn ensure_fresh(&self) -> Result<()> {

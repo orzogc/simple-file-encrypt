@@ -336,7 +336,7 @@ impl Expander<'_> {
     fn check_boundary(&self, rel: &str, dir: &Path) -> Result<()> {
         if paths::exists_probe(&dir.join(".git"))? {
             return Err(Error::Usage(format!(
-                "`{rel}` lies inside the nested repository `{}`; it needs its own simple-encrypt domain",
+                "`{rel}` lies inside the nested repository `{}`; it needs its own simple-file-encrypt domain",
                 report::escape_path(dir)
             )));
         }
@@ -464,7 +464,7 @@ impl Expander<'_> {
             // behind — naming one explicitly already fails at minting.
             let Some(ns) = name_str else {
                 return Err(Error::Usage(format!(
-                    "`{}`: file name is not valid UTF-8; simple-encrypt refuses such names",
+                    "`{}`: file name is not valid UTF-8; simple-file-encrypt refuses such names",
                     report::escape_path(&child_abs)
                 )));
             };
@@ -509,7 +509,7 @@ impl Expander<'_> {
 fn reject_control_name(abs: &Path, name: &str) -> Result<()> {
     if paths::has_control(name) {
         return Err(Error::Usage(format!(
-            "`{}`: a file name contains a control character; simple-encrypt refuses such names",
+            "`{}`: a file name contains a control character; simple-file-encrypt refuses such names",
             report::escape_path(abs)
         )));
     }

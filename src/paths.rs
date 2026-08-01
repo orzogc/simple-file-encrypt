@@ -24,8 +24,8 @@ pub fn has_control(s: &str) -> bool {
 }
 
 /// Whether `name` is exactly a tool temp-file name:
-/// `.simple-encrypt.tmp.<16 alnum>`. Only exact matches are swept as
-/// stale temps; lookalikes (`.simple-encrypt.tmp.notes`) are ordinary
+/// `.simple-file-encrypt.tmp.<16 alnum>`. Only exact matches are swept as
+/// stale temps; lookalikes (`.simple-file-encrypt.tmp.notes`) are ordinary
 /// user files.
 pub fn is_temp_name(name: &str) -> bool {
     let Some(rand) = name.strip_prefix(TMP_PREFIX) else {
@@ -70,11 +70,11 @@ pub fn forbidden_reason(entry: &str) -> Option<String> {
     let last = entry.rsplit('/').next().unwrap_or(entry);
     if PROTECTED_FINAL.contains(&last) {
         return Some(format!(
-            "`{last}` must stay readable as plaintext for git and simple-encrypt"
+            "`{last}` must stay readable as plaintext for git and simple-file-encrypt"
         ));
     }
     if is_temp_name(last) {
-        return Some("it is a simple-encrypt temp file".into());
+        return Some("it is a simple-file-encrypt temp file".into());
     }
     None
 }
@@ -206,7 +206,7 @@ pub fn mint(root: &Path, abs: &Path) -> Result<String> {
                 Err(e) => return Err(Error::io("inspecting", &candidate, e)),
                 Ok(md) if md.file_type().is_symlink() => {
                     return Err(Error::Usage(format!(
-                        "`{}` is or contains a symlink (`{}`); simple-encrypt refuses symlinked targets",
+                        "`{}` is or contains a symlink (`{}`); simple-file-encrypt refuses symlinked targets",
                         crate::report::escape_path(abs),
                         crate::report::escape_path(&candidate)
                     )));
@@ -217,7 +217,7 @@ pub fn mint(root: &Path, abs: &Path) -> Result<String> {
         if has_control(&spelled) {
             return Err(Error::Usage(format!(
                 "`{}`: a path component contains a control character; \
-                 simple-encrypt refuses such names",
+                 simple-file-encrypt refuses such names",
                 crate::report::escape_path(abs)
             )));
         }
@@ -296,8 +296,8 @@ mod tests {
         assert!(forbidden_reason("a/.git").is_some());
         assert!(forbidden_reason(".gitattributes").is_some());
         assert!(forbidden_reason("sub/.gitmodules").is_some());
-        assert!(forbidden_reason(".simple-encrypt.toml").is_some());
-        assert!(forbidden_reason("a/.simple-encrypt.toml").is_some());
+        assert!(forbidden_reason(".simple-file-encrypt.toml").is_some());
+        assert!(forbidden_reason("a/.simple-file-encrypt.toml").is_some());
         assert!(forbidden_reason(&format!("{TMP_PREFIX}0123456789abcdef")).is_some());
         assert!(forbidden_reason(".gitignore").is_none());
         assert!(forbidden_reason("a/gitattributes").is_none());

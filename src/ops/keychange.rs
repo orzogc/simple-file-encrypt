@@ -179,7 +179,7 @@ fn find_old_epoch_file(keys: &[crypto::DomainKey], files: &[TargetFile]) -> Resu
             Probe::TextUnrecognized => {
                 return Err(Error::format(
                     file.rel.clone(),
-                    "the first line starts with `#simple-encrypt` but is no exact v1 header; \
+                    "the first line starts with `#simple-file-encrypt` but is no exact v1 header; \
                      resolve it before rekeying",
                 ));
             }
@@ -204,7 +204,7 @@ fn ensure_all_current(keys: &[crypto::DomainKey], files: &[TargetFile]) -> Resul
         let failed = match probe(&data.content) {
             Probe::Plain => None,
             Probe::TextUnrecognized => {
-                Some("has an unrecognized `#simple-encrypt` header".to_owned())
+                Some("has an unrecognized `#simple-file-encrypt` header".to_owned())
             }
             Probe::TextV1 => textmode::decrypt(current, &file.rel, &data.content)
                 .err()

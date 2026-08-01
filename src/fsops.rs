@@ -157,7 +157,7 @@ pub fn read_prefix(path: &Path, n: usize) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Generates a random temp-file name: `.simple-encrypt.tmp.<16 alnum>`.
+/// Generates a random temp-file name: `.simple-file-encrypt.tmp.<16 alnum>`.
 fn random_temp_name() -> Result<String> {
     const ALPHABET: &[u8; 62] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let mut name = String::with_capacity(TMP_PREFIX.len() + TMP_RAND_LEN);
@@ -479,7 +479,7 @@ fn check_sweep_dir(root: &Path, dir: &Path) -> std::result::Result<(), SweepSkip
 
 /// Deletes stale temp files from the given directories (deduplicated):
 /// entries whose names match the tool's temp namespace exactly
-/// (`.simple-encrypt.tmp.<16 alnum>`). Directories must lie below
+/// (`.simple-file-encrypt.tmp.<16 alnum>`). Directories must lie below
 /// `root` without crossing a symlink. Failures are warnings, not
 /// errors; the exclusive lock guarantees no live instance owns them.
 pub fn sweep_temps<I: IntoIterator<Item = PathBuf>>(root: &Path, dirs: I) -> usize {

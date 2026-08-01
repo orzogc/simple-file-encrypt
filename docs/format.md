@@ -1,4 +1,4 @@
-# simple-encrypt — File Formats (Normative)
+# simple-file-encrypt — File Formats (Normative)
 
 This document is the byte-level source of truth for format version **1**.
 Key derivation and associated-data strings are specified in
@@ -15,7 +15,7 @@ binary mode, and both may exist over a file's lifetime).
 
 Config entries and key derivation both use the **canonical relative path**
 of a file: its path relative to the domain root (the directory containing
-`.simple-encrypt.toml`), with:
+`.simple-file-encrypt.toml`), with:
 
 - `/` as the separator;
 - no leading `./`, no trailing `/`, no empty segments, no `.` or `..`
@@ -53,10 +53,10 @@ used. The canonical relative path is the exact byte string fed to
 `blake3::keyed_hash` for per-file key derivation. Renaming a file
 therefore changes its keys: rename in plaintext state.
 
-## Domain config: `.simple-encrypt.toml`
+## Domain config: `.simple-file-encrypt.toml`
 
 ```toml
-# Managed by simple-encrypt. `salt`, `wrapped_keys`, and [kdf] are
+# Managed by simple-file-encrypt. `salt`, `wrapped_keys`, and [kdf] are
 # security-critical: do not edit them by hand.
 version = 1
 
@@ -114,7 +114,7 @@ Validation on load (all failures are hard errors):
   before storing.
 - No entry may target tool- or git-critical files: an entry with any
   component named `.git`, or whose final component is `.gitattributes`,
-  `.gitmodules`, or `.simple-encrypt.toml`, is a load-time error — the
+  `.gitmodules`, or `.simple-file-encrypt.toml`, is a load-time error — the
   managed list must never claim paths that every command would refuse
   to touch.
 - `paths` and `force_binary` may be empty or absent (treated as empty).
@@ -134,11 +134,11 @@ from it, so the existing order is preserved verbatim.
 A file is considered encrypted (keylessly) if and only if:
 
 - its first 8 bytes equal `BIN_MAGIC` (binary mode), or
-- its first line starts with `#simple-encrypt` (text mode).
+- its first line starts with `#simple-file-encrypt` (text mode).
 
 Probe refinements:
 
-- A first line that starts with `#simple-encrypt` but is not one of the
+- A first line that starts with `#simple-file-encrypt` but is not one of the
   two exact v1 header forms below is "unrecognized": ciphertext from a
   newer tool, or colliding plaintext. Write commands treat it as a hard
   error — version handling is never relaxed implicitly; the explicit
@@ -164,13 +164,13 @@ so managed paths must be marked `-text` in `.gitattributes`
 (see [cli.md](cli.md)):
 
 ```
-#simple-encrypt v1 text\n                     (non-empty plaintext)
+#simple-file-encrypt v1 text\n                     (non-empty plaintext)
 <one unit line per plaintext line>
 
-#simple-encrypt v1 text <22 base64 chars>\n   (empty plaintext; nothing else)
+#simple-file-encrypt v1 text <22 base64 chars>\n   (empty plaintext; nothing else)
 ```
 
-- **Header line**: exactly `#simple-encrypt v1 text`, or — for an empty
+- **Header line**: exactly `#simple-file-encrypt v1 text`, or — for an empty
   plaintext only — that string, one space, and the 22-character base64
   empty-file marker (see [crypto.md](crypto.md)), which must be
   canonical like every unit (its four trailing bits zero). Always
@@ -287,8 +287,8 @@ length per line, plus output) that can reach ~17–20x the input size
 | `SIV_LEN` | 16 bytes (also the per-unit overhead) |
 | `FILE_TAG_LEN` | 32 bytes |
 | `CHUNK_SIZE` | 65536 bytes (65552 on disk) |
-| `TEXT_MAGIC_PREFIX` | `#simple-encrypt` |
-| `TEXT_HEADER_V1` | `#simple-encrypt v1 text` |
+| `TEXT_MAGIC_PREFIX` | `#simple-file-encrypt` |
+| `TEXT_HEADER_V1` | `#simple-file-encrypt v1 text` |
 | `BIN_MAGIC` | `89 53 45 4E 43 0D 0A 1A` |
 | `BIN_HEADER_LEN` | 16 bytes |
 | Base64 | standard alphabet, no padding, canonical only |
@@ -299,5 +299,5 @@ length per line, plus output) that can reach ~17–20x the input size
 Format version 1 covers the config schema, both ciphertext layouts, and
 all derivation/AD context strings (which embed `v1`). Any incompatible
 change bumps the version everywhere at once; the tool refuses newer
-versions with a clear "upgrade simple-encrypt" error and refuses
+versions with a clear "upgrade simple-file-encrypt" error and refuses
 unknown or legacy layouts outright.

@@ -162,7 +162,7 @@ fn parse_header<'a>(path: &str, ct: &'a [u8]) -> Result<Header<'a>> {
     // The caller probes before decrypting, so this is defensive.
     Err(Error::format(
         path,
-        "unrecognized `#simple-encrypt` header: ciphertext from a newer tool, or colliding plaintext",
+        "unrecognized `#simple-file-encrypt` header: ciphertext from a newer tool, or colliding plaintext",
     ))
 }
 
@@ -320,9 +320,10 @@ mod tests {
         assert!(ct.ends_with(b"\n"));
 
         let ct = round_trip(b"\n");
-        assert_eq!(&ct[..24], b"#simple-encrypt v1 text\n");
+        let hdr = TEXT_HEADER_V1.len() + 1;
+        assert_eq!(&ct[..hdr], b"#simple-file-encrypt v1 text\n");
         assert!(ct.ends_with(b"\n"));
-        assert_eq!(ct.len(), 24 + 22 + 1); // one empty-line unit
+        assert_eq!(ct.len(), hdr + 22 + 1); // one empty-line unit
 
         let ct = round_trip(b"abc");
         assert!(!ct.ends_with(b"\n")); // trailing-newline mirroring
@@ -361,12 +362,12 @@ mod tests {
 
         // Bare header.
         assert!(matches!(
-            decrypt(&ks, "f.txt", b"#simple-encrypt v1 text\n"),
+            decrypt(&ks, "f.txt", b"#simple-file-encrypt v1 text\n"),
             Err(Error::Format { .. })
         ));
         // Unterminated header.
         assert!(matches!(
-            decrypt(&ks, "f.txt", b"#simple-encrypt v1 text"),
+            decrypt(&ks, "f.txt", b"#simple-file-encrypt v1 text"),
             Err(Error::Format { .. })
         ));
         // Marker header with trailing content.
@@ -447,7 +448,7 @@ mod tests {
         ));
         // Decrypt side: a unit region with too many lines is rejected
         // before any base64 decoding (the lines need not be valid).
-        let mut ct = Vec::from(&b"#simple-encrypt v1 text\n"[..]);
+        let mut ct = Vec::from(&b"#simple-file-encrypt v1 text\n"[..]);
         ct.extend(std::iter::repeat_n(&b"A\n"[..], (MAX_UNITS + 1) as usize).flatten());
         let err = decrypt(&ks, "f.txt", &ct).unwrap_err();
         assert!(matches!(err, Error::Limit(_)), "got: {err}");
@@ -464,7 +465,7 @@ mod tests {
         ct.extend(std::iter::repeat_n(b'\n', 4_000_000));
         assert_eq!(authenticate_first(&ks, "f.txt", &ct).unwrap(), 0);
         // An invalid first unit with a dense tail fails as a format error.
-        let mut bad = Vec::from(&b"#simple-encrypt v1 text\n"[..]);
+        let mut bad = Vec::from(&b"#simple-file-encrypt v1 text\n"[..]);
         bad.extend_from_slice(b"AA\n");
         bad.extend(std::iter::repeat_n(b'\n', 4_000_000));
         assert!(matches!(

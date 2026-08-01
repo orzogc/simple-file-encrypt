@@ -13,18 +13,18 @@ use crate::error::{Error, Result};
 
 /// Associated-data prefix for wrapping ring entries; `le64(ring_len)` and
 /// `le64(index)` are appended.
-pub const AD_WRAP_PREFIX: &[u8] = b"github.com/orzogc/simple-encrypt v1 domain key wrap";
+pub const AD_WRAP_PREFIX: &[u8] = b"github.com/orzogc/simple-file-encrypt v1 domain key wrap";
 /// BLAKE3 `derive_key` context for the per-file unit key.
-pub const CTX_UNIT: &str = "github.com/orzogc/simple-encrypt v1 unit key";
+pub const CTX_UNIT: &str = "github.com/orzogc/simple-file-encrypt v1 unit key";
 /// BLAKE3 `derive_key` context for the binary whole-file tag key.
-pub const CTX_FILE_TAG: &str = "github.com/orzogc/simple-encrypt v1 binary file tag key";
+pub const CTX_FILE_TAG: &str = "github.com/orzogc/simple-file-encrypt v1 binary file tag key";
 /// Associated data of every text-line unit.
-pub const AD_TEXT: &[u8] = b"github.com/orzogc/simple-encrypt v1 text unit";
+pub const AD_TEXT: &[u8] = b"github.com/orzogc/simple-file-encrypt v1 text unit";
 /// Associated data of the authenticated empty-file marker.
-pub const AD_TEXT_EMPTY: &[u8] = b"github.com/orzogc/simple-encrypt v1 text empty file";
+pub const AD_TEXT_EMPTY: &[u8] = b"github.com/orzogc/simple-file-encrypt v1 text empty file";
 /// Associated-data prefix of binary chunks; `le64(index)` and a
 /// last-chunk flag byte are appended.
-pub const AD_BIN_PREFIX: &[u8] = b"github.com/orzogc/simple-encrypt v1 binary chunk";
+pub const AD_BIN_PREFIX: &[u8] = b"github.com/orzogc/simple-file-encrypt v1 binary chunk";
 
 /// A 64-byte key-encryption key derived from the password via Argon2id.
 pub type Kek = Zeroizing<[u8; KEK_LEN]>;

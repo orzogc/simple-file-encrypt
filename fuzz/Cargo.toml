@@ -1,5 +1,5 @@
 [package]
-name = "simple-encrypt-fuzz"
+name = "simple-file-encrypt-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-simple-encrypt = { path = ".." }
+simple-file-encrypt = { path = ".." }
 zeroize = "1"
 
 # Keep the fuzz crate out of the main package's workspace.

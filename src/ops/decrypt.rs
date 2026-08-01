@@ -80,7 +80,7 @@ pub fn decrypt(opts: &DecryptOpts) -> Result<()> {
             Probe::TextUnrecognized => {
                 return Err(Error::format(
                     file.rel.clone(),
-                    "the first line starts with `#simple-encrypt` but is no exact v1 header: \
+                    "the first line starts with `#simple-file-encrypt` but is no exact v1 header: \
                      ciphertext from a newer tool, or plaintext colliding with the probe",
                 ));
             }

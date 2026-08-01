@@ -1,8 +1,8 @@
-# simple-encrypt
+# simple-file-encrypt
 
 [English](README.md)
 
-`simple-encrypt` 用单一密码就地加解密本地文件，密文对 git 友好：文本文件**逐行、确定性**加密，密文可以按行 diff 与合并，内容不变则重新加密得到逐字节相同的输出。工具本身从不调用 git。
+`simple-file-encrypt` 用单一密码就地加解密本地文件，密文对 git 友好：文本文件**逐行、确定性**加密，密文可以按行 diff 与合并，内容不变则重新加密得到逐字节相同的输出。工具本身从不调用 git。
 
 ## ⚠️ 托付数据之前请先读这一节
 
@@ -20,7 +20,7 @@ git 友好性是用明确的机密性代价换来的：
 
 ## 工作原理
 
-- 一个密码（经 Argon2id）包裹随机的 32 字节**域密钥**（AES-CMAC-SIV 密钥包裹），存放在随仓库提交的配置文件 `.simple-encrypt.toml` 中。没有该配置文件密文就无法解密——两者必须放在同一仓库里。
+- 一个密码（经 Argon2id）包裹随机的 32 字节**域密钥**（AES-CMAC-SIV 密钥包裹），存放在随仓库提交的配置文件 `.simple-file-encrypt.toml` 中。没有该配置文件密文就无法解密——两者必须放在同一仓库里。
 - 每个单元（文本行、空文件标记、64 KiB 二进制分块）都用 **AES-CMAC-SIV（RFC 5297，AES-256）** 加密，密钥由 BLAKE3 从域密钥和文件的仓库相对路径派生。没有 nonce、加密时没有随机性：密文是 `(域密钥, 路径, 模式, 内容)` 的纯函数。
 - 含 NUL 字节的文件（或被 `force_binary` 匹配的路径）走二进制模式：分块加密，外加能检测跨版本拼接的全文件 tag。
 - `passwd` 只重新包裹密钥环、不动密文——但**不能撤销**旧密码（git 历史里留着旧的包裹密钥环）。密码泄露的应对是先 `passwd` **再 `rekey`**：铸造新域密钥并在内存中迁移所有文件。
@@ -29,12 +29,12 @@ git 友好性是用明确的机密性代价换来的：
 
 ```console
 $ cd your-repo
-$ simple-encrypt init                 # 每仓库一次；提示输入密码
-$ simple-encrypt add .env secrets/
-$ simple-encrypt e                    # 加密所有托管文件
+$ simple-file-encrypt init                 # 每仓库一次；提示输入密码
+$ simple-file-encrypt add .env secrets/
+$ simple-file-encrypt e                    # 加密所有托管文件
 $ git add -A && git commit
-$ simple-encrypt d                    # 本地在明文上工作
-$ simple-encrypt e                    # 提交前重新加密
+$ simple-file-encrypt d                    # 本地在明文上工作
+$ simple-file-encrypt e                    # 提交前重新加密
 ```
 
 在 `.gitattributes` 中给托管路径标记 `-text`，防止 git 转换行尾（文本密文是字节精确、LF 定界的）：
@@ -48,7 +48,7 @@ secrets/**      -text
 
 | 命令 | 作用 |
 |---|---|
-| `init` | 在当前目录创建 `.simple-encrypt.toml` |
+| `init` | 在当前目录创建 `.simple-file-encrypt.toml` |
 | `encrypt`（`e`）`[PATHS…]` | 就地加密托管或指定的文件（自动纳入托管清单） |
 | `decrypt`（`d`）`[PATHS…]` | 就地解密托管或指定的文件 |
 | `add` / `remove <PATHS…>` | 维护托管清单（无需密码） |

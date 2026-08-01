@@ -1,4 +1,4 @@
-//! CLI integration tests for the `simple-encrypt` binary (the test
+//! CLI integration tests for the `simple-file-encrypt` binary (the test
 //! surface listed in `docs/design.md`, semantics from `docs/cli.md`).
 //!
 //! Every test creates its own temporary domain. Passwords are passed via
@@ -14,9 +14,9 @@ use assert_cmd::Command;
 /// Default domain password used by most tests.
 const PW: &str = "test password";
 /// Domain config file name.
-const CONFIG: &str = ".simple-encrypt.toml";
+const CONFIG: &str = ".simple-file-encrypt.toml";
 /// Exact v1 text header (without the terminating newline).
-const TEXT_HEADER: &str = "#simple-encrypt v1 text";
+const TEXT_HEADER: &str = "#simple-file-encrypt v1 text";
 /// Binary-mode magic bytes.
 const BIN_MAGIC: [u8; 8] = [0x89, 0x53, 0x45, 0x4E, 0x43, 0x0D, 0x0A, 0x1A];
 
@@ -49,17 +49,17 @@ fn assert_contains(hay: &str, needle: &str) {
 /// Builds a command with a clean password environment (external
 /// variables removed) and the global `--allow-weak-kdf` flag.
 fn se(dir: &Path) -> Command {
-    let mut c = Command::cargo_bin("simple-encrypt").unwrap();
+    let mut c = Command::cargo_bin("simple-file-encrypt").unwrap();
     c.current_dir(dir);
-    c.env_remove("SIMPLE_ENCRYPT_PASSWORD");
-    c.env_remove("SIMPLE_ENCRYPT_NEW_PASSWORD");
+    c.env_remove("SIMPLE_FILE_ENCRYPT_PASSWORD");
+    c.env_remove("SIMPLE_FILE_ENCRYPT_NEW_PASSWORD");
     c.arg("--allow-weak-kdf");
     c
 }
 
 /// Runs a prepared command and captures exit code and both streams.
 fn run(mut cmd: Command) -> Run {
-    let out = cmd.output().expect("failed to run simple-encrypt");
+    let out = cmd.output().expect("failed to run simple-file-encrypt");
     Run {
         code: out.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -70,7 +70,7 @@ fn run(mut cmd: Command) -> Run {
 /// Runs a subcommand with the password supplied via the environment.
 fn run_pw(dir: &Path, pw: &str, args: &[&str]) -> Run {
     let mut c = se(dir);
-    c.env("SIMPLE_ENCRYPT_PASSWORD", pw);
+    c.env("SIMPLE_FILE_ENCRYPT_PASSWORD", pw);
     c.args(args);
     run(c)
 }
@@ -389,7 +389,7 @@ fn assume_plaintext_escape_hatch() {
 
     // Plaintext masquerading as v1 ciphertext: a valid header and a
     // canonical base64 line that cannot authenticate.
-    let masked: &[u8] = b"#simple-encrypt v1 text\nAAAAAAAAAAAAAAAAAAAAAAAA\n";
+    let masked: &[u8] = b"#simple-file-encrypt v1 text\nAAAAAAAAAAAAAAAAAAAAAAAA\n";
     write_file(root, "fake.txt", masked);
     let r = run_pw(root, PW, &["encrypt", "fake.txt"]).expect_code(1);
     assert_contains(&r.stderr, "assume-plaintext");
@@ -402,8 +402,8 @@ fn assume_plaintext_escape_hatch() {
     run_pw(root, PW, &["decrypt", "fake.txt"]).expect_code(0);
     assert_eq!(read_file(root, "fake.txt"), masked);
 
-    // A `#simple-encrypt` first line that is no exact v1 header.
-    let unrec: &[u8] = b"#simple-encrypt v9 x\npayload\n";
+    // A `#simple-file-encrypt` first line that is no exact v1 header.
+    let unrec: &[u8] = b"#simple-file-encrypt v9 x\npayload\n";
     write_file(root, "unrec.txt", unrec);
     let r = run_pw(root, PW, &["encrypt", "unrec.txt"]).expect_code(1);
     assert_contains(&r.stderr, "no exact v1 header");
@@ -501,7 +501,7 @@ fn status_and_check_mixed_states() {
     let root = tmp.path();
     write_file(root, "enc.txt", b"secret\n");
     write_file(root, "plain.txt", b"exposed\n");
-    write_file(root, "unrec.txt", b"#simple-encrypt v9 x\n");
+    write_file(root, "unrec.txt", b"#simple-file-encrypt v9 x\n");
     init_domain(root);
     run_pw(root, PW, &["encrypt", "enc.txt"]).expect_code(0);
     run_nopw(root, &["add", "plain.txt", "gone.txt", "unrec.txt"]).expect_code(0);
@@ -548,7 +548,7 @@ fn verify_authentication_and_exit_codes() {
     assert_contains(&r.stdout, "missing gone.txt");
 
     // An unrecognized header is a failure; the scan still continues.
-    write_file(root, "unrec.txt", b"#simple-encrypt v9 x\n");
+    write_file(root, "unrec.txt", b"#simple-file-encrypt v9 x\n");
     run_nopw(root, &["add", "unrec.txt"]).expect_code(0);
     let r = run_pw(root, PW, &["verify"]).expect_code(1);
     assert_contains(&r.stdout, "FAILED unrec.txt");
@@ -584,8 +584,8 @@ fn passwd_rewraps_ring_only() {
     // Change the password via the two environment variables.
     const NEW_PW: &str = "brand new pw";
     let mut c = se(root);
-    c.env("SIMPLE_ENCRYPT_PASSWORD", PW);
-    c.env("SIMPLE_ENCRYPT_NEW_PASSWORD", NEW_PW);
+    c.env("SIMPLE_FILE_ENCRYPT_PASSWORD", PW);
+    c.env("SIMPLE_FILE_ENCRYPT_NEW_PASSWORD", NEW_PW);
     c.arg("passwd");
     let r = run(c).expect_code(0);
     assert_contains(&r.stdout, "password changed");
@@ -811,11 +811,11 @@ fn repository_boundaries() {
 
     // A target inside the nested repository resolves to no domain.
     let r = run_pw(&root, PW, &["encrypt", "sub/secret.txt"]).expect_code(1);
-    assert_contains(&r.stderr, "outside any simple-encrypt domain");
+    assert_contains(&r.stderr, "outside any simple-file-encrypt domain");
 
     // A target outside the domain root resolves to no domain either.
     let r = run_pw(&root, PW, &["encrypt", "../outside.txt"]).expect_code(1);
-    assert_contains(&r.stderr, "outside any simple-encrypt domain");
+    assert_contains(&r.stderr, "outside any simple-file-encrypt domain");
 
     // Recursion skips the nested repository with a note.
     let r = run_pw(&root, PW, &["encrypt", "."]).expect_code(0);
@@ -904,9 +904,9 @@ fn domain_lock_excludes_concurrent_instances() {
         let dir = fs::File::open(root).unwrap();
         dir.try_lock().unwrap();
         let r = run_pw(root, PW, &["encrypt", "f.txt"]).expect_code(1);
-        assert_contains(&r.stderr, "another simple-encrypt instance");
+        assert_contains(&r.stderr, "another simple-file-encrypt instance");
         let r = run_nopw(root, &["status"]).expect_code(1);
-        assert_contains(&r.stderr, "another simple-encrypt instance");
+        assert_contains(&r.stderr, "another simple-file-encrypt instance");
     }
 
     // A shared lock lets readers through but still blocks writers.
@@ -917,7 +917,7 @@ fn domain_lock_excludes_concurrent_instances() {
         });
         run_nopw(root, &["status"]).expect_code(0);
         let r = run_pw(root, PW, &["encrypt", "f.txt"]).expect_code(1);
-        assert_contains(&r.stderr, "another simple-encrypt instance");
+        assert_contains(&r.stderr, "another simple-file-encrypt instance");
     }
 
     // With all locks released the command succeeds.
@@ -978,7 +978,7 @@ fn empty_password_rejected() {
     init_domain(root);
 
     let mut c = se(root);
-    c.env("SIMPLE_ENCRYPT_PASSWORD", "");
+    c.env("SIMPLE_FILE_ENCRYPT_PASSWORD", "");
     c.args(["encrypt", "f.txt"]);
     let r = run(c).expect_code(1);
     assert_contains(&r.stderr, "must not be empty");
@@ -990,7 +990,7 @@ fn stale_temp_files_swept() {
     let root = tmp.path();
     write_file(root, "x.txt", b"x\n");
     init_domain(root);
-    let stale = root.join(".simple-encrypt.tmp.ABCDEFGH01234567");
+    let stale = root.join(".simple-file-encrypt.tmp.ABCDEFGH01234567");
     fs::write(&stale, b"crash leftover").unwrap();
 
     // Any exclusive-lock command sweeps stale temp files.
@@ -1018,7 +1018,7 @@ fn config_strictness() {
     )
     .unwrap();
     let r = run_nopw(root, &["status"]).expect_code(1);
-    assert_contains(&r.stderr, "upgrade simple-encrypt");
+    assert_contains(&r.stderr, "upgrade simple-file-encrypt");
 }
 
 #[test]
@@ -1138,7 +1138,7 @@ fn managed_ancestor_symlink_escape_refused() {
     // (a hostile commit can carry exactly this change).
     fs::remove_dir_all(root.join("managed")).unwrap();
     std::os::unix::fs::symlink(&outside, root.join("managed")).unwrap();
-    let stray = outside.join(".simple-encrypt.tmp.ABCDEFGH01234567");
+    let stray = outside.join(".simple-file-encrypt.tmp.ABCDEFGH01234567");
     fs::write(&stray, b"precious\n").unwrap();
 
     // The stored entry must not be followed out of the domain.
@@ -1188,7 +1188,7 @@ fn newline_dense_probe_hit_stays_cheap() {
     init_domain(root);
     // The first-unit check must not materialize per-line slices of a
     // newline-dense tail (~17x memory amplification before the fix).
-    let mut content = Vec::from(&b"#simple-encrypt v1 text\nAAAA\n"[..]);
+    let mut content = Vec::from(&b"#simple-file-encrypt v1 text\nAAAA\n"[..]);
     content.extend(std::iter::repeat_n(b'\n', 8_000_000));
     write_file(root, "dense.txt", &content);
     run_pw(root, PW, &["add", "dense.txt"]).expect_code(0);
@@ -1204,10 +1204,10 @@ fn temp_name_lookalikes_survive_the_sweep() {
     write_file(root, "x.txt", b"x\n");
     init_domain(root);
     let lookalikes = [
-        ".simple-encrypt.tmp.notes",
-        ".simple-encrypt.tmp.abc",
-        ".simple-encrypt.tmp.ABCDEFGH0123456789",
-        ".simple-encrypt.tmp.ABCDEFGH0123456!",
+        ".simple-file-encrypt.tmp.notes",
+        ".simple-file-encrypt.tmp.abc",
+        ".simple-file-encrypt.tmp.ABCDEFGH0123456789",
+        ".simple-file-encrypt.tmp.ABCDEFGH0123456!",
     ];
     for name in lookalikes {
         write_file(root, name, b"keep\n");
@@ -1304,11 +1304,11 @@ fn broken_pipe_exits_141_instead_of_panicking() {
     }
     run_nopw(root, &["add", "dir"]).expect_code(0);
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_simple-encrypt"))
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_simple-file-encrypt"))
         .arg("--allow-weak-kdf")
         .arg("status")
         .current_dir(root)
-        .env_remove("SIMPLE_ENCRYPT_PASSWORD")
+        .env_remove("SIMPLE_FILE_ENCRYPT_PASSWORD")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -1470,7 +1470,7 @@ fn concurrent_parent_child_init_never_nests() {
         fs::create_dir(root.join("sub")).unwrap();
 
         let spawn_init = |dir: &Path| {
-            std::process::Command::new(env!("CARGO_BIN_EXE_simple-encrypt"))
+            std::process::Command::new(env!("CARGO_BIN_EXE_simple-file-encrypt"))
                 .args([
                     "--allow-weak-kdf",
                     "init",
@@ -1480,8 +1480,8 @@ fn concurrent_parent_child_init_never_nests() {
                     "1",
                 ])
                 .current_dir(dir)
-                .env("SIMPLE_ENCRYPT_PASSWORD", PW)
-                .env_remove("SIMPLE_ENCRYPT_NEW_PASSWORD")
+                .env("SIMPLE_FILE_ENCRYPT_PASSWORD", PW)
+                .env_remove("SIMPLE_FILE_ENCRYPT_NEW_PASSWORD")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()

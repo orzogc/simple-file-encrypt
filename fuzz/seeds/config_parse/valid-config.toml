@@ -1,4 +1,4 @@
-# Managed by simple-encrypt. `salt`, `wrapped_keys`, and [kdf] are
+# Managed by simple-file-encrypt. `salt`, `wrapped_keys`, and [kdf] are
 # security-critical: do not edit them by hand.
 version = 1
 
