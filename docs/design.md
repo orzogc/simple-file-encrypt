@@ -237,9 +237,11 @@ This document is the entry point. Detailed specifications live in:
   advisories and licenses, a feature-unification assertion that the
   `zeroize` features of `aes`/`cmac` apply to the single version of
   each crate in the tree, full test runs against both musl release
-  targets (`x86_64` and `aarch64` Linux, statically linked), and a
-  short `cargo fuzz` smoke over the config parser and both ciphertext
-  decoders (targets in `fuzz/`, corpus cached between runs).
+  targets (`x86_64` and `aarch64` Linux, statically linked — C
+  compilation for blake3's aarch64 NEON goes through the
+  cargo-zigbuild shims in `ci/`), and a short `cargo fuzz` smoke over
+  the config parser and both ciphertext decoders (targets in `fuzz/`,
+  corpus cached between runs).
   `unsafe_code` is denied crate-wide.
 - **Release**: pushing a `v*` tag runs the whole CI suite (reused via
   `workflow_call`), then builds stripped release archives
