@@ -7,7 +7,9 @@ Key derivation and associated-data strings are specified in
 General strictness rule: anything not explicitly allowed here is a hard
 error — unknown versions, unknown config keys, non-zero reserved bytes,
 malformed or non-canonical unit encodings, out-of-range lengths. The tool
-never guesses, and every plaintext has exactly one valid ciphertext.
+never guesses, and in a fixed mode every plaintext has exactly one valid
+ciphertext (the same content has different valid ciphertexts in text and
+binary mode, and both may exist over a file's lifetime).
 
 ## Canonical relative paths
 
@@ -269,7 +271,10 @@ count would exceed the caps, or a binary plaintext within ~64 KiB of
 rejected at encryption time, before any cryptographic work. KDF cost
 limits are separate (see [crypto.md](crypto.md)). Files are processed
 whole in memory by design; these limits bound that, with peak memory a
-small multiple of the file size (see [design.md](design.md)).
+bounded multiple of the file size — for typical content a small one,
+but newline-dense text costs per-line bookkeeping (a slice and a
+length per line, plus output) that can reach ~17–20x the input size
+(see [design.md](design.md)).
 
 ## Constants
 

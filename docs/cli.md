@@ -260,7 +260,11 @@ the error message names this cause.
   names matching the reserved namespace exactly are removed, and only
   from directories reachable from the root without crossing a symlink
   (a replaced directory is warned about and skipped). The lock
-  guarantees the temps cannot belong to a live instance.
+  guarantees the temps cannot belong to a live instance. The sweep
+  covers *this run's* targets only: a temp left next to an unmanaged
+  explicit target of a crashed run is removed when that directory
+  takes part in a later operation (re-running the same command removes
+  it).
 - Multi-file operations that modify files (`encrypt`, `decrypt`,
   `rekey`) run serially and **stop at the first error**, then report
   three lists: completed, failed (with the reason), and not attempted.
@@ -296,19 +300,28 @@ migration rules above; a managed path that does not exist on disk is a
 warning. With arguments: encrypt the given files/directories inside the
 domain, auto-adding unmanaged files; an explicit argument that does not
 exist on disk is an error. `--assume-plaintext` as specified above.
+The password is read only when there is work to do: an empty target
+set prints `nothing to do` and exits 0 without it.
 
 ### `decrypt [PATHS…]` (alias `d`)
 
-Mirror of `encrypt` plus `--require-encrypted` (see above). Does not
-modify the managed list.
+Mirror of `encrypt` plus `--require-encrypted` (see above), including
+the password-only-when-needed contract. Does not modify the managed
+list.
 
 ### `add [--binary] <PATHS…>`
 
 Canonicalize each path and insert it into `paths` (files or
 directories; deduplicated, sorted). An entry already covered by a
 managed directory is reported and not duplicated; adding a directory
-prunes entries it now covers (reported). Warns when a path does not
-exist on disk. Does not encrypt anything and needs no password.
+prunes entries it now covers (reported) — but only when the path is a
+real directory on disk: adding a regular file that would lexically
+cover existing entries is a hard error (a file cannot cover them), and
+adding a not-yet-existing path keeps those entries. Warns when a path
+does not exist on disk. Does not encrypt anything and needs no
+password. When this command registers paths not marked `force_binary`,
+it prints a one-line reminder that text mode authenticates units, not
+whole files.
 
 With `--binary`, each path is additionally marked in `force_binary`
 (always encrypted in binary mode) — the marking is independent of the
@@ -377,7 +390,12 @@ continues; files that authenticate only under an older ring key are
 reported as pending migration (authentic — exit 0). Exit 0 when all
 encrypted files authenticate, exit 1 listing every failure, exit 2 on
 operational errors. The complete CI gate is `check && verify`:
-encryptedness and authenticity. This is also the
+encryptedness and authenticity. Read the result with the integrity
+model in mind: for text mode, `verify` proves every *unit* is
+authentic — that each line was legitimately produced for this path —
+**not** that the file as a whole (its set, order, and count of lines)
+ever existed; whole-file integrity is what binary mode's file tag
+provides. This is also the
 command that detects deep corruption (`encrypt`'s skip check only
 authenticates the first unit).
 

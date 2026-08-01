@@ -7,6 +7,20 @@ yanked = "deny"
 
 [bans]
 multiple-versions = "warn"
+# Duplicate versions that upstreams have not converged on yet; the
+# duplicates are dev- or trait-only code, so the risk is acceptable
+# until rand/rand_core/aes-siv move to one release line.
+skip = [
+    # getrandom 0.2 (aes-siv → aead → rand_core 0.6) and 0.3 (rand).
+    { name = "getrandom" },
+    # cpufeatures 0.2 (argon2) and 0.3 (rand).
+    { name = "cpufeatures" },
+    # rand_core 0.6 (aes-siv chain), 0.9 (proptest), 0.10 (rand).
+    { name = "rand_core" },
+    # windows-sys 0.59 (rpassword) and 0.61 (tempfile); Windows-only,
+    # and Windows is not a supported platform.
+    { name = "windows-sys" },
+]
 
 [licenses]
 version = 2
@@ -15,11 +29,8 @@ allow = [
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "ISC",
-    "Zlib",
     "CC0-1.0",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
 ]
 confidence-threshold = 0.8
 

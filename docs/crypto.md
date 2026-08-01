@@ -228,7 +228,9 @@ version of the path can be replayed (a whole-file rollback, see
   `iterations = 3` per RFC 9106's memory-constrained recommendation,
   with `parallelism = 1` (the RFC suggests 4 lanes; one lane is this
   tool's choice for single-threaded simplicity). Affordable for a CLI
-  that runs Argon2 once per command.
+  that runs Argon2 once per command — twice for `passwd`, `rekey`, and
+  `rekey --prune` (unlock the current ring, then derive a fresh KEK
+  under the new salt).
 - Parameters live in the config and are validated in tiers before
   Argon2 runs (the config may come from a hostile repository):
 
@@ -265,7 +267,9 @@ version of the path can be replayed (a whole-file rollback, see
   normalization, no trimming beyond stripping the trailing newline of
   non-TTY input. Different byte sequences that render identically are
   different passwords.
-- Ordinary encryption and decryption need no randomness at all. `init`,
-  `passwd`, and `rekey` depend on the OS CSPRNG for salts and domain
-  keys — a weak RNG at those moments compromises the domain. Temp-file
-  names also use it, harmlessly.
+- The ciphertext computation of ordinary encryption and decryption
+  needs no randomness at all. `init`, `passwd`, and `rekey` depend on
+  the OS CSPRNG for salts and domain keys — a weak RNG at those
+  moments compromises the domain. Atomic replacement also draws on it
+  for temp-file names, so a broken OS RNG fails even plain
+  encrypt/decrypt runs (without weakening any ciphertext).

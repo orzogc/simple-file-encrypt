@@ -196,7 +196,10 @@ This document is the entry point. Detailed specifications live in:
   `aes-siv` (RFC 5297 AEAD), `blake3`, `rand`, `zeroize`, `base64`,
   `serde` + `toml`, `rpassword`, `libc` (Unix open flags). The
   `zeroize` features of `argon2` and `cmac`/`aes` are enabled via
-  feature unification (see [crypto.md](crypto.md) hygiene). Advisory
+  feature unification (see [crypto.md](crypto.md) hygiene). The direct
+  `aes`/`cmac` deps exist only for that unification: a PR bumping
+  `aes-siv` must align them in the same PR (Dependabot ignores them;
+  CI's feature-unification assertion catches a split). Advisory
   locking uses `std`'s native
   `File::try_lock` (stable since 1.89); temp files are created by hand
   (`O_EXCL | O_NOFOLLOW`, CSPRNG names) so no temp-file crate is
@@ -233,16 +236,17 @@ This document is the entry point. Detailed specifications live in:
   `cargo clippy -- -D warnings`, `cargo test`, a `cargo deny` job for
   advisories and licenses, a feature-unification assertion that the
   `zeroize` features of `aes`/`cmac` apply to the single version of
-  each crate in the tree, a full test run against
-  `x86_64-unknown-linux-musl` (the release Linux binary is statically
-  linked), and a short `cargo fuzz` smoke over the config parser and
-  both ciphertext decoders (targets in `fuzz/`).
+  each crate in the tree, full test runs against both musl release
+  targets (`x86_64` and `aarch64` Linux, statically linked), and a
+  short `cargo fuzz` smoke over the config parser and both ciphertext
+  decoders (targets in `fuzz/`, corpus cached between runs).
   `unsafe_code` is denied crate-wide.
 - **Release**: pushing a `v*` tag runs the whole CI suite (reused via
   `workflow_call`), then builds stripped release archives
-  (`x86_64-unknown-linux-musl` — statically linked, runs on any
-  distribution — and `aarch64-apple-darwin`) with SHA-256 checksums
-  and publishes them to GitHub Releases; the tag must match the crate
+  (`x86_64`/`aarch64-unknown-linux-musl` — statically linked, runs on
+  any distribution — and `aarch64-apple-darwin`) with SHA-256
+  checksums and keyless (Sigstore) build-provenance attestations, and
+  publishes them to GitHub Releases; the tag must match the crate
   version in `Cargo.toml`.
 
 ## Versioning

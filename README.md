@@ -22,8 +22,10 @@ The git ergonomics are bought with a deliberate confidentiality trade:
   who knows any committed version of a file gets a
   ciphertext→plaintext dictionary for its lines.
 - Deterministic encryption protects content only to the extent it is
-  **unpredictable**: random tokens and keys are protected, guessable
-  config lines can be confirmed without any key.
+  **unpredictable**: random tokens and keys are protected, while
+  guessable config lines can be confirmed — but only via a
+  known-plaintext dictionary (any committed version of the file) or an
+  encryption oracle at the same path, not from ciphertext alone.
 - Text mode has **unit-level integrity only**: an attacker with write
   access can reorder, delete, duplicate, or resurrect authentic lines
   undetected. That is the price of line-level merging; review git
@@ -44,7 +46,8 @@ If you need to hide file structure and change patterns, use
   chunk) is encrypted with **AES-CMAC-SIV (RFC 5297, AES-256)** under a
   per-file key derived with BLAKE3 from the domain key and the file's
   repository-relative path. No nonces, no randomness at encryption
-  time: ciphertext is a pure function of `(domain key, path, content)`.
+  time: ciphertext is a pure function of `(domain key, path, mode,
+  content)`.
 - Files containing NUL bytes (or matched by `force_binary`) use binary
   mode: chunked, with a whole-file tag that detects chunk splicing.
 - `passwd` re-wraps the key ring and touches no ciphertext — but does
