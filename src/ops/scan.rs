@@ -9,7 +9,7 @@ use crate::crypto::KdfGate;
 use crate::error::{Error, Result};
 use crate::probe::{Probe, probe};
 use crate::select::{self, Origin};
-use crate::{binmode, fsops, report, textmode};
+use crate::{binmode, fsops, paths, report, textmode};
 
 /// Aggregate outcome of `check` / `verify`, mapped to exit codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +54,26 @@ pub fn status() -> Result<()> {
     let (domain, _) = super::open_domain(&[], false)?;
     let entries = scan_entries(&domain.loaded.config.paths, Vec::new());
     let expanded = select::expand(domain.root(), &entries, &domain.loaded.config.excludes)?;
+
+    // A `force_binary` entry that names nothing on disk is silently
+    // ineffective — the file it was meant to cover would encrypt in
+    // text mode, leaking its line structure. A typo, a wrong case, or
+    // a rename produces no other signal, so status warns. Exact
+    // managed entries are skipped: their absence already shows as a
+    // `missing … [binary]` line below. (On a case-insensitive volume a
+    // wrong-case entry can still stat successfully while never
+    // matching byte-wise — see `docs/format.md` on canonical paths.)
+    for entry in &domain.loaded.config.force_binary {
+        if domain.loaded.config.is_managed(entry) {
+            continue;
+        }
+        if !paths::exists_probe(&domain.root().join(entry))? {
+            report::warn(format!(
+                "force_binary entry `{entry}` matches nothing on disk; it has no effect until \
+                 that path exists — check for a typo or a rename"
+            ));
+        }
+    }
 
     let mut lines: Vec<(String, String)> = Vec::new();
     for missing in &expanded.missing_managed {

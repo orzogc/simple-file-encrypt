@@ -122,13 +122,44 @@ pub fn add(arg_paths: &[PathBuf], binary: bool, exclude: bool, force: bool) -> R
         }
 
         // Binary marking is independent of the managed-list outcome: a
-        // path already managed still needs its mark. Appended at the end
-        // so hand-maintained order is preserved.
+        // path already managed still needs its mark. The list gets the
+        // same bookkeeping as the others: sorted insertion, coverage
+        // dedup, and a real directory mark collapses marks it covers.
         if binary {
-            if domain.loaded.config.force_binary.contains(rel) {
-                report::out(format!("`{rel}` is already marked binary"));
+            if let Some(covering) = domain
+                .loaded
+                .config
+                .force_binary
+                .iter()
+                .find(|e| paths::is_covered_by(rel, e))
+                .cloned()
+            {
+                if covering == *rel {
+                    report::out(format!("`{rel}` is already marked binary"));
+                } else {
+                    report::out(format!(
+                        "`{rel}` is already covered by the force_binary entry `{covering}`"
+                    ));
+                }
             } else {
-                domain.loaded.config.force_binary.push(rel.clone());
+                if on_disk.is_some_and(|ft| ft.is_dir()) {
+                    let covered: Vec<String> = domain
+                        .loaded
+                        .config
+                        .force_binary
+                        .iter()
+                        .filter(|e| paths::is_covered_by(e, rel))
+                        .cloned()
+                        .collect();
+                    for e in covered {
+                        announcements.push(format!(
+                            "`{e}` is now covered by `{rel}`; dropped the redundant force_binary \
+                             entry"
+                        ));
+                        domain.loaded.config.force_binary.retain(|x| *x != e);
+                    }
+                }
+                super::insert_sorted(&mut domain.loaded.config.force_binary, rel);
                 announcements.push(format!("marked {rel} as always-binary (force_binary)"));
             }
         }
@@ -329,6 +360,18 @@ pub fn remove(arg_paths: &[PathBuf], force: bool, binary: bool, exclude: bool) -
         }
         if binary {
             if !domain.loaded.config.force_binary.contains(rel) {
+                if let Some(covering) = domain
+                    .loaded
+                    .config
+                    .force_binary
+                    .iter()
+                    .find(|e| paths::is_covered_by(rel, e))
+                {
+                    return Err(Error::Usage(format!(
+                        "`{rel}` is covered by the force_binary entry `{covering}`, not an entry \
+                         itself; remove that entry instead"
+                    )));
+                }
                 return Err(Error::Usage(format!(
                     "`{rel}` is not a `force_binary` entry"
                 )));

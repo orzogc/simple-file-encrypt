@@ -49,9 +49,10 @@ pub struct Config {
     pub kdf: KdfParams,
     /// Managed paths: canonical relative paths, kept sorted and deduplicated.
     pub paths: Vec<String>,
-    /// Binary-mode overrides, hand-maintained or appended by
-    /// `add --binary` / `remove --binary`; the loaded order is
-    /// preserved verbatim on rewrite (the tool only appends/removes).
+    /// Binary-mode overrides, maintained by `add --binary` /
+    /// `remove --binary`: paths (files or directories) always encrypted
+    /// in binary mode; kept sorted and deduplicated (order never had a
+    /// semantic effect — coverage is an any-match).
     pub force_binary: Vec<String>,
     /// Excluded paths: canonical relative paths (files or directories,
     /// recursive) never selected for encryption; kept sorted and
@@ -247,6 +248,9 @@ pub fn parse(content: &[u8]) -> Result<Config> {
     let mut managed = raw.paths;
     managed.sort_unstable();
     managed.dedup();
+    let mut force_binary = raw.force_binary;
+    force_binary.sort_unstable();
+    force_binary.dedup();
     let mut excludes = raw.excludes;
     excludes.sort_unstable();
     excludes.dedup();
@@ -257,7 +261,7 @@ pub fn parse(content: &[u8]) -> Result<Config> {
         wrapped_keys,
         kdf,
         paths: managed,
-        force_binary: raw.force_binary,
+        force_binary,
         excludes,
     })
 }
@@ -314,15 +318,18 @@ fn render_list(out: &mut String, name: &str, entries: &[String]) {
     out.push_str("]\n");
 }
 
-/// Renders the config in the tool's stable form. `paths` and `excludes`
+/// Renders the config in the tool's stable form. All three path lists
 /// are written in ascending byte order, deduplicated (`excludes` only
 /// when non-empty, so configs not using the feature stay loadable by
-/// older versions); `force_binary` verbatim. The `[kdf]` table comes
-/// last so every other key stays top-level.
+/// older versions). The `[kdf]` table comes last so every other key
+/// stays top-level.
 pub fn render(cfg: &Config) -> String {
     let mut paths_sorted = cfg.paths.clone();
     paths_sorted.sort_unstable();
     paths_sorted.dedup();
+    let mut force_binary_sorted = cfg.force_binary.clone();
+    force_binary_sorted.sort_unstable();
+    force_binary_sorted.dedup();
     let mut excludes_sorted = cfg.excludes.clone();
     excludes_sorted.sort_unstable();
     excludes_sorted.dedup();
@@ -365,11 +372,11 @@ pub fn render(cfg: &Config) -> String {
         out.push('\n');
     }
     out.push_str(
-        "# Maintained by hand or by `add --binary` / `remove --binary`: paths\n\
-         # (files or directories) always encrypted in binary (whole-file) mode,\n\
-         # even if their content looks like text. The tool only appends/removes.\n",
+        "# Maintained by `add --binary` / `remove --binary`: paths (files or\n\
+         # directories) always encrypted in binary (whole-file) mode, even if\n\
+         # their content looks like text. Ascending byte order, deduplicated.\n",
     );
-    render_list(&mut out, "force_binary", &cfg.force_binary);
+    render_list(&mut out, "force_binary", &force_binary_sorted);
     out.push('\n');
     out.push_str("[kdf]\nalgorithm = \"argon2id\"\n");
     out.push_str(&format!(
@@ -450,6 +457,8 @@ impl LoadedConfig {
         self.snap = replaced.snap.expect("checked above");
         self.config.paths.sort_unstable();
         self.config.paths.dedup();
+        self.config.force_binary.sort_unstable();
+        self.config.force_binary.dedup();
         self.config.excludes.sort_unstable();
         self.config.excludes.dedup();
         Ok(())
@@ -503,8 +512,19 @@ mod tests {
             parsed.paths,
             vec!["a dir/©.txt".to_string(), "b.txt".to_string()]
         );
-        // force_binary preserved verbatim, order included.
-        assert_eq!(parsed.force_binary, cfg.force_binary);
+        // force_binary is normalized like the other lists: ascending
+        // byte order, deduplicated (order never had a semantic effect).
+        assert_eq!(
+            parsed.force_binary,
+            vec!["blob.bin".to_string(), "zz".to_string()]
+        );
+        let mut cfg = sample();
+        cfg.force_binary.push("zz".into());
+        let parsed = parse(render(&cfg).as_bytes()).unwrap();
+        assert_eq!(
+            parsed.force_binary,
+            vec!["blob.bin".to_string(), "zz".to_string()]
+        );
     }
 
     #[test]

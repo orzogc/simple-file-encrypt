@@ -86,9 +86,9 @@ excludes = [
     "secrets/README.md",
 ]
 
-# Maintained by hand or by `add --binary` / `remove --binary`: paths
-# (files or directories) always encrypted in binary (whole-file) mode,
-# even if their content looks like text. The tool only appends/removes.
+# Maintained by `add --binary` / `remove --binary`: paths (files or
+# directories) always encrypted in binary (whole-file) mode, even if
+# their content looks like text. Ascending byte order, deduplicated.
 force_binary = [
     "secrets/huge-export.csv",
 ]
@@ -146,13 +146,14 @@ Validation on load (all failures are hard errors):
 
 `init` creates the config with `O_EXCL`; `add`, `remove`, `passwd`,
 `rekey`, and `encrypt` (auto-add) rewrite it atomically (temp + rename).
-The tool writes the form above with entries in ascending byte order,
-deduplicated.
-`force_binary` is maintained by hand and by `add --binary` /
-`remove --binary`; the tool only appends to or removes exact entries
-from it, so the existing order is preserved verbatim. `excludes` is
-maintained by `add --exclude` / `remove --exclude` (see
-[cli.md](cli.md)) and kept sorted like `paths`.
+All three path lists are tool-maintained — `paths` by `add`/`remove`,
+`force_binary` by `add --binary`/`remove --binary`, `excludes` by
+`add --exclude`/`remove --exclude` (see [cli.md](cli.md)) — and written
+in ascending byte order, deduplicated. Hand edits still load when they
+pass validation (the CLI is preferred: it mints canonical spellings —
+see above — where a hand-typed path can silently mismatch), but any
+rewrite re-renders the stable form: user comments and ordering inside
+the file do not survive.
 
 ## Ciphertext probe
 

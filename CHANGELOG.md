@@ -26,6 +26,19 @@ ciphertext layouts, and all derivation strings.
   exclusion, and `rekey --continue`/`--prune` refuse to converge past
   it. See `docs/cli.md` and `docs/format.md`.
 
+### Changed
+
+- `force_binary` is now normalized like the other config lists: written
+  in ascending byte order, deduplicated (order never had a semantic
+  effect, and hand-written comments never survived a config rewrite
+  anyway). `add --binary` reports marks covered by an existing
+  directory mark and collapses marks a new directory mark covers;
+  `remove --binary` names the covering mark when an exact entry is
+  missing.
+- `status` warns about `force_binary` entries that name nothing on
+  disk: such an entry is silently ineffective and the file it was meant
+  to cover would encrypt in text mode, leaking its line structure.
+
 ### Compatibility
 
 - The config schema stays at format version 1. The `excludes` key is

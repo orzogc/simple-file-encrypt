@@ -2195,3 +2195,53 @@ fn decrypt_exempts_excluded_paths_from_require_encrypted() {
     let r = run_nopw(root2, &["decrypt"]).expect_code(0);
     assert_contains(&r.stdout, "nothing to do");
 }
+
+#[test]
+fn force_binary_normalization_and_dead_mark_warnings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/inner.txt", b"inner\n");
+    write_file(root, "zz.txt", b"zz\n");
+    init_domain(root);
+
+    // Marks are kept sorted in the rendered config regardless of the
+    // order they were added in.
+    run_nopw(root, &["add", "--binary", "zz.txt", "d/inner.txt"]).expect_code(0);
+    let cfg = read_config(root);
+    let start = cfg.find("force_binary = [").unwrap();
+    let block = &cfg[start..start + cfg[start..].find(']').unwrap()];
+    assert!(
+        block.find("d/inner.txt").unwrap() < block.find("zz.txt").unwrap(),
+        "{block}"
+    );
+
+    // A real directory mark collapses the marks it now covers; a mark
+    // covered by it is reported, not duplicated; removing a covered
+    // path names the covering mark.
+    let r = run_nopw(root, &["add", "--binary", "d"]).expect_code(0);
+    assert_contains(&r.stdout, "dropped the redundant force_binary entry");
+    assert!(!read_config(root).contains("\"d/inner.txt\""));
+    let r = run_nopw(root, &["add", "--binary", "d/inner.txt"]).expect_code(0);
+    assert_contains(&r.stdout, "already covered by the force_binary entry `d`");
+    let r = run_nopw(root, &["remove", "--binary", "d/inner.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "covered by the force_binary entry `d`");
+
+    // A mark whose path names nothing on disk is silently ineffective:
+    // `status` warns about it — but not about an exact managed entry,
+    // whose absence already shows as a `missing … [binary]` line.
+    run_nopw(root, &["add", "--binary", "ghost.csv"]).expect_code(0);
+    run_nopw(root, &["remove", "ghost.csv"]).expect_code(0);
+    run_nopw(root, &["add", "--binary", "ghost2.csv"]).expect_code(0);
+    let r = run_nopw(root, &["status"]).expect_code(0);
+    assert_contains(
+        &r.stderr,
+        "force_binary entry `ghost.csv` matches nothing on disk",
+    );
+    assert!(!r.stderr.contains("ghost2.csv"), "{}", r.stderr);
+    assert!(status_line(&r.stdout, "missing", "ghost2.csv"));
+
+    // Once the path exists the warning disappears.
+    write_file(root, "ghost.csv", b"now here\n");
+    let r = run_nopw(root, &["status"]).expect_code(0);
+    assert!(!r.stderr.contains("matches nothing"), "{}", r.stderr);
+}

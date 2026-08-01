@@ -370,9 +370,11 @@ whole files.
 With `--binary`, each path is additionally marked in `force_binary`
 (always encrypted in binary mode) — the marking is independent of the
 managed-list outcome, so an already-managed path can be marked with a
-later `add --binary`. New marks are appended, preserving any
-hand-maintained order. A text-mode ciphertext under a newly marked
-path is migrated to binary by the next `encrypt`.
+later `add --binary`. The list gets the same bookkeeping as the managed
+list: sorted and deduplicated, a mark covered by an existing directory
+mark is reported and not duplicated, and marking a real directory
+collapses the marks it now covers. A text-mode ciphertext under a newly
+marked path is migrated to binary by the next `encrypt`.
 
 Adding a path covered by an `excludes` entry (with or without
 `--binary`) is refused: managing it is a contradiction — run
@@ -415,10 +417,11 @@ directory entry but not itself an entry is an error (the message names
 the covering entry).
 
 With `--binary`, remove exact entries from `force_binary` instead (an
-entry that does not exist is an error): the managed list is untouched,
-so the file stays managed and reverts to automatic mode choice.
-Existing binary ciphertext is **not** re-encrypted automatically —
-decrypt and re-encrypt to change its mode.
+entry that does not exist is an error; a path covered by a directory
+mark but not itself an entry is an error naming that mark): the managed
+list is untouched, so the file stays managed and reverts to automatic
+mode choice. Existing binary ciphertext is **not** re-encrypted
+automatically — decrypt and re-encrypt to change its mode.
 
 With `--exclude` (conflicts with `--binary` and `--force`), remove
 exact entries from `excludes`: the paths become eligible for encryption
@@ -437,6 +440,14 @@ exact v1 header) — plus a `binary` marker where `force_binary` applies
 or the stored mode is binary. Excluded plaintext is intentional and not
 listed (a large excluded tree would flood the report); an excluded file
 that probes as encrypted is an anomaly and gets an `excluded` line.
+`status` also warns about `force_binary` entries that name nothing on
+disk (skipping exact managed entries, whose absence already shows as
+`missing`): such an entry is silently ineffective — the file it was
+meant to cover would encrypt in text mode, leaking its line
+structure — and a typo or rename produces no other signal. On a
+case-insensitive volume a wrong-case entry can still stat successfully
+while never matching byte-wise; minting through the CLI avoids that
+(see [format.md](format.md)).
 Needs no password. Exit code 0 regardless of states (it is a report,
 not a gate); an I/O error while probing aborts with exit 1.
 
