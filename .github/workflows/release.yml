@@ -107,6 +107,10 @@ jobs:
       - name: Publish to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This job never checks out the repository (it only needs the
+          # built artifacts), so gh cannot infer the repo from a git
+          # remote — point it there explicitly.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           gh release create "$GITHUB_REF_NAME" \
