@@ -6,6 +6,11 @@ rust-version = "1.89"
 license = "MIT"
 description = "Encrypt and decrypt local files in place with a single password, producing git-friendly (line-diffable, deterministic) ciphertext"
 repository = "https://github.com/orzogc/simple-file-encrypt"
+keywords = ["encryption", "git", "secrets", "deterministic", "cli"]
+categories = ["command-line-utilities", "cryptography", "filesystem"]
+# Publish only what `cargo install` needs; docs/, tests/, and CI live in
+# the repository (crates.io rewrites the README's relative links there).
+include = ["src/", "LICENSE", "README.md"]
 
 [dependencies]
 aes-siv = "0.7.0"
