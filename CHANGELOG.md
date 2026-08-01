@@ -9,6 +9,30 @@ format has its own single version (currently **1**, see
 [docs/format.md](docs/format.md)), covering the config schema, both
 ciphertext layouts, and all derivation strings.
 
+## [0.2.0] - 2026-08-01
+
+### Added
+
+- **Excluded paths** (`excludes` in the domain config, maintained with
+  `add --exclude` / `remove --exclude`): files and directories that are
+  never selected for encryption, even under a managed directory — for
+  keeping a README, an example file, or probe-colliding foreign content
+  plaintext inside an otherwise-encrypted tree. Exclusion is guarded
+  against stranding ciphertext: an entry may not shadow an exact
+  managed entry (load-time error), `add --exclude` refuses content that
+  probes as encrypted (`--force` overrides, for content that only looks
+  encrypted), `decrypt` recovers excluded ciphertext, `check` exempts
+  excluded paths, `verify` flags this domain's ciphertext hidden by an
+  exclusion, and `rekey --continue`/`--prune` refuse to converge past
+  it. See `docs/cli.md` and `docs/format.md`.
+
+### Compatibility
+
+- The config schema stays at format version 1. The `excludes` key is
+  written only when non-empty, so configs not using the feature remain
+  loadable by 0.1.x; a config that carries the key is rejected by 0.1.x
+  as an unknown field (fail-closed).
+
 ## [0.1.0] - 2026-08-01
 
 Initial release.
