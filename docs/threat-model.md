@@ -212,8 +212,7 @@ history.
 - Need line-diffable encrypted files in git, and the leakage above is
   acceptable for your data (typical: high-entropy tokens, personal
   configs in a private repo) → **simple-file-encrypt**.
-- Need to hide file structure and change patterns, want whole-file
-  encryption with transactional robustness →
-  **git-simple-encrypt**.
-- Need multi-recipient/asymmetric encryption or public-audience threat
-  models → **age** / **git-crypt** class tools.
+- Need to hide file structure and change patterns, need
+  multi-recipient or asymmetric encryption, or face a public-audience
+  threat model → an **age** / **git-crypt** class tool (see the
+  comparison in [design.md](design.md)).

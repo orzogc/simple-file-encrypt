@@ -31,8 +31,7 @@ The git ergonomics are bought with a deliberate confidentiality trade:
   undetected. That is the price of line-level merging; review git
   history for changes you did not make.
 
-If you need to hide file structure and change patterns, use
-[git-simple-encrypt](https://github.com/orzogc/git-simple-encrypt) or an
+If you need to hide file structure and change patterns, use an
 `age`/`git-crypt`-class tool instead. The full analysis is in
 [docs/threat-model.md](docs/threat-model.md) — please read it.
 

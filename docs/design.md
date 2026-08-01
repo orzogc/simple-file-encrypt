@@ -32,9 +32,10 @@ This document is the entry point. Detailed specifications live in:
 
 ## Non-goals
 
-- Not a replacement for [git-simple-encrypt](https://github.com/orzogc/git-simple-encrypt)
-  when confidentiality of structure matters. That tool hides line-level
-  patterns; this one deliberately exposes them for diffability.
+- Not a structure-hiding encryptor. When confidentiality of line-level
+  patterns matters, whole-file tools (`age`, `git-crypt`) are the right
+  shape; this one deliberately exposes those patterns for diffability
+  (see the comparison below).
 - No multi-user key management, no asymmetric recipients, no OS keyring
   integration.
 - No clean/smudge filters, hooks management, or any git subprocess calls.
@@ -145,21 +146,28 @@ This document is the entry point. Detailed specifications live in:
    has different valid ciphertexts in text and binary mode — see
    [format.md](format.md)).
 
-## Comparison with git-simple-encrypt
+## Comparison with age and git-crypt
 
-| | git-simple-encrypt | simple-file-encrypt |
-|---|---|---|
-| Granularity | whole file (64 KiB chunks, AAD chain) | per line (text), chunked + file tag (binary) |
-| Cipher | XChaCha20-Poly1305, derived nonces | AES-SIV (RFC 5297), nonce-free |
-| Ciphertext diff/merge | opaque | line-level |
-| Structure leakage | file changed / unchanged only | exact line lengths, equality, positions |
-| Key model | password → per-file Argon2 | password-wrapped domain key (envelope) |
-| Password change | full re-encryption | re-wrap only (`rekey` rotates via in-memory migration) |
-| Salt | per file, in header + cache | per domain, in committed config |
-| Password check | HEAD anchor via git | unwrap of the domain key |
-| git dependency | required (subprocess plumbing) | none |
-| Atomicity | two-phase commit + journal | per-file temp + rename |
-| Code size | ~15k lines | small by design |
+The closest widely used alternatives solve adjacent problems with
+different trades:
+
+| | `age` | `git-crypt` | simple-file-encrypt |
+|---|---|---|---|
+| Shape | standalone file encryptor | git clean/smudge filter | standalone in-place CLI, never calls git |
+| Granularity | whole file | whole file | per line (text), chunked + file tag (binary) |
+| Determinism | randomized per encryption | deterministic (nonce from a content HMAC) | deterministic per line |
+| Ciphertext diff/merge | opaque, churns on every re-encryption | opaque, stable for unchanged content | line-level diff and textual merge |
+| Structure leakage | total length only | per-file changed/unchanged, length | exact line lengths, counts, equality, change positions |
+| Recipients | X25519 / ssh keys / scrypt passphrase, multi-recipient | one symmetric key, GPG-wrapped per collaborator | one password, no multi-recipient |
+| Key rotation | re-encrypt to new recipients | no built-in rekey | `passwd` re-wraps (no ciphertext churn); `rekey` migrates in memory |
+| git dependency | none | required (filters) | none |
+| Working tree | explicit encrypt/decrypt | transparent (plaintext checkout) | explicit in-place encrypt/decrypt |
+| Size limits | streaming | streaming | whole file in memory, 256 MiB cap |
+
+In short: `age` hides structure but churns ciphertext on every
+encryption; `git-crypt` hides structure with stable ciphertext, bound
+to git filters and hard to rekey; simple-file-encrypt trades structure
+confidentiality for line-level diff and merge.
 
 ## Operational consequences
 
