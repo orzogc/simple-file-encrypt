@@ -1,0 +1,35 @@
+# Managed by simple-encrypt. `salt`, `wrapped_keys`, and [kdf] are
+# security-critical: do not edit them by hand.
+version = 1
+
+# 16 random bytes, lowercase hex.
+salt = "abababababababababababababababab"
+
+# Key ring: AES-SIV(kek, domain_key), 48 bytes (96 hex chars) each,
+# newest first — entry 0 is the current key. Older entries keep
+# pre-`rekey` ciphertext decryptable until `rekey --prune`.
+wrapped_keys = [
+    "111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+    "222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
+]
+
+# Managed paths: files and directories (recursive), canonical relative
+# paths (no trailing slash; directory-ness is resolved at run time).
+# Maintained by the tool: ascending byte order, deduplicated.
+paths = [
+    "a dir/©.txt",
+    "b.txt",
+]
+
+# Maintained by hand or by `add --binary` / `remove --binary`: paths
+# (files or directories) always encrypted in binary (whole-file) mode,
+# even if their content looks like text. The tool only appends/removes.
+force_binary = [
+    "blob.bin",
+]
+
+[kdf]
+algorithm = "argon2id"
+memory_kib = 65536
+iterations = 3
+parallelism = 1

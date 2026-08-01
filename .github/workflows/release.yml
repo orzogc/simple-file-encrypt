@@ -48,16 +48,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Install zig and cargo-zigbuild (musl)
+        # SHA-256-pinned toolchain download: this job holds attestation
+        # credentials, and provenance cannot vouch for a compromised
+        # compiler (see the action for the pinning rationale).
+      - uses: ./.github/actions/setup-zig
         if: contains(matrix.target, 'linux-musl')
-        run: |
-          case "${{ runner.arch }}" in
-            X64) zarch=x86_64 ;;
-            ARM64) zarch=aarch64 ;;
-          esac
-          curl -sSfL "https://ziglang.org/download/0.16.0/zig-${zarch}-linux-0.16.0.tar.xz" | sudo tar -xJ -C /opt
-          echo "/opt/zig-${zarch}-linux-0.16.0" >> "$GITHUB_PATH"
-          cargo install cargo-zigbuild --locked --version 0.23.0
       - name: Tag must match the crate version
         run: |
           crate_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)

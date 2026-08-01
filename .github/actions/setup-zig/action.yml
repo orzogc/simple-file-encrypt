@@ -1,0 +1,32 @@
+# Installs the Zig toolchain (musl C compiler for the zigcc shims in
+# ci/) and cargo-zigbuild. The archive's SHA-256 is pinned here — from
+# ziglang.org/download/index.json at pin time — and verified before
+# unpacking: build provenance can only attest what the workflow built,
+# not that the toolchain itself was authentic, so toolchain integrity
+# must be anchored in the repository. Unpacking stays in the runner's
+# temp directory; no root involved.
+name: Setup zig and cargo-zigbuild
+description: Install the SHA-256-pinned Zig toolchain and cargo-zigbuild for musl builds
+
+runs:
+  using: composite
+  steps:
+    - name: Install zig (SHA-256 pinned)
+      shell: bash
+      run: |
+        set -euo pipefail
+        version=0.16.0
+        case "${RUNNER_ARCH}" in
+          X64)   zarch=x86_64;  sha256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;;
+          ARM64) zarch=aarch64; sha256=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17 ;;
+          *) echo "unsupported runner architecture: ${RUNNER_ARCH}" >&2; exit 1 ;;
+        esac
+        archive="zig-${zarch}-linux-${version}.tar.xz"
+        curl -sSfL -o "${RUNNER_TEMP}/${archive}" \
+          "https://ziglang.org/download/${version}/${archive}"
+        echo "${sha256}  ${RUNNER_TEMP}/${archive}" | sha256sum -c -
+        tar -xJf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+        echo "${RUNNER_TEMP}/zig-${zarch}-linux-${version}" >> "${GITHUB_PATH}"
+    - name: Install cargo-zigbuild
+      shell: bash
+      run: cargo install cargo-zigbuild --locked --version 0.23.0

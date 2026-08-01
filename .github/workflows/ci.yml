@@ -29,17 +29,20 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+        # --locked everywhere: a manifest/lockfile mismatch must fail
+        # loudly, never let CI regenerate the lock and mask a commit
+        # that forgot Cargo.lock.
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
         # The zeroize features of aes/cmac must stay unified with the
         # copies aes-siv actually uses (one version each), or the
         # feature would silently apply to a version nothing uses.
       - name: zeroize feature unification holds
         run: |
-          cargo tree -e features --prefix none | grep -q '^aes feature "zeroize"'
-          cargo tree -e features --prefix none | grep -q '^cmac feature "zeroize"'
-          test "$(cargo tree -p aes --prefix none | grep -c '^aes ')" -eq 1
-          test "$(cargo tree -p cmac --prefix none | grep -c '^cmac ')" -eq 1
+          cargo tree --locked -e features --prefix none | grep -q '^aes feature "zeroize"'
+          cargo tree --locked -e features --prefix none | grep -q '^cmac feature "zeroize"'
+          test "$(cargo tree --locked -p aes --prefix none | grep -c '^aes ')" -eq 1
+          test "$(cargo tree --locked -p cmac --prefix none | grep -c '^cmac ')" -eq 1
 
   msrv:
     runs-on: ubuntu-latest
@@ -49,7 +52,7 @@ jobs:
         with:
           toolchain: "1.89"
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo check --all-targets
+      - run: cargo check --all-targets --locked
 
   # The release Linux binaries are statically linked with musl; run
   # the full suite against both release targets on native runners.
@@ -77,20 +80,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Install zig and cargo-zigbuild
-        run: |
-          case "${{ runner.arch }}" in
-            X64) zarch=x86_64 ;;
-            ARM64) zarch=aarch64 ;;
-          esac
-          curl -sSfL "https://ziglang.org/download/0.16.0/zig-${zarch}-linux-0.16.0.tar.xz" | sudo tar -xJ -C /opt
-          echo "/opt/zig-${zarch}-linux-0.16.0" >> "$GITHUB_PATH"
-          cargo install cargo-zigbuild --locked --version 0.23.0
+      - uses: ./.github/actions/setup-zig
       - name: Test
         run: |
           export "${{ matrix.cc_env }}=${{ github.workspace }}/ci/${{ matrix.shim }}"
           export "${{ matrix.linker_env }}=${{ github.workspace }}/ci/${{ matrix.shim }}"
-          cargo test --target "${{ matrix.target }}"
+          cargo test --locked --target "${{ matrix.target }}"
 
   # Dependency advisories and license policy.
   deny:
@@ -101,7 +96,9 @@ jobs:
 
   # Short fuzz smoke over the untrusted-input parsers (config and both
   # ciphertext layouts). The corpus is cached between runs so coverage
-  # accumulates instead of restarting from scratch every time.
+  # accumulates instead of restarting from scratch every time; the
+  # committed seeds in fuzz/seeds/ guarantee format-boundary coverage
+  # even on a cold cache.
   fuzz:
     runs-on: ubuntu-latest
     steps:
@@ -116,6 +113,19 @@ jobs:
           key: fuzz-corpus-${{ github.sha }}
           restore-keys: fuzz-corpus-
       - run: cargo install cargo-fuzz --locked --version 0.13.2
-      - run: cargo fuzz run config_parse -- -max_total_time=60 -max_len=1048576
-      - run: cargo fuzz run text_decrypt -- -max_total_time=60 -max_len=1048576
-      - run: cargo fuzz run bin_decrypt -- -max_total_time=60 -max_len=1048576
+        # `cargo fuzz run` has no --locked; assert the fuzz lockfile is
+        # in sync separately so it cannot drift silently.
+      - run: cargo metadata --locked --manifest-path fuzz/Cargo.toml --format-version 1 > /dev/null
+      - run: mkdir -p fuzz/corpus/config_parse fuzz/corpus/text_decrypt fuzz/corpus/bin_decrypt
+      - run: cargo fuzz run config_parse fuzz/corpus/config_parse fuzz/seeds/config_parse -- -max_total_time=60 -max_len=1048576
+      - run: cargo fuzz run text_decrypt fuzz/corpus/text_decrypt fuzz/seeds/text_decrypt -- -max_total_time=60 -max_len=1048576
+      - run: cargo fuzz run bin_decrypt fuzz/corpus/bin_decrypt fuzz/seeds/bin_decrypt -- -max_total_time=60 -max_len=1048576
+        # A crash input is a one-of-a-kind reproducer; losing it to the
+        # runner teardown would leave only the (truncated) log.
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
