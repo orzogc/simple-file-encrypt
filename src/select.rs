@@ -1016,20 +1016,25 @@ mod tests {
 
     #[test]
     fn excluded_subtrees_relax_name_and_special_rules() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         touch(&root.join("exdir/ok.txt"));
         std::os::unix::fs::symlink("/nonexistent", root.join("exdir/link")).unwrap();
         // Non-UTF-8 and control-character names: hard errors during a
-        // normal walk, tolerated and ignored beneath an exclusion.
-        std::fs::write(
-            root.join("exdir").join(OsStr::from_bytes(b"bad\xff.txt")),
-            b"x",
-        )
-        .unwrap();
+        // normal walk, tolerated and ignored beneath an exclusion. APFS
+        // rejects non-UTF-8 names at creation time, so that variant is
+        // Linux-only; the control-character name is valid UTF-8 and
+        // created everywhere.
+        #[cfg(target_os = "linux")]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            std::fs::write(
+                root.join("exdir").join(OsStr::from_bytes(b"bad\xff.txt")),
+                b"x",
+            )
+            .unwrap();
+        }
         touch(&root.join("exdir/evil\nname"));
         let excludes = ["exdir".to_owned()];
 

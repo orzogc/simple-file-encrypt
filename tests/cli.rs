@@ -2058,22 +2058,27 @@ fn rekey_convergence_refuses_excluded_ciphertext() {
 
 #[test]
 fn exclude_probes_tolerate_hostile_names_in_hands_off_trees() {
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt;
-
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write_file(root, "d/real.txt", b"real\n");
-    fs::create_dir_all(root.join("d/weird")).unwrap();
-    fs::write(
-        root.join("d/weird").join(OsStr::from_bytes(b"bad\xffname")),
-        b"plain",
-    )
-    .unwrap();
+    // A control-character name is valid UTF-8 and creatable everywhere;
+    // the non-UTF-8 variant is Linux-only (APFS rejects such names at
+    // creation time).
+    write_file(root, "d/weird/evil\nname", b"plain");
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        fs::write(
+            root.join("d/weird").join(OsStr::from_bytes(b"bad\xffname")),
+            b"plain",
+        )
+        .unwrap();
+    }
     init_domain(root);
     run_nopw(root, &["add", "d"]).expect_code(0);
 
-    // Excluding a plaintext tree that contains a non-UTF-8 name — the
+    // Excluding a plaintext tree that contains hostile names — the
     // kind of content this feature exists to fence off — must work
     // without `--force`: the probe walks the candidate as if it were
     // already excluded, so the relaxed name rules apply.
