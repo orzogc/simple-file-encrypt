@@ -51,18 +51,25 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo check --all-targets
 
-  # The release Linux binary is statically linked with musl; run the
-  # full suite against that target too (static binaries run fine on
-  # the glibc runner).
+  # The release Linux binaries are statically linked with musl; run
+  # the full suite against both release targets on native runners.
   musl:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test --target x86_64-unknown-linux-musl
+      - run: cargo test --target ${{ matrix.target }}
 
   # Dependency advisories and license policy.
   deny:
@@ -72,8 +79,8 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
 
   # Short fuzz smoke over the untrusted-input parsers (config and both
-  # ciphertext layouts). Full fuzzing runs out of band; this keeps
-  # crashes and assertion regressions from reaching main.
+  # ciphertext layouts). The corpus is cached between runs so coverage
+  # accumulates instead of restarting from scratch every time.
   fuzz:
     runs-on: ubuntu-latest
     steps:
@@ -82,7 +89,12 @@ jobs:
         with:
           toolchain: nightly
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.sha }}
+          restore-keys: fuzz-corpus-
       - run: cargo install cargo-fuzz --locked --version 0.13.2
-      - run: cargo fuzz run config_parse -- -max_total_time=60
-      - run: cargo fuzz run text_decrypt -- -max_total_time=60
-      - run: cargo fuzz run bin_decrypt -- -max_total_time=60
+      - run: cargo fuzz run config_parse -- -max_total_time=60 -max_len=1048576
+      - run: cargo fuzz run text_decrypt -- -max_total_time=60 -max_len=1048576
+      - run: cargo fuzz run bin_decrypt -- -max_total_time=60 -max_len=1048576

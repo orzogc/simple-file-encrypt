@@ -20,15 +20,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The same runners the test matrix uses, so release binaries
-          # are built on exactly the tested platforms. Linux is linked
+          # The same runners the test jobs use, so release binaries are
+          # built on exactly the tested platforms. Linux is linked
           # statically with musl (covered by ci.yml's musl job) so the
           # archive runs on any distribution.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
           - os: macos-latest
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -65,6 +71,11 @@ jobs:
             simple-encrypt-*.tar.gz
             simple-encrypt-*.tar.gz.sha256
           retention-days: 1
+        # Keyless (Sigstore) build provenance: consumers can verify the
+        # archives came from this repo's release.yml on this tag.
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
+        with:
+          subject-path: simple-encrypt-*.tar.gz
 
   release:
     needs: build
