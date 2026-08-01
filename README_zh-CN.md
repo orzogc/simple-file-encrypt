@@ -25,6 +25,19 @@ git 友好性是用明确的机密性代价换来的：
 - 含 NUL 字节的文件（或被 `force_binary` 匹配的路径）走二进制模式：分块加密，外加能检测跨版本拼接的全文件 tag。
 - `passwd` 只重新包裹密钥环、不动密文——但**不能撤销**旧密码（git 历史里留着旧的包裹密钥环）。密码泄露的应对是先 `passwd` **再 `rekey`**：铸造新域密钥并在内存中迁移所有文件。
 
+## 安装
+
+已有 Rust 工具链（1.89 及以上）时：
+
+```console
+$ cargo install simple-file-encrypt
+```
+
+也可从 [GitHub Releases](https://github.com/orzogc/simple-file-encrypt/releases)
+下载预构建包：静态链接的 Linux 二进制（x86_64/aarch64，musl，任何发行版可直接运行）
+与 macOS（Apple silicon），均附带 SHA-256 校验和与 keyless（Sigstore）构建来源证明，
+可用 `gh attestation verify <archive> --repo orzogc/simple-file-encrypt` 验证。
+
 ## 快速上手
 
 ```console

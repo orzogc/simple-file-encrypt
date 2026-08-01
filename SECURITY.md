@@ -2,8 +2,9 @@
 
 ## Supported Versions
 
-simple-file-encrypt is pre-1.0 and under active development. Only the latest
-commit on `main` receives security fixes; there are no backports yet.
+simple-file-encrypt is pre-1.0 and under active development. Only the
+latest release and the tip of `main` receive security fixes; there are
+no backports yet.
 
 ## Reporting a Vulnerability
 

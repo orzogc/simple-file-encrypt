@@ -55,6 +55,21 @@ If you need to hide file structure and change patterns, use
   ring). Compromise response is `passwd` **then `rekey`**, which mints a
   fresh domain key and migrates every file in memory.
 
+## Installation
+
+With a Rust toolchain (1.89 or newer):
+
+```console
+$ cargo install simple-file-encrypt
+```
+
+Or download a prebuilt archive from
+[GitHub Releases](https://github.com/orzogc/simple-file-encrypt/releases):
+static Linux binaries (x86_64/aarch64, musl — run on any distribution)
+and macOS (Apple silicon), each with a SHA-256 checksum and a keyless
+(Sigstore) build-provenance attestation, verifiable with
+`gh attestation verify <archive> --repo orzogc/simple-file-encrypt`.
+
 ## Quick start
 
 ```console

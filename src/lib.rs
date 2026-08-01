@@ -3,7 +3,8 @@
 //! The modules are `pub` only so the integration tests and the binary
 //! share one implementation; depending on this crate as a library is
 //! unsupported and every module may change without notice. The
-//! normative specification lives in `docs/`.
+//! normative specification lives in the repository's `docs/` directory:
+//! <https://github.com/orzogc/simple-file-encrypt/tree/main/docs>.
 
 pub mod binmode;
 pub mod config;
