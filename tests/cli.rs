@@ -1722,9 +1722,12 @@ fn managed_entry_through_file_ancestor_reports_the_conflict() {
 // Whether the volume actually folds case is probed at run time (APFS
 // and HFS+ can be formatted either way), so on a case-sensitive volume
 // the test skips instead of failing.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[cfg(target_os = "macos")]
 #[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "tests cannot skip at run time; a silent pass would hide that nothing ran"
+)]
 fn case_insensitive_volume_respells_paths() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
