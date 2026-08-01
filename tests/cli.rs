@@ -1681,20 +1681,78 @@ fn status_marks_skipped_special_force_binary_paths() {
     assert_contains(&r.stdout, "symlink     s.txt [binary]");
 }
 
-// macOS-only: exercises the case-insensitive-volume re-spelling path
-// (default APFS is case-insensitive; this test would fail on a
-// case-sensitive volume).
+#[test]
+fn symlink_warning_flood_is_summarized() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_domain(root);
+    fs::create_dir(root.join("links")).unwrap();
+    for i in 0..25 {
+        std::os::unix::fs::symlink("/nonexistent", root.join(format!("links/l{i:02}"))).unwrap();
+    }
+    run_nopw(root, &["add", "links"]).expect_code(0);
+    // 20 individual warnings (the in-tree cap), one summary for the
+    // remaining 5 — a tree full of symlinks must not flood stderr.
+    let r = run_nopw(root, &["check"]).expect_code(1);
+    assert_eq!(
+        r.stderr.matches("skipping `links/").count(),
+        20,
+        "stderr:\n{}",
+        r.stderr
+    );
+    assert_contains(&r.stderr, "5 more symlinks or special files were skipped");
+    // All 25 still count as offenders for the gate.
+    assert_eq!(r.stdout.matches("symlink").count(), 25, "{}", r.stdout);
+}
+
+#[test]
+fn managed_entry_through_file_ancestor_reports_the_conflict() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_domain(root);
+    // Entry added while `a` did not exist; `a` then appears as a file.
+    run_nopw(root, &["add", "a/b"]).expect_code(0);
+    write_file(root, "a", b"now a file\n");
+    let r = run_pw(root, PW, &["encrypt"]).expect_code(1);
+    assert_contains(&r.stderr, "not a directory");
+    assert_contains(&r.stderr, "a/b");
+}
+
+// macOS-only: exercises the case-insensitive-volume re-spelling path.
+// Whether the volume actually folds case is probed at run time (APFS
+// and HFS+ can be formatted either way), so on a case-sensitive volume
+// the test skips instead of failing.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[cfg(target_os = "macos")]
 #[test]
 fn case_insensitive_volume_respells_paths() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
+    fs::write(root.join("CaseProbe"), b"").unwrap();
+    let insensitive = root.join("caseprobe").exists();
+    fs::remove_file(root.join("CaseProbe")).unwrap();
+    if !insensitive {
+        eprintln!("skipping: the test volume is case-sensitive");
+        return;
+    }
     init_domain(root);
     write_file(root, "Secrets/Inner.txt", b"x\n");
     // Reference the file with a different case spelling: minting must
     // re-spell to the on-disk name so key derivation stays stable.
     let r = run_nopw(root, &["add", "secrets/inner.txt"]).expect_code(0);
     assert_contains(&r.stdout, "added Secrets/Inner.txt");
-    let r = run_pw(root, PW, &["encrypt", "SECRETS/INNER.TXT"]).expect_code(0);
-    assert_contains(&r.stdout, "encrypted Secrets/Inner.txt");
+    // Two alias spellings of one file dedup to a single canonical
+    // target instead of tripping the same-inode aliasing error.
+    let r = run_pw(
+        root,
+        PW,
+        &["encrypt", "SECRETS/INNER.TXT", "secrets/inner.txt"],
+    )
+    .expect_code(0);
+    assert_eq!(
+        r.stdout.matches("encrypted Secrets/Inner.txt").count(),
+        1,
+        "{}",
+        r.stdout
+    );
 }

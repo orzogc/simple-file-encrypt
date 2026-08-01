@@ -503,10 +503,25 @@ mod tests {
     #[test]
     fn hostile_kdf_algorithm_is_escaped_in_errors() {
         let good = render(&sample());
-        // ESC (0x1B) in the value must not reach the terminal raw.
+        // A raw ESC (0x1B) is not legal inside a TOML basic string, so
+        // this exercises the *parser diagnostics* path: the parser
+        // quotes the hostile input and the message must be sanitized.
         let bad = good.replace("argon2id", "\u{1b}[31mPWN\u{1b}[0m");
         let err = parse(bad.as_bytes()).unwrap_err();
         let shown = err.to_string();
+        assert!(shown.contains("invalid TOML"), "wrong branch: {shown}");
+        assert!(!shown.contains('\u{1b}'), "raw escape byte in: {shown}");
+
+        // The same payload smuggled through legal TOML `\uXXXX` escapes
+        // parses fine and must reach the algorithm check itself, whose
+        // message quotes the (decoded, hostile) value escaped.
+        let bad = good.replace("argon2id", "\\u001B[31mPWN\\u001B[0m");
+        let err = parse(bad.as_bytes()).unwrap_err();
+        let shown = err.to_string();
+        assert!(
+            shown.contains("unsupported KDF algorithm"),
+            "wrong branch: {shown}"
+        );
         assert!(!shown.contains('\u{1b}'), "raw escape byte in: {shown}");
         assert!(shown.contains("\\u{1B}"), "missing escaped form: {shown}");
     }

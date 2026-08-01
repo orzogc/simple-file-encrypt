@@ -42,7 +42,6 @@ pub struct TargetFile {
     pub nlink: u64,
 }
 
-/// The result of expanding one invocation's entries.
 /// A managed path skipped because it is a symlink or special file:
 /// never processed, but scans and key rotation must treat it as
 /// unverified content rather than silently converge past it.
@@ -74,22 +73,70 @@ pub struct Expanded {
     pub sweep_dirs: BTreeSet<PathBuf>,
 }
 
+/// Traversal budgets. Production uses the normative constants; unit
+/// tests inject smaller values so the enforcement logic is testable
+/// without building million-entry trees.
+#[derive(Clone, Copy)]
+struct Budgets {
+    /// Cap on selected regular files (`MAX_FILES_PER_OP`).
+    max_files: usize,
+    /// Cap on directory entries examined (`MAX_SCANNED_ENTRIES`).
+    max_scanned: usize,
+    /// Cap on total retained path bytes (`MAX_PATH_BYTES`).
+    max_path_bytes: usize,
+}
+
+impl Budgets {
+    /// The normative limits of `consts.rs`.
+    const DEFAULT: Budgets = Budgets {
+        max_files: MAX_FILES_PER_OP,
+        max_scanned: MAX_SCANNED_ENTRIES,
+        max_path_bytes: MAX_PATH_BYTES,
+    };
+}
+
+/// After this many individual "skipping" warnings for symlinks and
+/// special files, the rest are summarized in one final warning, so a
+/// hostile tree full of them cannot flood stderr.
+const MAX_SPECIAL_WARNINGS: usize = 20;
+
 /// Expands entries (canonical relative paths tagged with their origin)
 /// into the target file list. `""` denotes the domain root directory.
 pub fn expand(root: &Path, entries: &[(String, Origin)]) -> Result<Expanded> {
+    expand_with_budgets(root, entries, Budgets::DEFAULT)
+}
+
+/// [`expand`] with injectable budgets (see [`Budgets`]).
+fn expand_with_budgets(
+    root: &Path,
+    entries: &[(String, Origin)],
+    budgets: Budgets,
+) -> Result<Expanded> {
     let mut exp = Expander {
         root,
         files: BTreeMap::new(),
         missing_managed: Vec::new(),
         missing_explicit: Vec::new(),
         skipped_special: Vec::new(),
-        sweep_dirs: BTreeSet::from([root.to_path_buf()]),
+        sweep_dirs: BTreeSet::new(),
         count: 0,
         scanned: 0,
         path_bytes: 0,
+        budgets,
     };
+    exp.add_sweep_dir(root)?;
     for (rel, origin) in entries {
         exp.add_entry(rel, *origin)?;
+    }
+    let suppressed = exp
+        .skipped_special
+        .len()
+        .saturating_sub(MAX_SPECIAL_WARNINGS);
+    if suppressed > 0 {
+        report::warn(format!(
+            "…and {suppressed} more symlinks or special files were skipped \
+             (individual warnings suppressed)"
+        ));
     }
 
     // Two different canonical paths must not share an inode: hard links
@@ -130,11 +177,60 @@ struct Expander<'a> {
     count: usize,
     /// Directory entries examined so far (hostile-tree budget).
     scanned: usize,
-    /// Total byte length of collected canonical paths (long-name budget).
+    /// Total byte length of retained paths (long-name budget): every
+    /// path stored in any result collection is charged here.
     path_bytes: usize,
+    /// The limits in force (constants outside unit tests).
+    budgets: Budgets,
 }
 
 impl Expander<'_> {
+    /// Charges `len` bytes against the retained-path budget. Every path
+    /// the expansion keeps — selected file, sweep directory, skipped
+    /// special, or missing entry — is charged, so no result collection
+    /// can outgrow the budget on a hostile tree.
+    fn charge_path(&mut self, len: usize) -> Result<()> {
+        self.path_bytes += len;
+        if self.path_bytes > self.budgets.max_path_bytes {
+            return Err(Error::Limit(format!(
+                "expanded paths exceed the {}-byte total path budget",
+                self.budgets.max_path_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    /// Records a directory in the sweep set, charging its path bytes
+    /// when it is new.
+    fn add_sweep_dir(&mut self, dir: &Path) -> Result<()> {
+        if self.sweep_dirs.insert(dir.to_path_buf()) {
+            self.charge_path(dir.as_os_str().len())?;
+        }
+        Ok(())
+    }
+
+    /// Records a missing entry, charging its path bytes.
+    fn add_missing(&mut self, rel: &str, origin: Origin) -> Result<()> {
+        self.charge_path(rel.len())?;
+        match origin {
+            Origin::Managed => self.missing_managed.push(rel.to_owned()),
+            Origin::Explicit { .. } => self.missing_explicit.push(rel.to_owned()),
+        }
+        Ok(())
+    }
+
+    /// Records a skipped symlink/special path, charging its path bytes
+    /// and warning individually up to `MAX_SPECIAL_WARNINGS` (the rest
+    /// are summarized once at the end of the expansion).
+    fn skip_special(&mut self, rel: String, symlink: bool, msg: String) -> Result<()> {
+        self.charge_path(rel.len())?;
+        if self.skipped_special.len() < MAX_SPECIAL_WARNINGS {
+            report::warn(msg);
+        }
+        self.skipped_special.push(SkippedSpecial { rel, symlink });
+        Ok(())
+    }
+
     /// Handles one entry: a file, a directory (recursed), or a missing
     /// path.
     fn add_entry(&mut self, rel: &str, origin: Origin) -> Result<()> {
@@ -148,7 +244,7 @@ impl Expander<'_> {
         if !rel.is_empty()
             && let Some(parent) = abs.parent()
         {
-            self.sweep_dirs.insert(parent.to_path_buf());
+            self.add_sweep_dir(parent)?;
         }
         if origin == Origin::Managed {
             self.check_ancestors(rel)?;
@@ -156,10 +252,7 @@ impl Expander<'_> {
         let md = match abs.symlink_metadata() {
             Ok(md) => md,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                match origin {
-                    Origin::Managed => self.missing_managed.push(rel.to_owned()),
-                    Origin::Explicit { .. } => self.missing_explicit.push(rel.to_owned()),
-                }
+                self.add_missing(rel, origin)?;
                 return Ok(());
             }
             Err(e) => return Err(Error::io("inspecting", &abs, e)),
@@ -187,14 +280,11 @@ impl Expander<'_> {
             Origin::Explicit { .. } => Err(Error::Usage(format!(
                 "`{rel}` is {kind}; only regular files can be processed"
             ))),
-            Origin::Managed => {
-                report::warn(format!("skipping managed path `{rel}`: {kind}"));
-                self.skipped_special.push(SkippedSpecial {
-                    rel: rel.to_owned(),
-                    symlink: ft.is_symlink(),
-                });
-                Ok(())
-            }
+            Origin::Managed => self.skip_special(
+                rel.to_owned(),
+                ft.is_symlink(),
+                format!("skipping managed path `{rel}`: {kind}"),
+            ),
         }
     }
 
@@ -227,7 +317,14 @@ impl Expander<'_> {
                 )));
             }
             if !ft.is_dir() {
-                return Ok(()); // Not a directory prefix: the entry is missing.
+                // Mirrors `add`'s "a file cannot cover them" conflict:
+                // a clear error beats the raw ENOTDIR the entry's own
+                // stat would otherwise produce.
+                return Err(Error::Usage(format!(
+                    "managed path `{rel}` passes through `{}`, which is not a directory; \
+                     remove the entry or restore the directory",
+                    report::escape_path(&dir)
+                )));
             }
             self.check_boundary(rel, &dir)?;
         }
@@ -272,17 +369,13 @@ impl Expander<'_> {
             return Ok(());
         }
         self.count += 1;
-        if self.count > MAX_FILES_PER_OP {
+        if self.count > self.budgets.max_files {
             return Err(Error::Limit(format!(
-                "more than {MAX_FILES_PER_OP} files selected in one invocation"
+                "more than {} files selected in one invocation",
+                self.budgets.max_files
             )));
         }
-        self.path_bytes += rel.len();
-        if self.path_bytes > MAX_PATH_BYTES {
-            return Err(Error::Limit(format!(
-                "expanded paths exceed the {MAX_PATH_BYTES}-byte total path budget"
-            )));
-        }
+        self.charge_path(rel.len())?;
         self.files.insert(
             rel.to_owned(),
             TargetFile {
@@ -308,7 +401,7 @@ impl Expander<'_> {
                 "`{rel}`: directory nesting exceeds the {MAX_WALK_DEPTH}-level cap"
             )));
         }
-        self.sweep_dirs.insert(abs.to_path_buf());
+        self.add_sweep_dir(abs)?;
         // Children of an explicit directory are not "named".
         let child_origin = match origin {
             Origin::Managed => Origin::Managed,
@@ -316,9 +409,10 @@ impl Expander<'_> {
         };
         for entry in std::fs::read_dir(abs).map_err(|e| Error::io("listing", abs, e))? {
             self.scanned += 1;
-            if self.scanned > MAX_SCANNED_ENTRIES {
+            if self.scanned > self.budgets.max_scanned {
                 return Err(Error::Limit(format!(
-                    "directory expansion examined more than {MAX_SCANNED_ENTRIES} entries"
+                    "directory expansion examined more than {} entries",
+                    self.budgets.max_scanned
                 )));
             }
             let name = entry.map_err(|e| Error::io("listing", abs, e))?.file_name();
@@ -397,17 +491,11 @@ impl Expander<'_> {
             if md.file_type().is_file() {
                 self.add_file(&crel, child_abs, child_origin, &md)?;
             } else if md.file_type().is_symlink() {
-                report::warn(format!("skipping `{crel}`: a symlink"));
-                self.skipped_special.push(SkippedSpecial {
-                    rel: crel,
-                    symlink: true,
-                });
+                let msg = format!("skipping `{crel}`: a symlink");
+                self.skip_special(crel, true, msg)?;
             } else {
-                report::warn(format!("skipping `{crel}`: not a regular file"));
-                self.skipped_special.push(SkippedSpecial {
-                    rel: crel,
-                    symlink: false,
-                });
+                let msg = format!("skipping `{crel}`: not a regular file");
+                self.skip_special(crel, false, msg)?;
             }
         }
         Ok(())
@@ -527,6 +615,139 @@ mod tests {
         assert!(err.to_string().contains("control character"), "got: {err}");
         let err = expand(root, &[("d".into(), Origin::Explicit { named: true })]).unwrap_err();
         assert!(err.to_string().contains("control character"), "got: {err}");
+    }
+
+    #[test]
+    fn managed_entry_through_file_ancestor_is_a_clear_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(&root.join("a"));
+        // A stored entry whose ancestor became a regular file must get
+        // a clear conflict message, not a raw ENOTDIR I/O error.
+        let err = expand(root, &[("a/b".into(), Origin::Managed)]).unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "got: {err}");
+        let err = expand(root, &[("a/b/c".into(), Origin::Managed)]).unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "got: {err}");
+    }
+
+    /// Small-budget variants: the enforcement logic is exercised with
+    /// injected limits so no test needs a million-entry tree.
+    fn tiny(max_files: usize, max_scanned: usize, max_path_bytes: usize) -> Budgets {
+        Budgets {
+            max_files,
+            max_scanned,
+            max_path_bytes,
+        }
+    }
+
+    #[test]
+    fn path_budget_covers_all_retained_paths() {
+        let all = (String::new(), Origin::Managed);
+
+        // Selected regular files are charged (canonical rel bytes).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let base = root.as_os_str().len();
+        touch(&root.join("some-regular-file.txt"));
+        let err = expand_with_budgets(
+            root,
+            std::slice::from_ref(&all),
+            tiny(usize::MAX, usize::MAX, base + 4),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("path budget"), "got: {err}");
+
+        // Visited directories are charged (absolute sweep-path bytes),
+        // even when the tree holds no regular file at all.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let base = root.as_os_str().len();
+        std::fs::create_dir_all(root.join("empty-but-deep/nested")).unwrap();
+        let err = expand_with_budgets(
+            root,
+            std::slice::from_ref(&all),
+            tiny(usize::MAX, usize::MAX, base + 4),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("path budget"), "got: {err}");
+
+        // Skipped symlinks/specials are charged.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let base = root.as_os_str().len();
+        std::os::unix::fs::symlink("/nonexistent", root.join("long-symlink-name")).unwrap();
+        let err = expand_with_budgets(
+            root,
+            std::slice::from_ref(&all),
+            tiny(usize::MAX, usize::MAX, base + 4),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("path budget"), "got: {err}");
+
+        // Missing managed entries are charged.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let base = root.as_os_str().len();
+        let err = expand_with_budgets(
+            root,
+            &[("missing-very-long-entry".into(), Origin::Managed)],
+            tiny(usize::MAX, usize::MAX, base + 4),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("path budget"), "got: {err}");
+
+        // Within budget, the same shapes succeed.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(&root.join("ok.txt"));
+        let exp = expand_with_budgets(root, &[all], Budgets::DEFAULT).unwrap();
+        assert_eq!(exp.files.len(), 1);
+    }
+
+    #[test]
+    fn file_and_scan_budgets_are_enforced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(&root.join("a"));
+        touch(&root.join("b"));
+        touch(&root.join("c"));
+
+        let all = (String::new(), Origin::Managed);
+        let err = expand_with_budgets(
+            root,
+            std::slice::from_ref(&all),
+            tiny(2, usize::MAX, usize::MAX),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("more than 2 files"), "got: {err}");
+
+        let err = expand_with_budgets(
+            root,
+            std::slice::from_ref(&all),
+            tiny(usize::MAX, 2, usize::MAX),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("more than 2 entries"),
+            "got: {err}"
+        );
+
+        let exp = expand_with_budgets(root, &[all], tiny(3, 3, usize::MAX)).unwrap();
+        assert_eq!(exp.files.len(), 3);
+    }
+
+    #[test]
+    fn special_warning_flood_is_capped_but_all_are_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for i in 0..(MAX_SPECIAL_WARNINGS + 5) {
+            std::os::unix::fs::symlink("/nonexistent", root.join(format!("l{i:03}"))).unwrap();
+        }
+        // Every special is recorded for scans and rotation even though
+        // only the first MAX_SPECIAL_WARNINGS were individually warned
+        // about (stderr behavior is covered by the CLI tests).
+        let exp = expand(root, &[(String::new(), Origin::Managed)]).unwrap();
+        assert_eq!(exp.skipped_special.len(), MAX_SPECIAL_WARNINGS + 5);
     }
 
     #[test]
