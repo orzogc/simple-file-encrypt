@@ -32,6 +32,7 @@ pub fn add(arg_paths: &[PathBuf], binary: bool) -> Result<()> {
     sweep(&domain, &rels);
 
     let mut announcements: Vec<String> = Vec::new();
+    let mut textish_added = false;
     for rel in &rels {
         if rel.is_empty() {
             return Err(Error::Usage(
@@ -39,18 +40,24 @@ pub fn add(arg_paths: &[PathBuf], binary: bool) -> Result<()> {
             ));
         }
         let abs = domain.root().join(rel);
-        match abs.symlink_metadata() {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => report::warn(format!(
-                "`{rel}` does not exist on disk (yet); adding it anyway"
-            )),
+        // The on-disk kind decides coverage pruning: only a real
+        // directory can cover descendants.
+        let on_disk = match abs.symlink_metadata() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                report::warn(format!(
+                    "`{rel}` does not exist on disk (yet); adding it anyway"
+                ));
+                None
+            }
             Err(e) => return Err(Error::io("inspecting", &abs, e)),
             Ok(md) if !md.is_file() && !md.is_dir() => {
                 report::warn(format!(
                     "`{rel}` is not a regular file or directory; it will be skipped when encrypting"
                 ));
+                None
             }
-            Ok(_) => {}
-        }
+            Ok(md) => Some(md.file_type()),
+        };
 
         // Already present or covered by a managed directory entry?
         if let Some(covering) = domain
@@ -69,7 +76,8 @@ pub fn add(arg_paths: &[PathBuf], binary: bool) -> Result<()> {
                 ));
             }
         } else {
-            // Adding a directory prunes entries it now covers.
+            // Adding a directory prunes entries it now covers — but
+            // only when it really is a directory on disk right now.
             let covered: Vec<String> = domain
                 .loaded
                 .config
@@ -78,14 +86,26 @@ pub fn add(arg_paths: &[PathBuf], binary: bool) -> Result<()> {
                 .filter(|e| paths::is_covered_by(e, rel))
                 .cloned()
                 .collect();
-            for e in covered {
-                announcements.push(format!(
-                    "`{e}` is now covered by `{rel}`; dropped the redundant entry"
-                ));
-                domain.loaded.config.paths.retain(|x| *x != e);
+            if on_disk.is_some_and(|ft| ft.is_file()) && !covered.is_empty() {
+                return Err(Error::Usage(format!(
+                    "`{rel}` is a regular file, but the managed list contains entries beneath it ({}); \
+                     a file cannot cover them — remove those entries or replace the file with a directory",
+                    covered.join(", ")
+                )));
+            }
+            if on_disk.is_some_and(|ft| ft.is_dir()) {
+                for e in covered {
+                    announcements.push(format!(
+                        "`{e}` is now covered by `{rel}`; dropped the redundant entry"
+                    ));
+                    domain.loaded.config.paths.retain(|x| *x != e);
+                }
             }
             super::insert_sorted(&mut domain.loaded.config.paths, rel);
             announcements.push(format!("added {rel}"));
+            if !binary && !domain.loaded.config.is_force_binary(rel) {
+                textish_added = true;
+            }
         }
 
         // Binary marking is independent of the managed-list outcome: a
@@ -106,6 +126,10 @@ pub fn add(arg_paths: &[PathBuf], binary: bool) -> Result<()> {
             report::out(line);
         }
     }
+    // One note per command, at the decision point — not per file.
+    if textish_added {
+        report::note(super::TEXT_MODE_NOTE);
+    }
     Ok(())
 }
 
@@ -120,6 +144,7 @@ pub fn remove(arg_paths: &[PathBuf], force: bool, binary: bool) -> Result<()> {
     sweep(&domain, &rels);
 
     let mut announcements: Vec<String> = Vec::new();
+    let mut deferred_warnings: Vec<String> = Vec::new();
     for rel in &rels {
         if rel.is_empty() {
             return Err(Error::Usage(
@@ -134,7 +159,10 @@ pub fn remove(arg_paths: &[PathBuf], force: bool, binary: bool) -> Result<()> {
             }
             domain.loaded.config.force_binary.retain(|e| e != rel);
             announcements.push(format!("unmarked {rel} as always-binary (force_binary)"));
-            report::warn(format!(
+            // Deferred like the announcements: a later failure aborts
+            // the rewrite, and the output must not claim a change that
+            // never reached the disk.
+            deferred_warnings.push(format!(
                 "`{rel}` reverts to automatic mode choice; existing binary ciphertext is not \
                  re-encrypted automatically — decrypt and re-encrypt to change its mode"
             ));
@@ -157,7 +185,8 @@ pub fn remove(arg_paths: &[PathBuf], force: bool, binary: bool) -> Result<()> {
         }
 
         if force {
-            report::warn(format!(
+            // Deferred too: it describes the completed removal.
+            deferred_warnings.push(format!(
                 "force-removing `{rel}`: if it (or anything under it) still holds valid ciphertext, \
                  that file is now hidden from `rekey` and will be stranded on the old key after a rotation"
             ));
@@ -170,6 +199,9 @@ pub fn remove(arg_paths: &[PathBuf], force: bool, binary: bool) -> Result<()> {
     domain.loaded.rewrite()?;
     for line in announcements {
         report::out(line);
+    }
+    for line in deferred_warnings {
+        report::warn(line);
     }
     Ok(())
 }

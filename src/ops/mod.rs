@@ -218,6 +218,12 @@ pub fn lexical_sweep_dirs(root: &Path, entries: &[String]) -> Vec<PathBuf> {
     dirs
 }
 
+/// The one-line integrity reminder shown when paths start being
+/// managed without a `force_binary` mark.
+pub(crate) const TEXT_MODE_NOTE: &str = "text mode (the default when content has no NUL bytes) \
+     authenticates each line but not the file as a whole: deleted, reordered, duplicated, or \
+     resurrected lines go undetected — use `add --binary` where order or presence matters";
+
 /// Inserts an entry into a sorted, deduplicated list; returns whether
 /// the list changed.
 pub fn insert_sorted(list: &mut Vec<String>, entry: &str) -> bool {

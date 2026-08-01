@@ -183,6 +183,12 @@ pub(crate) fn encrypt_pass(
             for rel in &added {
                 report::out(format!("added {rel}"));
             }
+            if added
+                .iter()
+                .any(|rel| !domain.loaded.config.is_force_binary(rel))
+            {
+                report::note(super::TEXT_MODE_NOTE);
+            }
         }
     }
 

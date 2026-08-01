@@ -72,7 +72,15 @@ pub fn status() -> Result<()> {
         } else {
             "special    "
         };
-        lines.push((skipped.rel.clone(), format!("{state} {}", skipped.rel)));
+        let marker = domain.loaded.config.is_force_binary(&skipped.rel);
+        lines.push((
+            skipped.rel.clone(),
+            format!(
+                "{state} {}{}",
+                skipped.rel,
+                if marker { " [binary]" } else { "" }
+            ),
+        ));
     }
     for file in &expanded.files {
         let prefix = fsops::read_prefix(&file.abs, 64)?;
@@ -182,22 +190,25 @@ pub fn verify(arg_paths: &[PathBuf], gate: &KdfGate) -> Result<ScanOutcome> {
         ));
     }
     for file in &expanded.files {
-        let result =
-            fsops::read_capped(&file.abs, crate::consts::MAX_FILE_SIZE, "file").and_then(|data| {
-                match probe(&data.content) {
-                    Probe::Plain => Ok(None),
-                    Probe::TextUnrecognized => Err(Error::format(
-                        file.rel.clone(),
-                        "the first line starts with `#simple-encrypt` but is no exact v1 header",
-                    )),
-                    Probe::TextV1 => {
-                        textmode::decrypt(&keys, &file.rel, &data.content).map(|(_, idx)| Some(idx))
-                    }
-                    Probe::Binary => {
-                        binmode::decrypt(&keys, &file.rel, &data.content).map(|(_, idx)| Some(idx))
-                    }
-                }
-            });
+        // Probe from a short prefix first: plaintext is reported from
+        // the prefix alone, so a large (or over-cap) plaintext file is
+        // never pulled into memory and stays "plaintext" per the CLI
+        // contract; only probe hits are read whole for authentication.
+        let result = fsops::read_prefix(&file.abs, 64).and_then(|prefix| match probe(&prefix) {
+            Probe::Plain => Ok(None),
+            Probe::TextUnrecognized => Err(Error::format(
+                file.rel.clone(),
+                "the first line starts with `#simple-encrypt` but is no exact v1 header",
+            )),
+            Probe::TextV1 => {
+                let data = fsops::read_capped(&file.abs, crate::consts::MAX_FILE_SIZE, "file")?;
+                textmode::decrypt(&keys, &file.rel, &data.content).map(|(_, idx)| Some(idx))
+            }
+            Probe::Binary => {
+                let data = fsops::read_capped(&file.abs, crate::consts::MAX_FILE_SIZE, "file")?;
+                binmode::decrypt(&keys, &file.rel, &data.content).map(|(_, idx)| Some(idx))
+            }
+        });
         match result {
             Ok(None) => report::out(format!("plaintext {}", file.rel)),
             Ok(Some(0)) => report::out(format!("verified {}", file.rel)),

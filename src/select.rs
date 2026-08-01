@@ -5,7 +5,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use crate::consts::{CONFIG_NAME, MAX_FILES_PER_OP, MAX_SCANNED_ENTRIES, MAX_WALK_DEPTH};
+use crate::consts::{
+    CONFIG_NAME, MAX_FILES_PER_OP, MAX_PATH_BYTES, MAX_SCANNED_ENTRIES, MAX_WALK_DEPTH,
+};
 use crate::error::{Error, Result};
 use crate::{paths, report};
 
@@ -84,6 +86,7 @@ pub fn expand(root: &Path, entries: &[(String, Origin)]) -> Result<Expanded> {
         sweep_dirs: BTreeSet::from([root.to_path_buf()]),
         count: 0,
         scanned: 0,
+        path_bytes: 0,
     };
     for (rel, origin) in entries {
         exp.add_entry(rel, *origin)?;
@@ -127,6 +130,8 @@ struct Expander<'a> {
     count: usize,
     /// Directory entries examined so far (hostile-tree budget).
     scanned: usize,
+    /// Total byte length of collected canonical paths (long-name budget).
+    path_bytes: usize,
 }
 
 impl Expander<'_> {
@@ -272,6 +277,12 @@ impl Expander<'_> {
                 "more than {MAX_FILES_PER_OP} files selected in one invocation"
             )));
         }
+        self.path_bytes += rel.len();
+        if self.path_bytes > MAX_PATH_BYTES {
+            return Err(Error::Limit(format!(
+                "expanded paths exceed the {MAX_PATH_BYTES}-byte total path budget"
+            )));
+        }
         self.files.insert(
             rel.to_owned(),
             TargetFile {
@@ -285,10 +296,12 @@ impl Expander<'_> {
         Ok(())
     }
 
-    /// Recursively walks a directory in ascending name order, applying
-    /// the skip rules. `depth` bounds recursion and every visited entry
-    /// counts against the scan budget, so hostile trees cannot exhaust
-    /// memory or time before the file cap applies.
+    /// Recursively walks a directory, applying the skip rules. `depth`
+    /// bounds recursion and every visited entry counts against the scan
+    /// budget, so hostile trees cannot exhaust memory or time before
+    /// the file cap applies. Entries are streamed, never collected: the
+    /// final list order comes from `files` being a `BTreeMap`, so no
+    /// per-directory name vector (or its sorting) is needed.
     fn walk_dir(&mut self, rel: &str, abs: &Path, origin: Origin, depth: usize) -> Result<()> {
         if depth > MAX_WALK_DEPTH {
             return Err(Error::Limit(format!(
@@ -301,7 +314,6 @@ impl Expander<'_> {
             Origin::Managed => Origin::Managed,
             Origin::Explicit { .. } => Origin::Explicit { named: false },
         };
-        let mut names: Vec<std::ffi::OsString> = Vec::new();
         for entry in std::fs::read_dir(abs).map_err(|e| Error::io("listing", abs, e))? {
             self.scanned += 1;
             if self.scanned > MAX_SCANNED_ENTRIES {
@@ -309,10 +321,7 @@ impl Expander<'_> {
                     "directory expansion examined more than {MAX_SCANNED_ENTRIES} entries"
                 )));
             }
-            names.push(entry.map_err(|e| Error::io("listing", abs, e))?.file_name());
-        }
-        names.sort_unstable();
-        for name in names {
+            let name = entry.map_err(|e| Error::io("listing", abs, e))?.file_name();
             let name_str = name.to_str().map(str::to_owned);
             let child_abs = abs.join(&name);
             let md = match child_abs.symlink_metadata() {

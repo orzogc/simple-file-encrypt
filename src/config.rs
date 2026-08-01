@@ -160,9 +160,10 @@ pub fn parse(content: &[u8]) -> Result<Config> {
     }
 
     if raw.kdf.algorithm != "argon2id" {
+        // The value is hostile-input content; escape it in the message.
         return Err(Error::Config(format!(
             "unsupported KDF algorithm `{}` (expected `argon2id`)",
-            raw.kdf.algorithm
+            crate::report::escape_str(&raw.kdf.algorithm)
         )));
     }
     let kdf = validate_kdf_structural(raw.kdf.memory_kib, raw.kdf.iterations, raw.kdf.parallelism)?;
@@ -497,6 +498,17 @@ mod tests {
         std::fs::write(&tmp, render(&cfg)).unwrap();
         std::fs::rename(&tmp, dir.path().join(CONFIG_NAME)).unwrap();
         assert!(loaded.ensure_fresh().is_err());
+    }
+
+    #[test]
+    fn hostile_kdf_algorithm_is_escaped_in_errors() {
+        let good = render(&sample());
+        // ESC (0x1B) in the value must not reach the terminal raw.
+        let bad = good.replace("argon2id", "\u{1b}[31mPWN\u{1b}[0m");
+        let err = parse(bad.as_bytes()).unwrap_err();
+        let shown = err.to_string();
+        assert!(!shown.contains('\u{1b}'), "raw escape byte in: {shown}");
+        assert!(shown.contains("\\u{1B}"), "missing escaped form: {shown}");
     }
 
     #[test]

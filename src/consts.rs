@@ -78,6 +78,11 @@ pub const MAX_SCANNED_ENTRIES: usize = 1 << 20;
 /// descendant scan.
 pub const MAX_WALK_DEPTH: usize = 128;
 
+/// Hard cap on the total byte length of all canonical paths collected
+/// in one expansion, so long names cannot exhaust memory within the
+/// file and entry caps.
+pub const MAX_PATH_BYTES: usize = 64 * 1024 * 1024;
+
 /// Hard cap on the config file size: 1 MiB.
 pub const MAX_CONFIG_SIZE: u64 = 1024 * 1024;
 

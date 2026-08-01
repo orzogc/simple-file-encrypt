@@ -1594,3 +1594,107 @@ fn add_and_remove_binary_marks_force_binary() {
     // --binary and --force conflict.
     run_nopw(root, &["remove", "--binary", "--force", "data.txt"]).expect_code(1);
 }
+
+#[test]
+fn add_prunes_descendants_only_for_real_directories() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_domain(root);
+    // A missing path keeps descendant entries (its type is unknown).
+    run_nopw(root, &["add", "a/b"]).expect_code(0);
+    run_nopw(root, &["add", "a"]).expect_code(0);
+    assert!(
+        read_config(root).contains("\"a/b\""),
+        "descendant lost: {}",
+        read_config(root)
+    );
+
+    // A regular file cannot cover descendants: hard conflict (the
+    // entry was added while the file did not yet exist).
+    run_nopw(root, &["add", "f/c"]).expect_code(0);
+    write_file(root, "f", b"x\n");
+    let r = run_nopw(root, &["add", "f"]).expect_code(1);
+    assert_contains(&r.stderr, "a file cannot cover them");
+    assert!(read_config(root).contains("\"f/c\""));
+
+    // A real directory prunes as documented.
+    fs::create_dir_all(root.join("d")).unwrap();
+    run_nopw(root, &["add", "d/e"]).expect_code(0);
+    let r = run_nopw(root, &["add", "d"]).expect_code(0);
+    assert_contains(&r.stdout, "dropped the redundant entry");
+    assert!(!read_config(root).contains("\"d/e\""));
+}
+
+#[test]
+fn verify_reports_large_plaintext_without_reading_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_domain(root);
+    // A sparse plaintext file beyond the 256 MiB cap: verify must
+    // still report "plaintext" (exit 0), not fail on the cap.
+    let big = root.join("big.bin");
+    fs::write(&big, b"").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&big)
+        .unwrap()
+        .set_len(257 * 1024 * 1024)
+        .unwrap();
+    run_nopw(root, &["add", "big.bin"]).expect_code(0);
+    let r = run_pw(root, PW, &["verify"]).expect_code(0);
+    assert_contains(&r.stdout, "plaintext big.bin");
+}
+
+#[test]
+fn remove_binary_defers_warnings_until_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "a.txt", b"a\n");
+    init_domain(root);
+    run_nopw(root, &["add", "--binary", "a.txt"]).expect_code(0);
+    // First arg succeeds in memory, second fails: nothing is committed,
+    // so no reversion warning may be printed at all.
+    let r = run_nopw(root, &["remove", "--binary", "a.txt", "ghost.txt"]).expect_code(1);
+    assert_contains(&r.stderr, "ghost.txt` is not a `force_binary` entry");
+    assert!(
+        !r.stderr.contains("reverts to automatic mode choice"),
+        "warning leaked before commit: {}",
+        r.stderr
+    );
+    assert!(read_config(root).contains("a.txt"));
+
+    // The committed path prints the warning after the rewrite.
+    let r = run_nopw(root, &["remove", "--binary", "a.txt"]).expect_code(0);
+    assert_contains(&r.stderr, "reverts to automatic mode choice");
+}
+
+#[test]
+fn status_marks_skipped_special_force_binary_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "s.txt", b"data\n");
+    init_domain(root);
+    run_nopw(root, &["add", "--binary", "s.txt"]).expect_code(0);
+    fs::remove_file(root.join("s.txt")).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", root.join("s.txt")).unwrap();
+    let r = run_nopw(root, &["status"]).expect_code(0);
+    assert_contains(&r.stdout, "symlink     s.txt [binary]");
+}
+
+// macOS-only: exercises the case-insensitive-volume re-spelling path
+// (default APFS is case-insensitive; this test would fail on a
+// case-sensitive volume).
+#[cfg(target_os = "macos")]
+#[test]
+fn case_insensitive_volume_respells_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    init_domain(root);
+    write_file(root, "Secrets/Inner.txt", b"x\n");
+    // Reference the file with a different case spelling: minting must
+    // re-spell to the on-disk name so key derivation stays stable.
+    let r = run_nopw(root, &["add", "secrets/inner.txt"]).expect_code(0);
+    assert_contains(&r.stdout, "added Secrets/Inner.txt");
+    let r = run_pw(root, PW, &["encrypt", "SECRETS/INNER.TXT"]).expect_code(0);
+    assert_contains(&r.stdout, "encrypted Secrets/Inner.txt");
+}
