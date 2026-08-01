@@ -211,7 +211,7 @@ pub fn remove(arg_paths: &[PathBuf], force: bool, binary: bool) -> Result<()> {
 fn refuse_if_encrypted(domain: &super::Domain, rel: &str) -> Result<()> {
     let expanded = select::expand(domain.root(), &[(rel.to_owned(), Origin::Managed)])?;
     for file in &expanded.files {
-        let prefix = fsops::read_prefix(&file.abs, 64)?;
+        let prefix = fsops::read_prefix(&file.abs, crate::consts::PROBE_PREFIX_LEN)?;
         if probe(&prefix).is_hit() {
             return Err(Error::Usage(format!(
                 "`{}` probes as encrypted; decrypt it first — removing the entry would strand \

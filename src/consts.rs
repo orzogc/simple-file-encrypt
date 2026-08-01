@@ -53,6 +53,23 @@ pub const BIN_HEADER_LEN: usize = 16;
 /// Base64 length of the 16-byte empty-file marker.
 pub const EMPTY_MARKER_B64_LEN: usize = 22;
 
+/// Keyless-probe read window in bytes: must hold the longest exact v1
+/// header line — the empty-file marker form (`TEXT_HEADER_V1` + one
+/// space + `EMPTY_MARKER_B64_LEN` chars + newline, 52 bytes) — so a
+/// probe can classify it from the prefix alone.
+pub const PROBE_PREFIX_LEN: usize = 64;
+
+/// Length of the longest exact v1 header line: the marker form,
+/// `TEXT_HEADER_V1` + one space + the marker + the newline.
+const LONGEST_HEADER_LINE: usize = TEXT_HEADER_V1.len() + 1 + EMPTY_MARKER_B64_LEN + 1;
+
+// A tool rename or header change must never silently shrink the probe
+// window below the longest header line.
+const _: () = assert!(
+    PROBE_PREFIX_LEN >= LONGEST_HEADER_LINE,
+    "the probe window must hold the longest exact header line"
+);
+
 /// Hard cap on plaintext and ciphertext file sizes: 256 MiB.
 pub const MAX_FILE_SIZE: u64 = 256 * 1024 * 1024;
 
