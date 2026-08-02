@@ -146,6 +146,28 @@ ciphertext layouts, and all derivation strings.
   local TOCTOU stays outside the threat model).
 - A `v*` tag push no longer runs the CI suite twice (once for the
   tag, once through the release workflow's call).
+- **Over-cap binary hits are scanned header-blind and never read as
+  foreign.** The bounded first-chunk check validated the header
+  before trying the chunk, so one flipped version/flags/reserved byte
+  on an over-cap ciphertext read as decisively foreign without a
+  single authentication attempt — hiding the intact first chunk
+  sitting right inside the 64 KiB window and letting `rekey --prune`
+  drop its key, in direct violation of the complete-scan-only rule
+  for "foreign". The window is now scanned as a header-blind grid,
+  and no over-cap probe hit is ever classified as foreign (a prefix
+  can prove ownership, never disprove it): magic-bearing over-cap
+  junk blocks convergence as ambiguous until moved out of the tree
+  (found by external review).
+- `Snapshot` comparisons include the inode change time: a concurrent
+  same-size rewrite that restores the mtime still fails the re-check
+  (ctime cannot be set from userspace).
+- The unit-scan work budget is documented in the resource-limits
+  table of `docs/format.md` — what it meters (cryptographic attempts
+  only; parsing is bounded by the read caps) and the verdict shift it
+  can cause (a hostile pseudo-unit flood turns blocking-ambiguous
+  instead of ignored-foreign); binary scans got the same budget-cut
+  property test as text ones, and both scanners gained fuzz targets
+  exercising arbitrary budget cutoffs.
 
 ### Compatibility
 

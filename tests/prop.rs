@@ -106,6 +106,53 @@ proptest! {
         prop_assert_eq!(ca.len(), cb.len());
     }
 
+    /// The binary side of the same invariant, across the shapes the
+    /// grid handles: intact, bit-flipped, truncated, appended-to, and
+    /// header-damaged ciphertexts of one to three chunks.
+    #[test]
+    fn budget_cut_binary_scans_never_go_decisive(
+        len in 0usize..(2 * 65536 + 200),
+        op in 0u8..5,
+        seed in any::<usize>(),
+        budget in 0u64..300_000,
+    ) {
+        let ks = keys();
+        let fk = FileKeys::derive(&ks[1], "blob.bin");
+        let mut ct = binmode::encrypt(&fk, "blob.bin", &vec![0xa5u8; len]).unwrap();
+        match op {
+            1 => {
+                let pos = seed % ct.len();
+                ct[pos] ^= 1;
+            }
+            2 => {
+                let keep = 16 + seed % (ct.len() - 15);
+                ct.truncate(keep);
+            }
+            3 => ct.extend(std::iter::repeat_n(0u8, seed % 200_000)),
+            4 => ct[8 + seed % 8] ^= 0x55, // version/flags/reserved
+            _ => {}
+        }
+        let full = binmode::authenticate_any(
+            &ks, "blob.bin", &ct, &mut ScanBudget::with(u64::MAX),
+        );
+        let cut = binmode::authenticate_any(
+            &ks, "blob.bin", &ct, &mut ScanBudget::with(budget),
+        );
+        match full {
+            UnitScan::Found(idx) => prop_assert!(
+                matches!(cut, UnitScan::Inconclusive) || cut == UnitScan::Found(idx),
+                "a budget cut downgraded {full:?} to {cut:?}"
+            ),
+            UnitScan::NoMatch => prop_assert!(
+                matches!(cut, UnitScan::NoMatch | UnitScan::Inconclusive),
+                "a budget cut turned no-match into {cut:?}"
+            ),
+            UnitScan::Inconclusive => prop_assert!(
+                false, "an unbudgeted scan cannot be inconclusive"
+            ),
+        }
+    }
+
     /// The ownership-scan safety invariant: whatever the budget, a
     /// scan may weaken a find into "inconclusive" but never into the
     /// decisive "no match" that lets `rekey --prune` treat content as

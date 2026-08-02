@@ -33,3 +33,15 @@ name = "bin_decrypt"
 path = "fuzz_targets/bin_decrypt.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "text_authenticate_any"
+path = "fuzz_targets/text_authenticate_any.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "bin_authenticate_any"
+path = "fuzz_targets/bin_authenticate_any.rs"
+test = false
+doc = false

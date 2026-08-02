@@ -399,23 +399,25 @@ fn scan_verdict(scan: crypto::UnitScan) -> ExcludedCiphertext {
 /// which blocks key-rotation convergence exactly like an in-cap
 /// damaged file.
 ///
-/// Binary hits are decided from a header-plus-one-chunk window: a
-/// valid header whose first chunk fails authentication is `Ambiguous`,
-/// never plain foreign — a single-chunk ciphertext of this domain with
-/// appended data is unrecognizable from any prefix, and an over-cap
-/// file cannot be intact ciphertext of *any* domain (the cap binds
-/// both sides), so a well-formed v1 binary header there is
-/// realistically ciphertext-plus-junk of some kind. Ambiguity already
-/// blocks convergence exactly like a proven-ours hit, so scanning the
-/// remaining chunks could only sharpen the message, not the outcome —
-/// not worth a cap-sized read plus a full grid scan per run (the
-/// in-cap classifier has no such conservative fallback, which is why
-/// it does scan every unit). Text hits get the cap-sized line scan,
-/// and one *without* a surviving unit stays `Ambiguous` too: a prefix
-/// can never disprove ownership — prepended damage pushes real units
-/// past any window. The one over-cap shape read as foreign is a
-/// structurally invalid binary header: junk that would additionally
-/// need a broken header to be ours (see `docs/cli.md`).
+/// No over-cap probe hit is ever read as foreign: a prefix can prove
+/// ownership (any surviving unit inside it is decisive) but never
+/// disprove it, and an over-cap file cannot be intact ciphertext of
+/// *any* domain (the cap binds both sides), so probed-as-encrypted
+/// over-cap content is realistically ciphertext-plus-junk of some
+/// kind — whose surviving units may sit past the window, and whose
+/// header fields may be damaged along with everything else. Binary
+/// hits are decided from a header-plus-one-chunk window scanned as a
+/// header-blind grid (an earlier version validated the header first
+/// and read a damaged version byte as decisively foreign — letting
+/// one flipped byte hide the intact first chunk sitting right inside
+/// the window and unblock `rekey --prune`); ambiguity already blocks
+/// convergence exactly like a proven-ours hit, so scanning chunks
+/// beyond the window could only sharpen the message, not the outcome
+/// — not worth a cap-sized read per run (the in-cap classifier has no
+/// such conservative fallback, which is why it does scan every unit).
+/// Text hits get the cap-sized line scan, and one *without* a
+/// surviving unit stays `Ambiguous` too: prepended damage pushes real
+/// units past any window (see `docs/cli.md`).
 pub(crate) fn classify_oversize_excluded(
     keys: &[DomainKey],
     rel: &str,
@@ -428,15 +430,12 @@ pub(crate) fn classify_oversize_excluded(
             let window =
                 crate::consts::BIN_HEADER_LEN + crate::consts::CHUNK_SIZE + crate::consts::SIV_LEN;
             let prefix = fsops::read_prefix(abs, window)?;
-            match crate::binmode::authenticate_first_bounded(keys, rel, &prefix) {
-                Ok(idx) => ExcludedCiphertext::PartiallyAuthentic(idx),
-                // A valid header whose first chunk fails: ambiguous,
-                // which blocks convergence just like a proven hit.
-                Err(Error::Auth { .. }) => ExcludedCiphertext::Ambiguous,
-                // Structural failures (bad magic, version, flags) are
-                // decisive: over-cap junk with a broken header would
-                // need two independent kinds of damage to be ours.
-                Err(_) => ExcludedCiphertext::Foreign,
+            let mut budget = crypto::ScanBudget::full();
+            match crate::binmode::authenticate_any_prefix(keys, rel, &prefix, &mut budget) {
+                crypto::UnitScan::Found(idx) => ExcludedCiphertext::PartiallyAuthentic(idx),
+                crypto::UnitScan::NoMatch | crypto::UnitScan::Inconclusive => {
+                    ExcludedCiphertext::Ambiguous
+                }
             }
         }
         // Text units are line-independent, so any surviving unit in

@@ -291,6 +291,19 @@ Hostile inputs must exhaust neither memory nor CPU. Hard limits
 | `paths` + `force_binary` + `excludes` entries | 65536 | config load |
 | `wrapped_keys` entries | 64 | config load |
 | Password length | 4096 bytes | all password input |
+| Ownership-scan work budget per excluded probe hit | 4 GiB processed-byte equivalents (each authentication attempt charges the unit's length + 128) | the any-unit scan of excluded-content classification |
+
+The ownership-scan budget meters cryptographic work only — parsing
+(line splitting, failed base64 decodes) is bounded by the file-size
+caps — and running out is reported as *inconclusive*, which blocks
+key rotation like ciphertext that cannot be ruled out as this
+domain's, never as "foreign" (see [cli.md](cli.md) under `rekey`). It
+covers a complete scan of any format-valid in-cap file under a ring
+of several keys; content packed with more decodable pseudo-units than
+the format allows can exhaust it sooner, turning an "ignored" foreign
+verdict into a blocking ambiguous one. Unlike the wire-format
+constants above it is an implementation bound and may be retuned in
+future versions.
 
 Both sides of every limit are enforced, so `encrypt` can never produce a
 ciphertext that `decrypt` refuses: a text file whose ciphertext or line

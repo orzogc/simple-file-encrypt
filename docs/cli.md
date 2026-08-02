@@ -381,10 +381,15 @@ counts as work to do for the password contract. One that fails
 authentication is noted and left untouched — deliberately excluded
 foreign-looking content (see `add --exclude --force`) must never block
 a full `decrypt`; the note distinguishes ours-but-damaged (some unit
-still authenticates) from foreign. A hit too large to decrypt in
-memory is classified from a bounded prefix and noted (a surviving
-unit of this domain → restore the original content manually;
-otherwise ambiguous or foreign). Excluded plaintext
+still authenticates) from foreign. One exception: an excluded file
+with an **unrecognized** `#simple-file-encrypt` header gets no keyed
+classification here — `decrypt` cannot repair a header, so there is
+nothing to recover, and it reads no password for a purely diagnostic
+note (the password-only-when-needed contract); its note points at
+`verify`, the keyed arbiter for that shape. A hit too large to
+decrypt in memory is classified from a bounded prefix and noted (a
+surviving unit of this domain → restore the original content
+manually; otherwise ambiguous or foreign). Excluded plaintext
 is skipped (silently unless named) and exempt from
 `--require-encrypted`: its plaintext is intentional. The repair pass
 runs after the main pass with the same serial stop-at-first-error
@@ -631,16 +636,17 @@ size cap: a hit too large to read whole is scanned from a cap-sized
 prefix, where a surviving unit is decisive proof of ownership but
 finding none proves nothing — prepended damage can push real units
 past any prefix. An over-cap *binary* hit is decided from its header
-plus first chunk (a valid header whose first chunk does not
-authenticate is ambiguous: a single-chunk ciphertext with appended
-data is unrecognizable from any prefix, and since ambiguity already
-blocks convergence, scanning further chunks could only sharpen the
-message); an over-cap file cannot be intact ciphertext of *any*
-domain anyway (the cap binds both sides), so a v1 header there is
-realistically ciphertext-plus-junk of some kind. Restore the
-original bytes or move the file out to resolve an ambiguous hit. The
-one over-cap shape read as decisively foreign is a structurally
-invalid (or newer-version) binary header. In-cap, after the complete
+plus first chunk, scanned as a header-blind grid: the version and
+flag bytes are as damageable as any unit, and an intact chunk
+authenticates regardless of them (a single-chunk ciphertext with
+appended data stays unrecognizable from any prefix, and since
+ambiguity already blocks convergence, scanning further chunks could
+only sharpen the message). **No over-cap probe hit is ever read as
+foreign**: an over-cap file cannot be intact ciphertext of *any*
+domain (the cap binds both sides), so magic-bearing over-cap content
+is realistically ciphertext-plus-junk of some kind — restore the
+original bytes, or move the file out of the tree if it is known
+junk, to resolve an ambiguous hit. In-cap, after the complete
 scan, two shapes remain genuinely indistinguishable from foreign
 ciphertext — and read as foreign: a hit with **no surviving unit**
 (every unit destroyed, or a single-unit file whose only unit is

@@ -23,6 +23,10 @@ pub struct Snapshot {
     pub size: u64,
     /// Modification time (seconds, nanoseconds).
     pub mtime: (i64, i64),
+    /// Inode change time (seconds, nanoseconds): unlike mtime it
+    /// cannot be set from userspace (utimensat updates it as a side
+    /// effect), so a rewrite that restores the mtime still moves it.
+    pub ctime: (i64, i64),
     /// Full `st_mode` (permission bits are restored after rename).
     pub mode: u32,
     /// Hard-link count.
@@ -37,6 +41,7 @@ impl Snapshot {
             ino: md.ino(),
             size: md.size(),
             mtime: (md.mtime(), md.mtime_nsec()),
+            ctime: (md.ctime(), md.ctime_nsec()),
             mode: md.mode(),
             nlink: md.nlink(),
         }
@@ -47,11 +52,13 @@ impl Snapshot {
     /// other name would keep a stale alias) or a permission change (a
     /// concurrent `chmod` the restore step would silently undo)
     /// mid-operation fails the file instead of being papered over.
+    /// The ctime comparison catches a rewrite that restores the mtime.
     pub fn matches(&self, other: &Snapshot) -> bool {
         self.dev == other.dev
             && self.ino == other.ino
             && self.size == other.size
             && self.mtime == other.mtime
+            && self.ctime == other.ctime
             && self.mode == other.mode
             && self.nlink == other.nlink
     }

@@ -2143,7 +2143,7 @@ fn grow_past_cap(root: &Path, rel: &str) {
 }
 
 #[test]
-fn oversize_foreign_excluded_probe_hits_block_nothing() {
+fn oversize_magic_bearing_junk_is_ambiguous_until_moved_out() {
     use std::io::Write as _;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -2153,9 +2153,13 @@ fn oversize_foreign_excluded_probe_hits_block_nothing() {
     run_nopw(root, &["add", "d"]).expect_code(0);
 
     // A sparse file over the 256 MiB cap that starts with the binary
-    // magic but has an invalid header (version 0): structurally not v1
-    // ciphertext of any domain — decisively foreign, and foreign
-    // content must block nothing.
+    // magic but has an invalid header (version 0). No over-cap probe
+    // hit is ever read as foreign: a prefix cannot disprove ownership
+    // — damage can break a real ciphertext's header, or push its
+    // surviving chunks past the window (an earlier version read a
+    // broken header as decisively foreign, which let one flipped byte
+    // hide an intact first chunk and unblock `rekey --prune`). The
+    // junk blocks convergence until it is moved out of the tree.
     fs::create_dir_all(root.join("d")).unwrap();
     let mut f = fs::File::create(root.join("d/huge.bin")).unwrap();
     f.write_all(&BIN_MAGIC).unwrap();
@@ -2164,13 +2168,58 @@ fn oversize_foreign_excluded_probe_hits_block_nothing() {
     run_nopw(root, &["add", "--exclude", "--force", "d/huge.bin"]).expect_code(0);
 
     run_pw(root, PW, &["encrypt"]).expect_code(0);
-    run_pw(root, PW, &["decrypt"]).expect_code(0);
-    run_pw(root, PW, &["encrypt"]).expect_code(0);
-    let r = run_pw(root, PW, &["verify"]).expect_code(0);
-    assert_contains(&r.stdout, "ignored");
-    run_pw(root, PW, &["rekey"]).expect_code(0);
+    let r = run_pw(root, PW, &["verify"]).expect_code(1);
+    assert_contains(&r.stdout, "FAILED d/huge.bin");
+    assert_contains(&r.stdout, "cannot be conclusively classified");
+    let r = run_pw(root, PW, &["rekey"]).expect_code(0);
+    assert_contains(&r.stderr, "cannot be conclusively classified");
+    let r = run_pw(root, PW, &["rekey", "--continue"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot be conclusively classified");
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot prune");
+
+    // Moving the junk out of the tree resolves it.
+    fs::remove_file(root.join("d/huge.bin")).unwrap();
     run_pw(root, PW, &["rekey", "--continue"]).expect_code(0);
     run_pw(root, PW, &["rekey", "--prune"]).expect_code(0);
+}
+
+#[test]
+fn oversize_binary_with_damaged_header_and_intact_chunk_still_blocks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/b.bin", &vec![0u8; 65536 + 100]); // two chunks
+    write_file(root, "d/other.txt", b"other\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "--force", "d/b.bin"]).expect_code(0);
+
+    // Break only the header's version byte, keep every chunk intact,
+    // and grow past the cap. The intact first chunk sits inside the
+    // bounded window and authenticates regardless of the header
+    // (chunk associated data does not involve it) — the header-blind
+    // grid must prove ownership instead of guessing foreign.
+    let original = read_file(root, "d/b.bin");
+    let mut damaged = original.clone();
+    damaged[8] = 0x02; // version 1 -> 2
+    fs::write(root.join("d/b.bin"), &damaged).unwrap();
+    grow_past_cap(root, "d/b.bin");
+
+    let r = run_pw(root, PW, &["verify"]).expect_code(1);
+    assert_contains(&r.stdout, "FAILED d/b.bin");
+    assert_contains(&r.stdout, "a unit authenticates under ring entry");
+    run_pw(root, PW, &["rekey"]).expect_code(0); // mint, so prune has work
+    let r = run_pw(root, PW, &["rekey", "--continue"]).expect_code(1);
+    assert_contains(&r.stderr, "does not fully decrypt");
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot prune");
+
+    // The refusals kept the old key: the restored ciphertext recovers.
+    fs::write(root.join("d/b.bin"), &original).unwrap();
+    let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
+    assert_contains(&r.stdout, "decrypted d/b.bin (excluded; recovered)");
+    assert_eq!(read_file(root, "d/b.bin"), vec![0u8; 65536 + 100]);
 }
 
 #[test]

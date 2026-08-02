@@ -156,40 +156,25 @@ pub fn authenticate_first(keys: &[DomainKey], path: &str, ct: &[u8]) -> Result<u
     Ok(select_key(keys, path, ct, &chunks[0])?.0)
 }
 
-/// Bounded first-chunk authentication for a file too large to read
-/// whole: `prefix` must hold the header and one full on-disk chunk. In
-/// any valid ciphertext larger than the size cap the first chunk is
-/// full and non-last, so it is tried with that associated data alone;
-/// a small single-chunk ciphertext with data appended past the cap
-/// carries a last-chunk AD whose extent a prefix cannot recover, and
-/// reads as non-authentic (a documented residual). Returns the
-/// authenticating key index.
-pub fn authenticate_first_bounded(keys: &[DomainKey], path: &str, prefix: &[u8]) -> Result<usize> {
-    if prefix.len() < BIN_HEADER_LEN + CHUNK_DISK {
-        return Err(Error::format(
-            path,
-            "prefix too short for a full first chunk",
-        ));
-    }
-    // The probe and this read are separate reads: re-check the magic
-    // instead of trusting a snapshot of a file another program may
-    // have replaced in between (the full-parse path has the caller's
-    // probe and the parse on the same buffer; this one does not).
-    if prefix[..BIN_MAGIC.len()] != BIN_MAGIC {
-        return Err(Error::format(
-            path,
-            "binary magic missing (the file changed between reads)",
-        ));
-    }
-    validate_header(path, prefix)?;
-    let unit = &prefix[BIN_HEADER_LEN..BIN_HEADER_LEN + CHUNK_DISK];
-    for (i, key) in keys.iter().enumerate() {
-        let fk = FileKeys::derive(key, path);
-        if fk.unit_decrypt(&ad_bin(0, false), unit).is_some() {
-            return Ok(i);
-        }
-    }
-    Err(Error::auth(path, crate::textmode::FIRST_UNIT_AUTH_HINT))
+/// [`authenticate_grid`] over a bounded prefix of an over-cap file:
+/// grid-only, because a prefix holds no trustworthy structure, and
+/// deliberately *without* header-field validation — the version,
+/// flags, and reserved bytes are as damageable as any unit, and an
+/// intact first chunk authenticates regardless of what happened to
+/// them (chunk associated data does not involve the header). A hit
+/// proves ownership; no hit proves nothing about a file the prefix
+/// does not cover. A prefix that no longer starts with the magic (the
+/// file changed between the caller's probe and this read) simply has
+/// no authenticating chunk and scans to no-match — the caller's
+/// conservative mapping absorbs it.
+pub fn authenticate_any_prefix(
+    keys: &[DomainKey],
+    path: &str,
+    prefix: &[u8],
+    budget: &mut ScanBudget,
+) -> UnitScan {
+    let fks: Vec<FileKeys> = keys.iter().map(|k| FileKeys::derive(k, path)).collect();
+    authenticate_grid(&fks, prefix, budget)
 }
 
 /// Scans every chunk for one that authenticates under any ring key:
@@ -544,6 +529,16 @@ mod tests {
         assert_eq!(
             authenticate_any(&ks, "blob", &broken, &mut partial),
             UnitScan::Inconclusive
+        );
+
+        // The bounded-prefix variant is header-blind: a damaged
+        // version byte does not hide the intact first chunk sitting
+        // inside the window.
+        let mut prefix = ct[..BIN_HEADER_LEN + CHUNK_DISK].to_vec();
+        prefix[8] = 0x02;
+        assert_eq!(
+            authenticate_any_prefix(&ks, "blob", &prefix, &mut ScanBudget::full()),
+            UnitScan::Found(1)
         );
     }
 
