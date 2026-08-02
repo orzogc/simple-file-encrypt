@@ -113,6 +113,9 @@ pub fn rekey(mode: RekeyMode, gate: &KdfGate) -> Result<()> {
                     skipped.rel
                 )));
             }
+            if let Some(boundary) = expanded.skipped_boundaries.first() {
+                return Err(Error::Usage(boundary_message(boundary)));
+            }
             if let Some(hit) = excluded_hits.first() {
                 return Err(Error::Usage(excluded_hit_message(hit)));
             }
@@ -140,13 +143,28 @@ pub fn rekey(mode: RekeyMode, gate: &KdfGate) -> Result<()> {
         RekeyMode::Fresh => {}
     }
 
-    for hit in &excluded_hits {
+    for boundary in &expanded.skipped_boundaries {
         report::warn(format!(
-            "excluded path `{}` holds this domain's ciphertext (ring entry {}) and is hidden \
-             from migration; it stays on its old key — decrypt it or `remove --exclude` the \
-             covering entry",
-            hit.rel, hit.idx
+            "nested repository `{boundary}` sits inside a managed tree and is not audited; \
+             anything this domain encrypted there before it became a repository stays on its \
+             old key"
         ));
+    }
+    for hit in &excluded_hits {
+        report::warn(match hit.kind {
+            super::ExcludedCiphertext::Ambiguous => format!(
+                "excluded path `{}` exceeds the file-size cap and cannot be authenticated; if it \
+                 is this domain's ciphertext with appended data it stays on its old key — \
+                 restore the original bytes or move it out of the tree",
+                hit.rel
+            ),
+            _ => format!(
+                "excluded path `{}` holds this domain's ciphertext and is hidden from \
+                 migration; it stays on its old key — decrypt it or `remove --exclude` the \
+                 covering entry",
+                hit.rel
+            ),
+        });
     }
 
     // Refuse to mint another key while an earlier rotation is unfinished.
@@ -216,16 +234,15 @@ fn find_old_epoch_file(keys: &[crypto::DomainKey], files: &[TargetFile]) -> Resu
     Ok(None)
 }
 
-/// An excluded path holding this domain's ciphertext, found by
-/// [`scan_excluded_ciphertext`].
+/// An excluded path that key rotation must not converge past, found by
+/// [`scan_excluded_ciphertext`]: content that authenticates under some
+/// ring key, or over-cap content that cannot be ruled out as this
+/// domain's.
 struct ExcludedHit {
     /// Canonical relative path.
     rel: String,
-    /// Ring entry its content authenticates under.
-    idx: usize,
-    /// Whether the whole file decrypts (vs. first unit only: damaged
-    /// or mixing key epochs).
-    fully: bool,
+    /// How the content relates to the ring (never `Foreign`).
+    kind: super::ExcludedCiphertext,
 }
 
 /// Scans the excluded files for content that authenticates under any
@@ -252,13 +269,13 @@ fn scan_excluded_ciphertext(
             // convergence like any in-cap damaged file; foreign blobs
             // still authenticate under no key and block nothing.
             Err(Error::Limit(_)) => {
-                if let super::ExcludedCiphertext::FirstUnitOnly(idx) =
+                if let kind @ (super::ExcludedCiphertext::FirstUnitOnly(_)
+                | super::ExcludedCiphertext::Ambiguous) =
                     super::classify_oversize_excluded(keys, &ex.rel, &ex.abs, prefix_kind)?
                 {
                     hits.push(ExcludedHit {
                         rel: ex.rel.clone(),
-                        idx,
-                        fully: false,
+                        kind,
                     });
                 }
                 continue;
@@ -267,15 +284,11 @@ fn scan_excluded_ciphertext(
         };
         let kind = probe(&data.content);
         match super::classify_excluded_ciphertext(keys, &ex.rel, &data.content, kind) {
-            super::ExcludedCiphertext::Authentic(idx) => hits.push(ExcludedHit {
+            kind @ (super::ExcludedCiphertext::Authentic(_)
+            | super::ExcludedCiphertext::FirstUnitOnly(_)
+            | super::ExcludedCiphertext::Ambiguous) => hits.push(ExcludedHit {
                 rel: ex.rel.clone(),
-                idx,
-                fully: true,
-            }),
-            super::ExcludedCiphertext::FirstUnitOnly(idx) => hits.push(ExcludedHit {
-                rel: ex.rel.clone(),
-                idx,
-                fully: false,
+                kind,
             }),
             super::ExcludedCiphertext::Foreign => {}
         }
@@ -283,22 +296,41 @@ fn scan_excluded_ciphertext(
     Ok(hits)
 }
 
+/// The convergence-refusal message for a nested repository discovered
+/// inside a managed tree.
+fn boundary_message(boundary: &str) -> String {
+    format!(
+        "nested repository `{boundary}` sits inside a managed tree; its contents were never \
+         audited, and anything this domain encrypted there before it became a repository would \
+         be stranded — decrypt such files first (temporarily moving its `.git` entry aside lets \
+         `decrypt` reach them), then move the repository out of the managed tree or `remove` \
+         the covering entry"
+    )
+}
+
 /// The convergence-refusal message for one excluded ciphertext hit.
 fn excluded_hit_message(hit: &ExcludedHit) -> String {
-    if hit.fully {
-        format!(
-            "excluded path `{}` still holds valid ciphertext of this domain (ring entry {}), \
+    match hit.kind {
+        super::ExcludedCiphertext::Authentic(idx) => format!(
+            "excluded path `{}` still holds valid ciphertext of this domain (ring entry {idx}), \
              hidden from migration — decrypt it (`decrypt {}`) or `remove --exclude` the \
              covering entry first",
-            hit.rel, hit.idx, hit.rel
-        )
-    } else {
-        format!(
+            hit.rel, hit.rel
+        ),
+        super::ExcludedCiphertext::FirstUnitOnly(idx) => format!(
             "excluded path `{}` holds this domain's ciphertext (first unit authenticates under \
-             ring entry {}) but does not fully decrypt — it is damaged or mixes key epochs; \
+             ring entry {idx}) but does not fully decrypt — it is damaged or mixes key epochs; \
              resolve it manually first",
-            hit.rel, hit.idx
-        )
+            hit.rel
+        ),
+        super::ExcludedCiphertext::Ambiguous => format!(
+            "excluded path `{}` exceeds the file-size cap and cannot be authenticated from a \
+             bounded prefix — a single-chunk binary ciphertext of this domain with appended data \
+             is indistinguishable from foreign content; restore the original bytes or move the \
+             file out of the tree first",
+            hit.rel
+        ),
+        super::ExcludedCiphertext::Foreign => unreachable!("foreign content is never a hit"),
     }
 }
 
@@ -390,6 +422,15 @@ fn prune(
             "managed path `{}` is a symlink or special file and was skipped, so its content \
              was never verified — resolve it (or `remove` the covering entry) before pruning",
             skipped.rel
+        )));
+    }
+    // A nested repository inside a managed tree was never audited: a
+    // directory can be encrypted first and become a boundary later, so
+    // pruning past one could drop the very key its contents need.
+    if let Some(boundary) = expanded.skipped_boundaries.first() {
+        return Err(Error::Usage(format!(
+            "cannot prune: {}",
+            boundary_message(boundary)
         )));
     }
     // Excluded paths holding this domain's ciphertext would be stranded

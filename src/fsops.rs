@@ -688,6 +688,32 @@ mod tests {
         assert!(read_capped(dir.path(), 1024, "file").is_err());
     }
 
+    #[test]
+    fn snapshot_matches_covers_mode_and_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"x").unwrap();
+        // Pin the baseline permissions: `fs::write` honors the umask,
+        // and a 0o?77 umask would otherwise make the later chmod a
+        // no-op.
+        std::fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
+        let snap = |p: &Path| Snapshot::of(&std::fs::symlink_metadata(p).unwrap());
+        let base = snap(&path);
+        assert!(base.matches(&snap(&path)));
+
+        // A concurrent chmod must fail the freshness check: the
+        // restore step would otherwise silently undo it.
+        std::fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
+        assert!(!base.matches(&snap(&path)));
+        std::fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
+
+        // A hard link created mid-operation must fail it too: the new
+        // name would keep a stale alias after the rename.
+        let taken = snap(&path);
+        std::fs::hard_link(&path, dir.path().join("l")).unwrap();
+        assert!(!taken.matches(&snap(&path)));
+    }
+
     /// `/proc` files report size 0 but yield content: they exercise the
     /// bounded read and the growth-detection branch.
     #[cfg(target_os = "linux")]

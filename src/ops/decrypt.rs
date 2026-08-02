@@ -158,6 +158,12 @@ fn recover_excluded(
                      manually (e.g. from git)",
                     ex.rel
                 )),
+                super::ExcludedCiphertext::Ambiguous => report::note(format!(
+                    "`{}` is excluded, exceeds the file-size cap, and cannot be authenticated \
+                     from a bounded prefix — if it is a single-chunk ciphertext of this domain \
+                     with appended data, restore the original bytes; left untouched",
+                    ex.rel
+                )),
                 _ => report::note(format!(
                     "`{}` is excluded, probes as encrypted, and exceeds the file-size cap, but \
                      its first unit does not authenticate under this domain's keys; left \

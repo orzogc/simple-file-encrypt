@@ -137,7 +137,14 @@ KDF-related global options, honored by every command that runs Argon2:
   descendant scan do not enter it (noted), and explicit arguments
   inside it resolve to no domain (domain resolution stops at repository
   boundaries — see above). The domain root itself is exempt, so a
-  domain rooted in a linked worktree works.
+  domain rooted in a linked worktree works. A boundary found inside a
+  managed tree is **recorded**: a directory can be encrypted first and
+  only later become a submodule or nested checkout, so `status` and
+  `verify` report it and `rekey --continue`/`--prune` refuse to treat
+  it as convergence — decrypt or migrate a directory's contents
+  *before* turning it into a repository. Boundaries beneath an
+  exclusion are not recorded: excluded trees are hands-off by
+  declaration (a documented residual — decrypt before excluding).
 - During expansion the tool also skips the domain config itself, temp
   files, and any file named `.gitattributes` or `.gitmodules` — git
   must read those as plaintext, and encrypting `.gitattributes` would
@@ -588,7 +595,8 @@ unit, so a mixed-epoch or deeply damaged file would otherwise pass
 silently. A file that fails this bar needs manual resolution (the error
 says so) — `--continue` never loops advice with `--prune`. It likewise
 refuses to declare completion while a managed path exists only as a
-symlink or special file: its content was never verified.
+symlink or special file, or while a nested-repository boundary sits
+inside a managed tree: their content was never verified.
 
 Excluded paths — including independent exclusions outside every
 managed entry, which are expanded as audit roots — are checked against
@@ -599,12 +607,24 @@ ring key (fully, or first-unit-only) is this domain's ciphertext
 `--prune` refuse — the fix is `decrypt` (which recovers excluded
 ciphertext) or `remove --exclude`. Excluded content that authenticates
 under no key is foreign and never blocks rotation. A hit too large to
-read whole is classified by its first unit from a bounded prefix, so
+read whole is classified by its first unit from a bounded prefix:
 valid ciphertext with data appended past the size cap still blocks
-convergence; the one shape a prefix cannot recognize is a
-single-chunk *binary* ciphertext with appended data (its last-chunk
-extent is unrecoverable), which reads as foreign — text ciphertext of
-any size is recognized by its first line.
+convergence, and an over-cap *binary* probe hit with a valid header
+whose first chunk does not authenticate is **ambiguous** — a
+single-chunk ciphertext of this domain with appended data is
+indistinguishable from foreign content (its last-chunk extent is
+unrecoverable from a prefix), so `--continue` and `--prune` refuse it
+too; restore the original bytes or move the file out to resolve it.
+Two shapes stay decisively foreign: a structurally invalid (or
+newer-version) binary header, and an empty-file marker header with
+appended data (the recoverable plaintext is empty, so nothing can be
+lost). *In-cap* excluded probe hits that authenticate under no ring
+key are likewise treated as foreign — a complete foreign ciphertext,
+the very content `add --exclude --force` exists for, is
+indistinguishable there from a damaged or appended-to ciphertext of
+this domain whose first unit was destroyed; treat `verify`'s
+"ignored" lines as worth a look when content under an exclusion was
+ever encrypted here.
 
 A fresh `rekey`, by contrast, may start a new epoch while managed
 paths are missing or skipped: exit 0 then means the epoch started and

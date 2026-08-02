@@ -118,6 +118,12 @@ pub fn status() -> Result<()> {
             ),
         ));
     }
+    for boundary in &expanded.skipped_boundaries {
+        lines.push((
+            boundary.clone(),
+            format!("boundary     {boundary} (nested repository; not audited)"),
+        ));
+    }
     // Excluded plaintext is intentional and not listed (a large
     // excluded tree would flood the report); an excluded probe hit is
     // an anomaly worth a line — stranded or foreign-looking content.
@@ -222,6 +228,16 @@ pub fn verify(arg_paths: &[PathBuf], gate: &KdfGate) -> Result<ScanOutcome> {
         .chain(&expanded.missing_explicit)
     {
         report::out(format!("missing {missing}"));
+    }
+    // A nested repository discovered inside a managed tree is reported
+    // like a missing entry — informational here, while `rekey
+    // --continue`/`--prune` refuse to converge past it: its contents
+    // were never audited, and a directory can be encrypted first and
+    // become a boundary later.
+    for boundary in &expanded.skipped_boundaries {
+        report::out(format!(
+            "boundary {boundary} (nested repository; contents not audited)"
+        ));
     }
     let mut failures = 0usize;
     let mut operational = 0usize;
@@ -329,6 +345,16 @@ pub fn verify(arg_paths: &[PathBuf], gate: &KdfGate) -> Result<ScanOutcome> {
                     "FAILED {}: excluded path holds this domain's ciphertext (first unit \
                      authenticates under ring entry {idx}) but does not fully decrypt — damaged \
                      or mixing key epochs; resolve it manually",
+                    ex.rel
+                ));
+            }
+            Ok(Some(super::ExcludedCiphertext::Ambiguous)) => {
+                failures += 1;
+                report::out(format!(
+                    "FAILED {}: excluded path exceeds the file-size cap and cannot be \
+                     authenticated from a bounded prefix — a single-chunk binary ciphertext of \
+                     this domain with appended data is indistinguishable from foreign content; \
+                     restore the original bytes or move the file out of the tree",
                     ex.rel
                 ));
             }

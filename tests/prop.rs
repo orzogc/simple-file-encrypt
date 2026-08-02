@@ -3,6 +3,7 @@
 //! tampering never yields a successful decryption.
 
 use proptest::prelude::*;
+use simple_file_encrypt::consts::TEXT_HEADER_V1;
 use simple_file_encrypt::crypto::{DomainKey, FileKeys};
 use simple_file_encrypt::probe::{Probe, probe};
 use simple_file_encrypt::{binmode, textmode};
@@ -59,7 +60,8 @@ proptest! {
         let ks = keys();
         let fk = FileKeys::derive(&ks[0], "p/q.txt");
         let mut ct = textmode::encrypt(&fk, "p/q.txt", &content).unwrap();
-        let unit_region = 24..ct.len(); // after "#simple-file-encrypt v1 text\n"
+        // Everything after the newline-terminated header line.
+        let unit_region = (TEXT_HEADER_V1.len() + 1)..ct.len();
         prop_assume!(!unit_region.is_empty());
         let pos = unit_region.start + pos_seed % unit_region.len();
         ct[pos] ^= 1 << bit;

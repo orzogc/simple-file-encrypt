@@ -9,7 +9,7 @@ format has its own single version (currently **1**, see
 [docs/format.md](docs/format.md)), covering the config schema, both
 ciphertext layouts, and all derivation strings.
 
-## [0.2.0] - 2026-08-01
+## [Unreleased]
 
 ### Added
 
@@ -73,6 +73,27 @@ ciphertext layouts, and all derivation strings.
 - Release archives now include `docs/`, `SECURITY.md`, `CHANGELOG.md`,
   and the Chinese README (the README links them); the crates.io
   package includes them too.
+- **Nested-repository boundaries no longer pass as convergence.** A
+  directory can be encrypted first and only later become a submodule
+  or nested checkout; the walk never enters boundaries, so
+  `rekey --continue`/`--prune` previously vouched past ciphertext
+  hidden there and prune could drop its key. Boundaries inside managed
+  trees are now recorded: `status`/`verify` report them, a fresh
+  `rekey` warns, and `--continue`/`--prune` refuse (found by external
+  review).
+- **Ambiguous over-cap binary hits block convergence.** An over-cap
+  excluded binary probe hit with a valid header whose first chunk does
+  not authenticate is indistinguishable from a single-chunk ciphertext
+  of this domain with appended data; it previously passed as foreign,
+  letting `rekey --prune` drop the key. It is now classified as
+  ambiguous: `verify` fails it and `--continue`/`--prune` refuse until
+  the original bytes are restored or the file is moved out.
+- Overlapping expansion roots (`paths = ["d", "d/sub"]`, overlapping
+  exclusions) walk each real directory once, deduplicated by identity:
+  excluded counts stay accurate and the scan budget charges actual
+  work.
+- `encrypt`'s auto-add and the `add`/`remove` coverage lookups use the
+  sorted-list ancestor search instead of linear scans.
 
 ### Compatibility
 
@@ -116,5 +137,5 @@ Initial release.
   static Linux binaries (x86_64/aarch64, musl) and macOS (Apple
   silicon) — with SHA-256 checksums and provenance attestations.
 
-[0.2.0]: https://github.com/orzogc/simple-file-encrypt/releases/tag/v0.2.0
+[Unreleased]: https://github.com/orzogc/simple-file-encrypt/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/orzogc/simple-file-encrypt/releases/tag/v0.1.0

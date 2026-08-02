@@ -188,12 +188,7 @@ pub(crate) fn encrypt_pass(
         let mut added: Vec<String> = Vec::new();
         for file in files {
             if file.explicit
-                && !domain
-                    .loaded
-                    .config
-                    .paths
-                    .iter()
-                    .any(|e| crate::paths::is_covered_by(&file.rel, e))
+                && crate::paths::covering_entry(&domain.loaded.config.paths, &file.rel).is_none()
                 && insert_sorted(&mut domain.loaded.config.paths, &file.rel)
             {
                 added.push(file.rel.clone());

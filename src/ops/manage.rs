@@ -77,13 +77,8 @@ pub fn add(arg_paths: &[PathBuf], binary: bool, exclude: bool, force: bool) -> R
         };
 
         // Already present or covered by a managed directory entry?
-        if let Some(covering) = domain
-            .loaded
-            .config
-            .paths
-            .iter()
-            .find(|e| paths::is_covered_by(rel, e))
-            .cloned()
+        if let Some(covering) =
+            paths::covering_entry(&domain.loaded.config.paths, rel).map(str::to_owned)
         {
             if covering == *rel {
                 reports.push(format!("`{rel}` is already managed"));
@@ -130,13 +125,8 @@ pub fn add(arg_paths: &[PathBuf], binary: bool, exclude: bool, force: bool) -> R
         // same bookkeeping as the others: sorted insertion, coverage
         // dedup, and a real directory mark collapses marks it covers.
         if binary {
-            if let Some(covering) = domain
-                .loaded
-                .config
-                .force_binary
-                .iter()
-                .find(|e| paths::is_covered_by(rel, e))
-                .cloned()
+            if let Some(covering) =
+                paths::covering_entry(&domain.loaded.config.force_binary, rel).map(str::to_owned)
             {
                 if covering == *rel {
                     reports.push(format!("`{rel}` is already marked binary"));
@@ -221,13 +211,8 @@ fn add_excludes(domain: &mut super::Domain, rels: &[String], force: bool) -> Res
         };
 
         // Already present or covered by an excludes directory entry?
-        if let Some(covering) = domain
-            .loaded
-            .config
-            .excludes
-            .iter()
-            .find(|e| paths::is_covered_by(rel, e))
-            .cloned()
+        if let Some(covering) =
+            paths::covering_entry(&domain.loaded.config.excludes, rel).map(str::to_owned)
         {
             if covering == *rel {
                 reports.push(format!("`{rel}` is already excluded"));
@@ -278,12 +263,24 @@ fn add_excludes(domain: &mut super::Domain, rels: &[String], force: bool) -> Res
             } else {
                 let mut probe_excludes = domain.loaded.config.excludes.clone();
                 super::insert_sorted(&mut probe_excludes, rel);
-                if let Some(hit) = first_encrypted_under(domain, rel, &probe_excludes)? {
-                    return Err(Error::Usage(format!(
-                        "`{hit}` probes as encrypted; decrypt it first — excluding it would hide \
-                         the ciphertext from `encrypt` and `rekey` (`add --exclude --force` \
-                         overrides, for content that only looks encrypted)"
-                    )));
+                match probe_under(domain, rel, &probe_excludes)? {
+                    Some(ProbeFinding::Encrypted(hit)) => {
+                        return Err(Error::Usage(format!(
+                            "`{hit}` probes as encrypted; decrypt it first — excluding it would \
+                             hide the ciphertext from `encrypt` and `rekey` (`add --exclude \
+                             --force` overrides, for content that only looks encrypted)"
+                        )));
+                    }
+                    // Defensive: the candidate's subtree walks in
+                    // excluded mode, which records no boundaries; kept
+                    // in case that ever changes.
+                    Some(ProbeFinding::Boundary(boundary)) => {
+                        return Err(Error::Usage(format!(
+                            "`{boundary}` is a nested repository inside `{rel}`; its contents \
+                             cannot be probed (`add --exclude --force` overrides)"
+                        )));
+                    }
+                    None => {}
                 }
             }
         }
@@ -347,13 +344,7 @@ pub fn remove(arg_paths: &[PathBuf], force: bool, binary: bool, exclude: bool) -
         }
         if exclude {
             if !domain.loaded.config.excludes.contains(rel) {
-                if let Some(covering) = domain
-                    .loaded
-                    .config
-                    .excludes
-                    .iter()
-                    .find(|e| paths::is_covered_by(rel, e))
-                {
+                if let Some(covering) = paths::covering_entry(&domain.loaded.config.excludes, rel) {
                     return Err(Error::Usage(format!(
                         "`{rel}` is covered by the excludes entry `{covering}`, not an entry \
                          itself; remove that entry instead"
@@ -371,12 +362,8 @@ pub fn remove(arg_paths: &[PathBuf], force: bool, binary: bool, exclude: bool) -
         }
         if binary {
             if !domain.loaded.config.force_binary.contains(rel) {
-                if let Some(covering) = domain
-                    .loaded
-                    .config
-                    .force_binary
-                    .iter()
-                    .find(|e| paths::is_covered_by(rel, e))
+                if let Some(covering) =
+                    paths::covering_entry(&domain.loaded.config.force_binary, rel)
                 {
                     return Err(Error::Usage(format!(
                         "`{rel}` is covered by the force_binary entry `{covering}`, not an entry \
@@ -399,13 +386,7 @@ pub fn remove(arg_paths: &[PathBuf], force: bool, binary: bool, exclude: bool) -
             continue;
         }
         if !domain.loaded.config.paths.contains(rel) {
-            if let Some(covering) = domain
-                .loaded
-                .config
-                .paths
-                .iter()
-                .find(|e| paths::is_covered_by(rel, e))
-            {
+            if let Some(covering) = paths::covering_entry(&domain.loaded.config.paths, rel) {
                 return Err(Error::Usage(format!(
                     "`{rel}` is covered by the managed directory entry `{covering}`, not an entry itself; \
                      remove that entry instead"
@@ -439,32 +420,50 @@ pub fn remove(arg_paths: &[PathBuf], force: bool, binary: bool, exclude: bool) -
 /// Refuses removal when the entry's file — or, for a directory entry,
 /// any file beneath it — probes as encrypted.
 fn refuse_if_encrypted(domain: &super::Domain, rel: &str) -> Result<()> {
-    if let Some(hit) = first_encrypted_under(domain, rel, &domain.loaded.config.excludes)? {
-        return Err(Error::Usage(format!(
+    match probe_under(domain, rel, &domain.loaded.config.excludes)? {
+        Some(ProbeFinding::Encrypted(hit)) => Err(Error::Usage(format!(
             "`{hit}` probes as encrypted; decrypt it first — removing the entry would strand \
              ciphertext outside `rekey`'s reach (`remove --force` overrides)"
-        )));
+        ))),
+        Some(ProbeFinding::Boundary(boundary)) => Err(Error::Usage(format!(
+            "`{boundary}` is a nested repository inside `{rel}`; its contents cannot be probed \
+             and may still hold this domain's ciphertext — decrypt them first (temporarily \
+             moving its `.git` entry aside lets the tool see them), or use `remove --force`"
+        ))),
+        None => Ok(()),
     }
-    Ok(())
 }
 
-/// Returns the first path equal to or beneath `rel` (directories
-/// expanded) that probes as encrypted. Content hidden by an exclusion
-/// would be stranded all the same, so the excluded files are probed
-/// too; `excludes` steers only the walk *rules* — the caller passes the
-/// entries whose subtrees deserve the relaxed treatment (silently
-/// ignored symlinks and hostile names), so a hands-off tree cannot
-/// hard-error the very refusal that protects it.
-fn first_encrypted_under(
+/// What the deep probe beneath an entry found: content probing as
+/// encrypted, or a repository boundary it could not see past.
+enum ProbeFinding {
+    /// A path whose content probes as encrypted.
+    Encrypted(String),
+    /// A nested-repository root the walk did not enter.
+    Boundary(String),
+}
+
+/// Probes every path equal to or beneath `rel` (directories expanded).
+/// Content hidden by an exclusion would be stranded all the same, so
+/// the excluded files are probed too; `excludes` steers only the walk
+/// *rules* — the caller passes the entries whose subtrees deserve the
+/// relaxed treatment (silently ignored symlinks and hostile names), so
+/// a hands-off tree cannot hard-error the very refusal that protects
+/// it. A repository boundary is reported before any probe hit: it
+/// blinds the probe, so nothing behind it can be vouched for.
+fn probe_under(
     domain: &super::Domain,
     rel: &str,
     excludes: &[String],
-) -> Result<Option<String>> {
+) -> Result<Option<ProbeFinding>> {
     let expanded = select::expand(
         domain.root(),
         &[(rel.to_owned(), Origin::Managed)],
         excludes,
     )?;
+    if let Some(boundary) = expanded.skipped_boundaries.first() {
+        return Ok(Some(ProbeFinding::Boundary(boundary.clone())));
+    }
     let candidates = expanded
         .files
         .iter()
@@ -473,7 +472,7 @@ fn first_encrypted_under(
     for (abs, rel) in candidates {
         let prefix = fsops::read_prefix(abs, crate::consts::PROBE_PREFIX_LEN)?;
         if probe(&prefix).is_hit() {
-            return Ok(Some(rel.clone()));
+            return Ok(Some(ProbeFinding::Encrypted(rel.clone())));
         }
     }
     Ok(None)

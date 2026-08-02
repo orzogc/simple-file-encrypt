@@ -319,6 +319,14 @@ pub(crate) enum ExcludedCiphertext {
     /// Only the first unit authenticates (under the given ring entry):
     /// ours, but damaged or mixing key epochs — manual resolution.
     FirstUnitOnly(usize),
+    /// An over-cap binary probe hit with a valid header whose first
+    /// full chunk does not authenticate: indistinguishable from a
+    /// single-chunk ciphertext of this domain with data appended past
+    /// the cap (the original chunk's extent — and thus its last-chunk
+    /// associated data — cannot be recovered from a prefix). Treated
+    /// like this domain's ciphertext where it matters: key rotation
+    /// must not converge past what it cannot rule out.
+    Ambiguous,
     /// Authenticates under no ring key: foreign or moved content.
     Foreign,
 }
@@ -359,11 +367,14 @@ pub(crate) fn classify_excluded_ciphertext(
 /// convergence exactly like an in-cap damaged file, while an over-cap
 /// foreign blob authenticates under no key and blocks nothing.
 ///
-/// Residual gaps, both harmless or documented: an empty-file marker
-/// header with appended data reads as foreign (the recoverable
-/// plaintext is empty either way), and a single-chunk binary
-/// ciphertext carries a last-chunk AD whose extent a prefix cannot
-/// recover, so with enough appended data it reads as foreign too
+/// A binary prefix with a valid header whose first chunk fails
+/// authentication is `Ambiguous`, not `Foreign`: it may be a
+/// single-chunk ciphertext of this domain with appended data, and an
+/// over-cap file cannot be intact ciphertext of *any* domain (the cap
+/// binds both sides), so a well-formed v1 binary header there is
+/// realistically ciphertext-plus-junk of some kind. The one residual
+/// read as foreign is an empty-file marker header with appended data:
+/// the recoverable plaintext is empty, so nothing is lost
 /// (see `docs/cli.md`).
 pub(crate) fn classify_oversize_excluded(
     keys: &[DomainKey],
@@ -387,16 +398,26 @@ pub(crate) fn classify_oversize_excluded(
         _ => return Ok(ExcludedCiphertext::Foreign),
     };
     let prefix = fsops::read_prefix(abs, window)?;
-    let first = match kind {
-        Probe::Binary => crate::binmode::authenticate_first_bounded(keys, rel, &prefix),
+    Ok(match kind {
+        Probe::Binary => match crate::binmode::authenticate_first_bounded(keys, rel, &prefix) {
+            Ok(idx) => ExcludedCiphertext::FirstUnitOnly(idx),
+            // A valid header whose chunk fails authentication cannot
+            // be told apart from an appended-to single-chunk
+            // ciphertext of this domain: ambiguous, never plain
+            // foreign. Structural failures (bad magic, version,
+            // flags) are decisive.
+            Err(Error::Auth { .. }) => ExcludedCiphertext::Ambiguous,
+            Err(_) => ExcludedCiphertext::Foreign,
+        },
         // The text checker only inspects the header line and the first
-        // unit line, so a prefix is enough.
-        Probe::TextV1 => crate::textmode::authenticate_first(keys, rel, &prefix),
+        // unit line, so a prefix is enough — and it is decisive: text
+        // units carry no last-flag, so any valid first unit either
+        // authenticates or the content is not this domain's.
+        Probe::TextV1 => match crate::textmode::authenticate_first(keys, rel, &prefix) {
+            Ok(idx) => ExcludedCiphertext::FirstUnitOnly(idx),
+            Err(_) => ExcludedCiphertext::Foreign,
+        },
         _ => unreachable!("handled above"),
-    };
-    Ok(match first {
-        Ok(idx) => ExcludedCiphertext::FirstUnitOnly(idx),
-        Err(_) => ExcludedCiphertext::Foreign,
     })
 }
 

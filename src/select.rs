@@ -107,8 +107,15 @@ pub struct Expanded {
     /// counting-only expansions ([`expand_count_only`]).
     pub excluded: Vec<ExcludedFile>,
     /// Excluded regular files encountered (deduplicated when records
-    /// are kept; raw encounters otherwise).
+    /// are kept; raw walk-deduplicated encounters otherwise).
     pub excluded_count: usize,
+    /// Nested-repository roots discovered inside managed (selecting)
+    /// walks, in encounter order. Their contents were never audited —
+    /// a directory can be encrypted first and only later become a
+    /// repository boundary — so key-rotation convergence must refuse
+    /// to vouch past them. Boundaries beneath an exclusion stay
+    /// unrecorded: excluded trees are hands-off by declaration.
+    pub skipped_boundaries: Vec<String>,
     /// Directories to sweep for stale temp files: the domain root, the
     /// parents of all entries, and every directory visited.
     pub sweep_dirs: BTreeSet<PathBuf>,
@@ -191,6 +198,8 @@ fn expand_with_budgets(
         files: BTreeMap::new(),
         excluded: BTreeMap::new(),
         excluded_count: 0,
+        skipped_boundaries: Vec::new(),
+        visited_dirs: HashMap::new(),
         missing_managed: Vec::new(),
         missing_explicit: Vec::new(),
         skipped_special: Vec::new(),
@@ -247,6 +256,7 @@ fn expand_with_budgets(
         skipped_special: exp.skipped_special,
         excluded: exp.excluded.into_values().collect(),
         excluded_count,
+        skipped_boundaries: exp.skipped_boundaries,
         sweep_dirs: exp.sweep_dirs,
     })
 }
@@ -263,6 +273,20 @@ struct Expander<'a> {
     /// Excluded files encountered (fresh records in `Record` mode, raw
     /// encounters in `CountOnly` mode).
     excluded_count: usize,
+    /// Nested-repository roots found inside selecting walks.
+    skipped_boundaries: Vec<String>,
+    /// Every directory already walked, keyed by `(device, inode)` and
+    /// holding the canonical path it was walked under: overlapping
+    /// roots (`paths = ["d", "d/sub"]`, overlapping exclusions) reach
+    /// a directory again under the *same* path and skip the repeat, so
+    /// counts stay accurate and the scan budget charges actual work —
+    /// while two *different* canonical paths naming one directory
+    /// (case-insensitive aliases, bind mounts) stay a hard error, as
+    /// for files: silent dedup would let walk order decide which
+    /// spelling gets selected or excluded. A path-identical repeat is
+    /// mode-identical too (exclusion coverage is a function of the
+    /// path), so a skip never crosses walk modes.
+    visited_dirs: HashMap<(u64, u64), String>,
     missing_managed: Vec<String>,
     missing_explicit: Vec<String>,
     skipped_special: Vec<SkippedSpecial>,
@@ -384,6 +408,14 @@ impl<'a> Expander<'a> {
         Ok(())
     }
 
+    /// Records a nested-repository root discovered inside a selecting
+    /// walk, charging its path bytes.
+    fn skip_boundary(&mut self, rel: String) -> Result<()> {
+        self.charge_path(rel.len())?;
+        self.skipped_boundaries.push(rel);
+        Ok(())
+    }
+
     /// Handles one entry: a file, a directory (recursed), or a missing
     /// path.
     fn add_entry(&mut self, rel: &str, origin: Origin) -> Result<()> {
@@ -435,7 +467,7 @@ impl<'a> Expander<'a> {
                     return Ok(());
                 }
                 self.check_foreign_config(rel, &abs)?;
-                return self.walk_dir(rel, &abs, origin, 0, Some(via));
+                return self.walk_dir(rel, &abs, dir_id(&md), origin, 0, Some(via));
             }
             // The entry itself may be a nested-repository root or hold a
             // foreign config (the domain root is exempt); ancestors were
@@ -443,7 +475,7 @@ impl<'a> Expander<'a> {
             if !rel.is_empty() {
                 self.check_boundary(rel, &abs)?;
             }
-            return self.walk_dir(rel, &abs, origin, 0, None);
+            return self.walk_dir(rel, &abs, dir_id(&md), origin, 0, None);
         }
         if ft.is_file() {
             if let Some(via) = excluded_via {
@@ -618,10 +650,29 @@ impl<'a> Expander<'a> {
         &mut self,
         rel: &str,
         abs: &Path,
+        id: (u64, u64),
         origin: Origin,
         depth: usize,
         excluded_via: Option<&'a str>,
     ) -> Result<()> {
+        // A directory already walked under this same path (overlapping
+        // roots reach it again through covering entries) was walked in
+        // full: skip it, so nothing is double-counted or
+        // double-charged. The same directory under a *different* path
+        // is aliasing and fails, exactly like aliased files.
+        match self.visited_dirs.get(&id) {
+            Some(prev) if prev == rel => return Ok(()),
+            Some(prev) => {
+                return Err(Error::Usage(format!(
+                    "`{rel}` and `{prev}` are the same directory (hard links or case-insensitive \
+                     aliases); resolve the aliasing first"
+                )));
+            }
+            None => {
+                self.charge_path(rel.len())?;
+                self.visited_dirs.insert(id, rel.to_owned());
+            }
+        }
         if depth > MAX_WALK_DEPTH {
             return Err(Error::Limit(format!(
                 "`{rel}`: directory nesting exceeds the {MAX_WALK_DEPTH}-level cap"
@@ -681,10 +732,14 @@ impl<'a> Expander<'a> {
                 let crel = child_rel(&ns);
                 // A subdirectory with a `.git` entry is a nested
                 // repository: never entered (silently so under an
-                // exclusion — nothing would be selected from it).
+                // exclusion — hands-off by declaration). In a selecting
+                // walk it is recorded: its contents were never audited,
+                // and a directory can be encrypted first and become a
+                // boundary later, so convergence must not vouch for it.
                 if paths::exists_probe(&child_abs.join(".git"))? {
                     if excluded_via.is_none() {
                         report::note(format!("skipping nested repository `{crel}`"));
+                        self.skip_boundary(crel)?;
                     }
                     continue;
                 }
@@ -695,7 +750,14 @@ impl<'a> Expander<'a> {
                     )));
                 }
                 let child_via = excluded_via.or_else(|| self.exact_exclude(&crel));
-                self.walk_dir(&crel, &child_abs, child_origin, depth + 1, child_via)?;
+                self.walk_dir(
+                    &crel,
+                    &child_abs,
+                    dir_id(&md),
+                    child_origin,
+                    depth + 1,
+                    child_via,
+                )?;
                 continue;
             }
             // Non-directory entries with non-UTF-8 names cannot become
@@ -757,6 +819,12 @@ impl<'a> Expander<'a> {
         }
         Ok(())
     }
+}
+
+/// The `(device, inode)` identity of a directory, for walk dedup.
+fn dir_id(md: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (md.dev(), md.ino())
 }
 
 /// A discovered name that contains a control character is a hard
@@ -1305,6 +1373,50 @@ mod tests {
         let exp = expand_count_only(root, &entries, &excludes).unwrap();
         assert_eq!(exp.files.len(), 1);
         assert_eq!(exp.excluded_count, 1);
+    }
+
+    #[test]
+    fn overlapping_roots_walk_each_directory_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(&root.join("d/keep.txt"));
+        touch(&root.join("d/sub/x.txt"));
+        // Overlapping managed roots are legal (hand edits, history):
+        // the walk dedups real directories by identity, so counts and
+        // budgets charge actual work, not visits.
+        let entries = [
+            ("d".to_owned(), Origin::Managed),
+            ("d/sub".to_owned(), Origin::Managed),
+        ];
+        let excludes = ["d/sub/x.txt".to_owned()];
+        let exp = expand_count_only(root, &entries, &excludes).unwrap();
+        assert_eq!(exp.files.len(), 1);
+        assert_eq!(exp.excluded_count, 1);
+        let exp = expand(root, &entries, &excludes).unwrap();
+        assert_eq!(exp.excluded.len(), 1);
+        assert_eq!(exp.excluded_count, 1);
+    }
+
+    #[test]
+    fn nested_repositories_in_managed_walks_are_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(&root.join("d/vendor/.git"));
+        touch(&root.join("d/vendor/inner.txt"));
+        touch(&root.join("d/keep.txt"));
+        // A selecting walk records the boundary: its contents were
+        // never audited, and a directory can be encrypted first and
+        // become a repository later — convergence must know.
+        let exp = expand(root, &[("d".into(), Origin::Managed)], &[]).unwrap();
+        let rels: Vec<&str> = exp.files.iter().map(|f| f.rel.as_str()).collect();
+        assert_eq!(rels, ["d/keep.txt"]);
+        assert_eq!(exp.skipped_boundaries, ["d/vendor".to_string()]);
+
+        // Beneath an exclusion the tree is hands-off by declaration:
+        // no boundary is recorded (documented residual).
+        let excludes = ["d".to_owned()];
+        let exp = expand(root, &[("d".into(), Origin::Exclusion)], &excludes).unwrap();
+        assert!(exp.skipped_boundaries.is_empty());
     }
 
     #[test]

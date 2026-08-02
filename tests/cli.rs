@@ -2118,23 +2118,108 @@ fn oversize_foreign_excluded_probe_hits_block_nothing() {
     run_nopw(root, &["add", "d"]).expect_code(0);
 
     // A sparse file over the 256 MiB cap that starts with the binary
-    // magic but authenticates under no ring key: foreign, and foreign
+    // magic but has an invalid header (version 0): structurally not v1
+    // ciphertext of any domain — decisively foreign, and foreign
     // content must block nothing.
     fs::create_dir_all(root.join("d")).unwrap();
     let mut f = fs::File::create(root.join("d/huge.bin")).unwrap();
     f.write_all(&BIN_MAGIC).unwrap();
-    f.write_all(&[0x01]).unwrap(); // valid version byte, junk chunk
-    f.set_len(256 * 1024 * 1024 + 1).unwrap();
+    f.set_len(256 * 1024 * 1024 + 1).unwrap(); // version byte stays 0
     drop(f);
     run_nopw(root, &["add", "--exclude", "--force", "d/huge.bin"]).expect_code(0);
 
     run_pw(root, PW, &["encrypt"]).expect_code(0);
-    let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
-    assert_contains(&r.stderr, "first unit does not authenticate");
+    run_pw(root, PW, &["decrypt"]).expect_code(0);
     run_pw(root, PW, &["encrypt"]).expect_code(0);
     let r = run_pw(root, PW, &["verify"]).expect_code(0);
     assert_contains(&r.stdout, "ignored");
     run_pw(root, PW, &["rekey"]).expect_code(0);
+    run_pw(root, PW, &["rekey", "--continue"]).expect_code(0);
+    run_pw(root, PW, &["rekey", "--prune"]).expect_code(0);
+}
+
+#[test]
+fn oversize_ambiguous_binary_blocks_convergence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    // A single-chunk binary ciphertext (NUL content below one chunk).
+    write_file(root, "d/tiny.bin", &[0u8, 1, 2, 3]);
+    write_file(root, "d/other.txt", b"other\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "--force", "d/tiny.bin"]).expect_code(0);
+
+    // Grown past the cap, its single chunk's extent — and thus its
+    // last-chunk AD — cannot be recovered from a prefix: ambiguous,
+    // and convergence must not treat "cannot rule out ours" as
+    // foreign (the previous behavior let `rekey --prune` drop the key
+    // this ciphertext needs).
+    let original = read_file(root, "d/tiny.bin");
+    grow_past_cap(root, "d/tiny.bin");
+
+    let r = run_pw(root, PW, &["verify"]).expect_code(1);
+    assert_contains(&r.stdout, "FAILED d/tiny.bin");
+    assert_contains(&r.stdout, "cannot be authenticated");
+    let r = run_pw(root, PW, &["rekey"]).expect_code(0);
+    assert_contains(&r.stderr, "cannot be authenticated");
+    let r = run_pw(root, PW, &["rekey", "--continue"]).expect_code(1);
+    assert_contains(&r.stderr, "indistinguishable from foreign content");
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot prune");
+    let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
+    assert_contains(&r.stderr, "restore the original bytes");
+
+    // Restoring the original bytes resolves the ambiguity.
+    fs::write(root.join("d/tiny.bin"), &original).unwrap();
+    let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
+    assert_contains(&r.stdout, "decrypted d/tiny.bin (excluded; recovered)");
+    assert_eq!(read_file(root, "d/tiny.bin"), [0u8, 1, 2, 3]);
+    run_pw(root, PW, &["rekey", "--continue"]).expect_code(0);
+    run_pw(root, PW, &["rekey", "--prune"]).expect_code(0);
+}
+
+#[test]
+fn nested_repository_boundaries_block_convergence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/vendor/s.txt", b"secret\n");
+    write_file(root, "d/other.txt", b"other\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+
+    // The directory was encrypted first and became a repository
+    // boundary afterwards: the walk can no longer see inside, so
+    // convergence must refuse instead of letting `rekey --prune` drop
+    // the key `d/vendor/s.txt` still needs.
+    write_file(root, "d/vendor/.git", b"gitdir: elsewhere\n");
+
+    let r = run_nopw(root, &["status"]).expect_code(0);
+    assert!(status_line(&r.stdout, "boundary", "d/vendor"));
+    let r = run_pw(root, PW, &["verify"]).expect_code(0);
+    assert_contains(&r.stdout, "boundary d/vendor");
+    let r = run_pw(root, PW, &["rekey"]).expect_code(0);
+    assert_contains(&r.stderr, "not audited");
+    let r = run_pw(root, PW, &["rekey", "--continue"]).expect_code(1);
+    assert_contains(&r.stderr, "nested repository `d/vendor`");
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot prune");
+
+    // `remove` of the covering entry is refused too: the probe cannot
+    // see past the boundary, and removal would hide whatever it holds
+    // from `rekey` — the exact bypass the refusal exists to close.
+    let r = run_nopw(root, &["remove", "d"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot be probed");
+    assert_contains(&r.stderr, "`remove --force`");
+
+    // Removing the boundary lets decrypt reach the file again (the old
+    // key is still in the ring because prune refused), after which the
+    // rotation converges.
+    fs::remove_file(root.join("d/vendor/.git")).unwrap();
+    let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
+    assert_contains(&r.stdout, "decrypted d/vendor/s.txt");
+    assert_eq!(read_file(root, "d/vendor/s.txt"), b"secret\n");
     run_pw(root, PW, &["rekey", "--continue"]).expect_code(0);
     run_pw(root, PW, &["rekey", "--prune"]).expect_code(0);
 }
