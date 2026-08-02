@@ -9,7 +9,7 @@ format has its own single version (currently **1**, see
 [docs/format.md](docs/format.md)), covering the config schema, both
 ciphertext layouts, and all derivation strings.
 
-## [Unreleased]
+## [0.2.0] - 2026-08-02
 
 ### Added
 
@@ -25,6 +25,30 @@ ciphertext layouts, and all derivation strings.
   excluded paths, `verify` flags this domain's ciphertext hidden by an
   exclusion, and `rekey --continue`/`--prune` refuse to converge past
   it. See `docs/cli.md` and `docs/format.md`.
+- **Excluded-content ownership classification**, the machinery behind
+  those guards. Every excluded probe hit is checked against the whole
+  key ring: full decryption — or **any surviving unit** (text line or
+  binary chunk) — proves the content is this domain's, fails
+  `verify`, and blocks `rekey --continue`/`--prune` until it is
+  decrypted, restored, or un-excluded. The scan is built to find
+  survivors: shredded lines are skipped for free with no line-count
+  cutoff, binary chunks are matched header-blind on the fixed chunk
+  grid plus a length-only layout (a damaged header or first unit
+  hides nothing), and a damaged text header still gets its unit lines
+  scanned. "Foreign" — the verdict that lets rotation proceed — is
+  only ever the result of a *complete* scan within a per-file
+  cryptographic work budget; a scan cut short by the budget, or
+  bounded to the cap-sized window of an over-cap file, blocks
+  convergence as **ambiguous** instead, and no over-cap probe hit is
+  ever read as foreign (a prefix can prove ownership, never disprove
+  it). Independent exclusions outside every managed entry are
+  expanded as audit roots so the same guards see them; excluded
+  records are capped and budgeted like selected files; the work
+  budget joins the resource-limits table in `docs/format.md`. The
+  genuinely indistinguishable residual shapes are documented in
+  `docs/cli.md` and the threat model, and the scanners are pinned by
+  budget-cut property tests and seeded fuzz targets. Hardened across
+  four rounds of external review.
 
 ### Changed
 
@@ -41,156 +65,43 @@ ciphertext layouts, and all derivation strings.
 
 ### Fixed
 
-- **Independent exclusions are audited.** An `excludes` entry outside
-  every managed entry was previously never walked, so `status`,
-  `verify`, argument-less `decrypt`, and `rekey` were blind to
-  ciphertext hidden there — `rekey --prune` could drop the old key such
-  a file needed. The audit-style commands now expand those entries as
-  roots of their own, restoring every documented guard (found by
-  external review).
-- **Over-cap excluded probe hits are no longer assumed foreign.** A
-  valid ciphertext with data appended past the 256 MiB cap is
-  recognized from a bounded prefix and blocks key-rotation convergence
-  like any damaged file, instead of letting `rekey --prune` discard
-  its key.
-- **Excluded records are bounded.** Excluded files retained for the
-  audit-style commands are capped at 65536 (like selected files) and
-  every retained string is charged against the 64 MiB expansion
-  budget; `encrypt` keeps only a count and `check` retains nothing, so
-  a huge excluded tree no longer materializes unbounded state.
-- Coverage lookups (`force_binary`, `excludes`) now binary-search the
-  sorted lists per path ancestor instead of scanning them, removing a
-  quadratic hot path a 65536-entry config could exploit.
-- Concurrent-modification detection also compares permissions and
-  hard-link count, and hard-link refusals use the read-time link count
-  instead of the expansion-time one, narrowing the race windows.
-- `add`'s informational "already managed/excluded" lines are deferred
-  until the config rewrite commits, and `decrypt`'s excluded-recovery
-  pass reports completed/failed/not-attempted like every other
-  multi-file pass.
-- Release archives now include `docs/`, `SECURITY.md`, `CHANGELOG.md`,
-  and the Chinese README (the README links them); the crates.io
-  package includes them too.
 - **Nested-repository boundaries no longer pass as convergence.** A
   directory can be encrypted first and only later become a submodule
   or nested checkout; the walk never enters boundaries, so
   `rekey --continue`/`--prune` previously vouched past ciphertext
-  hidden there and prune could drop its key. Boundaries inside managed
-  trees are now recorded: `status`/`verify` report them, a fresh
-  `rekey` warns, and `--continue`/`--prune` refuse (found by external
-  review).
-- **Ambiguous over-cap binary hits block convergence.** An over-cap
-  excluded binary probe hit with a valid header whose first chunk does
-  not authenticate is indistinguishable from a single-chunk ciphertext
-  of this domain with appended data; it previously passed as foreign,
-  letting `rekey --prune` drop the key. It is now classified as
-  ambiguous: `verify` fails it and `--continue`/`--prune` refuse until
-  the original bytes are restored or the file is moved out.
-- **Any surviving unit now proves excluded ciphertext is this
-  domain's.** Classification of excluded probe hits authenticated only
-  the first unit, so a ciphertext whose first line or chunk was
-  destroyed — but whose later units were intact — read as foreign:
-  `verify` passed and `rekey --prune` dropped the key the surviving
-  units still need. Every text line and binary chunk is now scanned
-  (over-cap text from a cap-sized prefix; over-cap binary keeps its
-  ambiguous fallback, which already blocks convergence), including
-  files whose header was damaged — an unrecognized-header text file
-  with authenticating unit lines is ours, not foreign. Truncated and
-  appended-to binaries are matched on the fixed chunk grid, and a
-  full single-chunk ciphertext with appended data is recognized as
-  well. What still reads as foreign is a hit with no surviving unit —
-  every unit destroyed, a damaged single-unit file, or a short
-  single-chunk binary ciphertext with appended data — see
-  `docs/cli.md` (found by external review).
+  hidden there and prune could drop its key. Boundaries inside
+  managed trees are now recorded — including a managed directory
+  entry that itself became a repository root, which previously
+  hard-errored every audit-style command — so `status`/`verify`
+  report them, a fresh `rekey` warns, and `--continue`/`--prune`
+  refuse; explicit arguments naming a repository root keep the hard
+  error (found by external review).
+- Concurrent-modification snapshots compare permissions, hard-link
+  count, and the inode change time on top of `(device, inode)`, size,
+  and mtime; whole-file reads re-stat their open descriptor on
+  completion; and hard-link refusals use the read-time link count
+  instead of the expansion-time one — narrowing the windows a
+  mid-operation rewrite, chmod, or new hard link could slip through
+  (a same-size rewrite that restores the mtime still moves the
+  ctime, which cannot be set from userspace).
+- Coverage lookups (`force_binary`, `excludes`) binary-search the
+  sorted lists per path ancestor instead of scanning them, and
+  `encrypt`'s auto-add batches new entries into one sorted merge
+  instead of a per-file `Vec::insert` — both were quadratic hot
+  paths under a 65536-entry config; `remove` finds managed entries
+  by binary search.
 - Overlapping expansion roots (`paths = ["d", "d/sub"]`, overlapping
-  exclusions) walk each real directory once, deduplicated by identity:
-  excluded counts stay accurate and the scan budget charges actual
-  work.
-- `encrypt`'s auto-add and the `add`/`remove` coverage lookups use the
-  sorted-list ancestor search instead of linear scans.
-- `encrypt`'s auto-add batches new entries into one sorted merge
-  instead of inserting each into the managed list separately — the
-  per-file insertion shifted the list's whole tail every time and went
-  quadratic on a large directory of new files; `remove` finds managed
-  entries by binary search.
-- **"Foreign" is now only ever the verdict of a complete unit scan.**
-  The any-unit scan stopped after `MAX_UNITS` lines and reported the
-  cutoff as "no match": 2^22 junk lines inserted before intact units
-  hid them past the horizon, verify passed, and `rekey --prune`
-  dropped the key those units still need — breaking the stated
-  invariant that any surviving unit blocks convergence. The scan now
-  skips undecodable lines for free (a surviving unit is found behind
-  any amount of shredded content, with no line cutoff at all) and
-  meters authentication attempts against a per-file work budget;
-  running out reports the scan as inconclusive, which blocks
-  convergence as ambiguous — the same conservative path over-cap
-  content takes. Over-cap text hits without a surviving unit in the
-  cap-sized prefix are likewise ambiguous now instead of foreign:
-  prepended damage can push real units past any prefix, so a prefix
-  can prove ownership but never disprove it. The budget also bounds
-  the scan's worst-case CPU against hostile floods of valid-looking
-  units (found by external review).
-- **An exact managed directory entry that becomes a repository root
-  is recorded as a boundary** — reported by `status`/`verify`, warned
-  about by a fresh `rekey`, refused by `--continue`/`--prune` — like
-  a boundary discovered inside a walk, instead of hard-erroring every
-  audit-style command. Explicit arguments naming a repository root
-  keep the hard error (found by external review).
-- `decrypt`'s note for an excluded unrecognized-header file points at
-  `verify` as the keyed arbiter of ours-vs-foreign, instead of
-  implying the shape was checked (it never was: `decrypt` cannot
-  repair a header, and reads no password for a keyless note).
-- `read_capped` re-stats the open descriptor after reading and fails
-  on any snapshot mismatch, so a same-size in-place rewrite during
-  the read no longer slips past the length check (best-effort, as
-  local TOCTOU stays outside the threat model).
+  exclusions) walk each real directory once, deduplicated by
+  identity: excluded counts stay accurate and the scan budget charges
+  actual work.
+- `add`'s informational "already managed/excluded" lines are deferred
+  until the config rewrite commits, so the output never claims a
+  change that failed to reach the disk.
+- Release archives now include `docs/`, `SECURITY.md`,
+  `CHANGELOG.md`, and the Chinese README (the README links them); the
+  crates.io package includes them too.
 - A `v*` tag push no longer runs the CI suite twice (once for the
   tag, once through the release workflow's call).
-- **Over-cap binary hits are scanned header-blind and never read as
-  foreign.** The bounded first-chunk check validated the header
-  before trying the chunk, so one flipped version/flags/reserved byte
-  on an over-cap ciphertext read as decisively foreign without a
-  single authentication attempt — hiding the intact first chunk
-  sitting right inside the 64 KiB window and letting `rekey --prune`
-  drop its key, in direct violation of the complete-scan-only rule
-  for "foreign". The window is now scanned as a header-blind grid,
-  and no over-cap probe hit is ever classified as foreign (a prefix
-  can prove ownership, never disprove it): magic-bearing over-cap
-  junk blocks convergence as ambiguous until moved out of the tree
-  (found by external review).
-- `Snapshot` comparisons include the inode change time: a concurrent
-  same-size rewrite that restores the mtime still fails the re-check
-  (ctime cannot be set from userspace).
-- The unit-scan work budget is documented in the resource-limits
-  table of `docs/format.md` — what it meters (cryptographic attempts
-  only; parsing is bounded by the read caps) and the verdict shift it
-  can cause (a hostile pseudo-unit flood turns blocking-ambiguous
-  instead of ignored-foreign); binary scans got the same budget-cut
-  property test as text ones, and both scanners gained fuzz targets
-  exercising arbitrary budget cutoffs.
-- **A flipped header byte on a small in-cap single-chunk ciphertext
-  no longer reads as foreign.** The binary scan located the last
-  chunk through the structure parser, which validated the header
-  first, so a small single-chunk ciphertext (nothing on the grid)
-  with a damaged version byte was never tried at all — the in-cap
-  sibling of the over-cap header-blind fix. Chunk boundaries come
-  from the total length alone, so the scan now derives them without
-  touching the header fields.
-- The `authenticate_any` fuzz targets run in CI beside the decrypt
-  ones, with committed authentic seeds (a surviving unit behind an
-  alien one, header-damaged chunks, budgets that die mid-scan) — a
-  mutation-only fuzzer cannot forge an AES-SIV unit, so without seeds
-  the `Found` verdicts were unreachable; their budget prefix grew to
-  three bytes so a budget-cut scan can afford a full-chunk attempt,
-  and the header-blind prefix grid is held to the same
-  found/no-match/inconclusive invariant instead of a bare no-panic
-  check.
-- The concurrent-modification snapshot documentation lists the full
-  compared set — `(device, inode)`, size, mtime, ctime, mode, link
-  count — and a value-level test pins the ctime field; the
-  probe-boundary residual is spelled out next to the scan guarantees
-  (content whose magic itself was destroyed reads as plaintext and
-  never reaches the ownership scans).
 
 ### Compatibility
 
@@ -234,5 +145,5 @@ Initial release.
   static Linux binaries (x86_64/aarch64, musl) and macOS (Apple
   silicon) — with SHA-256 checksums and provenance attestations.
 
-[Unreleased]: https://github.com/orzogc/simple-file-encrypt/compare/v0.1.0...HEAD
+[0.2.0]: https://github.com/orzogc/simple-file-encrypt/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/orzogc/simple-file-encrypt/releases/tag/v0.1.0
