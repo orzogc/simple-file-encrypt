@@ -40,7 +40,7 @@ $ cargo install simple-file-encrypt
 
 ```console
 $ cd your-repo
-$ simple-file-encrypt init                 # 每仓库一次；提示输入密码
+$ simple-file-encrypt init                 # 每个域一次；提示输入密码
 $ simple-file-encrypt add .env secrets/
 $ simple-file-encrypt e                    # 加密所有托管文件
 $ git add -A && git commit
@@ -84,7 +84,7 @@ secrets/**      -text
 
 ## 实际限制
 
-- 文件整体载入内存处理：单文件上限 256 MiB，文本文件上限 2²² 行。重命名托管文件需先解密（密钥绑定路径）。拒绝处理硬链接文件。仅支持 Linux 与 macOS。
+- 文件整体载入内存处理：单文件上限 256 MiB，文本文件上限 2²² 行。重命名托管文件需先解密（密钥绑定路径）。加密/迁移硬链接文件会被拒绝，解密仅警告。仅支持 Linux 与 macOS。
 - 诚实声明：本设计由标准化且经过充分分析的组件（RFC 5297 AES-CMAC-SIV、BLAKE3、Argon2id）以直接的方式组合而成，但组合整体未经过独立的密码学审查。
 
 ## 许可证

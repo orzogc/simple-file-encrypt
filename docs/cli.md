@@ -180,7 +180,25 @@ KDF-related global options, honored by every command that runs Argon2:
   violation, not an encryption choice), and nested repositories are
   still never entered. Traversal budgets apply unchanged, so a huge
   excluded tree can exceed them; the tool targets small secret sets.
-  Excluded files do not count toward the 65536-file operation cap.
+  Every command that consumes excluded content — the audit-style
+  commands (`status`, `verify`, argument-less `decrypt`, `rekey`),
+  explicit-argument scans, and the `add`/`remove` probes — retains one
+  record per excluded file, capped at its own 65536 like selected
+  files and charged in full against the retained-path budget;
+  `encrypt` keeps only a count and `check` nothing, so those retain no
+  excluded state at all.
+- The audit-style commands also expand every `excludes` entry that no
+  managed entry covers as a root of its own: an **independent
+  exclusion** — a path outside every managed entry — can hide this
+  domain's ciphertext just as well as one below a managed directory,
+  and the scans and key rotation must see it to warn, refuse, or
+  recover. A missing independent exclusion is silently fine
+  (pre-declared exclusions are legal), and so is one whose ancestor
+  has become a regular file or a nested-repository boundary — nothing
+  this domain encrypted can sit at such a path, and an inert hands-off
+  entry must not brick every scan. A symlinked ancestor is still
+  refused, exactly as for managed entries: stored entries are never
+  followed out of the domain.
 
 ### Encrypt-time bookkeeping (auto-add)
 
@@ -350,8 +368,13 @@ under a ring key is decrypted normally (reported as recovered), and
 counts as work to do for the password contract. One that fails
 authentication is noted and left untouched — deliberately excluded
 foreign-looking content (see `add --exclude --force`) must never block
-a full `decrypt`. Excluded plaintext is skipped (silently unless named)
-and exempt from `--require-encrypted`: its plaintext is intentional.
+a full `decrypt`. A hit too large to decrypt in memory is classified
+from a bounded prefix and noted (this domain's first unit → restore
+the original content manually; otherwise foreign). Excluded plaintext
+is skipped (silently unless named) and exempt from
+`--require-encrypted`: its plaintext is intentional. The repair pass
+runs after the main pass with the same serial stop-at-first-error
+semantics and completed / failed / not-attempted report.
 
 ### `add [--binary | --exclude [--force]] <PATHS…>`
 
@@ -499,10 +522,12 @@ authenticates the first unit).
 `check` exempts: an excluded file that probes as encrypted is
 authenticated against the ring. If it decrypts under any ring key —
 or its first unit authenticates but the file does not fully decrypt
-(damaged or mixing key epochs) — that is **this domain's ciphertext
-hidden from migration**, reported as a failure; content that
-authenticates under no key is deliberately excluded foreign-looking
-material and is only noted. Excluded plaintext is not reported at all.
+(damaged, mixing key epochs, or grown past the size cap, where only
+the first unit can be checked from a bounded prefix) — that is **this
+domain's ciphertext hidden from migration**, reported as a failure;
+content that authenticates under no key is deliberately excluded
+foreign-looking material and is only noted. Excluded plaintext is not
+reported at all.
 
 ### `passwd` (alias `p`)
 
@@ -565,13 +590,21 @@ says so) — `--continue` never loops advice with `--prune`. It likewise
 refuses to declare completion while a managed path exists only as a
 symlink or special file: its content was never verified.
 
-Excluded paths are checked against the ring on every `rekey`: content
-there that authenticates under any ring key (fully, or first-unit-only)
-is this domain's ciphertext **hidden from the migration pass**. A fresh
-`rekey` warns and proceeds (consistent with its tolerance for missing
-paths); `--continue` and `--prune` refuse — the fix is `decrypt` (which
-recovers excluded ciphertext) or `remove --exclude`. Excluded content
-that authenticates under no key is foreign and never blocks rotation.
+Excluded paths — including independent exclusions outside every
+managed entry, which are expanded as audit roots — are checked against
+the ring on every `rekey`: content there that authenticates under any
+ring key (fully, or first-unit-only) is this domain's ciphertext
+**hidden from the migration pass**. A fresh `rekey` warns and proceeds
+(consistent with its tolerance for missing paths); `--continue` and
+`--prune` refuse — the fix is `decrypt` (which recovers excluded
+ciphertext) or `remove --exclude`. Excluded content that authenticates
+under no key is foreign and never blocks rotation. A hit too large to
+read whole is classified by its first unit from a bounded prefix, so
+valid ciphertext with data appended past the size cap still blocks
+convergence; the one shape a prefix cannot recognize is a
+single-chunk *binary* ciphertext with appended data (its last-chunk
+extent is unrecoverable), which reads as foreign — text ciphertext of
+any size is recognized by its first line.
 
 A fresh `rekey`, by contrast, may start a new epoch while managed
 paths are missing or skipped: exit 0 then means the epoch started and
@@ -696,7 +729,7 @@ its config.
 ### Typical flow
 
 ```console
-$ simple-file-encrypt init                 # once per repository
+$ simple-file-encrypt init                 # once per domain
 $ simple-file-encrypt add .env secrets/
 $ simple-file-encrypt e                    # encrypt everything managed
 $ git add -A && git commit

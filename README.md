@@ -122,7 +122,8 @@ pre-commit hook that checks the **staged** tree) are in
 
 - Files are processed whole in memory: 256 MiB per file, 2²² lines per
   text file. Renaming a managed file requires decrypting first (keys
-  are path-bound). Hard-linked files are refused. Linux and macOS only.
+  are path-bound). Encrypting or migrating a hard-linked file is
+  refused; decrypting one only warns. Linux and macOS only.
 - Honesty note: the design composes standardized, well-analyzed pieces
   (RFC 5297 AES-CMAC-SIV, BLAKE3, Argon2id), but the composition as a
   whole has not received independent cryptographic review.

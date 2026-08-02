@@ -2,7 +2,7 @@
 //! into the deduplicated list of regular files one invocation operates
 //! on, applying the skip and boundary rules of `docs/cli.md`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::consts::{
@@ -13,7 +13,7 @@ use crate::{paths, report};
 
 /// Where a target entry came from; decides auto-add and
 /// `--assume-plaintext` eligibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Origin {
     /// From the config's managed list.
     Managed,
@@ -23,6 +23,11 @@ pub enum Origin {
         /// directory).
         named: bool,
     },
+    /// An `excludes` entry expanded as an audit root: everything
+    /// beneath it is excluded by construction, so the walk only feeds
+    /// the excluded list. A missing one is silently fine — exclusions
+    /// may be pre-declared for paths that do not exist yet.
+    Exclusion,
 }
 
 /// One regular file selected for processing.
@@ -38,8 +43,6 @@ pub struct TargetFile {
     /// Whether the file was reached via an explicit argument
     /// (auto-add applies to these).
     pub explicit: bool,
-    /// Hard-link count at scan time.
-    pub nlink: u64,
 }
 
 /// A managed path skipped because it is a symlink or special file:
@@ -68,8 +71,19 @@ pub struct ExcludedFile {
     pub via: String,
     /// Whether the file was literally named on the command line.
     pub named: bool,
-    /// Hard-link count at scan time.
-    pub nlink: u64,
+}
+
+/// Whether an expansion retains records for the excluded files it
+/// encounters. Only the commands that must see what exclusion hides
+/// (`status`, `verify`, `decrypt`, `rekey`, the `add`/`remove` probes)
+/// pay for the records; `encrypt` needs a count and `check` nothing,
+/// so they retain none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExcludedHandling {
+    /// Keep an [`ExcludedFile`] per file, capped and budgeted.
+    Record,
+    /// Count encounters only; nothing is retained.
+    CountOnly,
 }
 
 /// The result of expanding one invocation's entries.
@@ -89,8 +103,12 @@ pub struct Expanded {
     pub skipped_special: Vec<SkippedSpecial>,
     /// Regular files covered by an `excludes` entry, in ascending
     /// canonical-path order: never selected, but visible to the
-    /// commands that must see what exclusion hides.
+    /// commands that must see what exclusion hides. Empty in
+    /// counting-only expansions ([`expand_count_only`]).
     pub excluded: Vec<ExcludedFile>,
+    /// Excluded regular files encountered (deduplicated when records
+    /// are kept; raw encounters otherwise).
+    pub excluded_count: usize,
     /// Directories to sweep for stale temp files: the domain root, the
     /// parents of all entries, and every directory visited.
     pub sweep_dirs: BTreeSet<PathBuf>,
@@ -128,7 +146,30 @@ const MAX_SPECIAL_WARNINGS: usize = 20;
 /// `excludes` must be sorted, deduplicated canonical relative paths
 /// (the loaded config form); covered files are recorded, not selected.
 pub fn expand(root: &Path, entries: &[(String, Origin)], excludes: &[String]) -> Result<Expanded> {
-    expand_with_budgets(root, entries, excludes, Budgets::DEFAULT)
+    expand_with_budgets(
+        root,
+        entries,
+        excludes,
+        ExcludedHandling::Record,
+        Budgets::DEFAULT,
+    )
+}
+
+/// [`expand`], but excluded files are only counted, never retained:
+/// for `encrypt` (which wants a count) and `check` (which wants
+/// nothing), a huge excluded tree costs no memory beyond the walk.
+pub fn expand_count_only(
+    root: &Path,
+    entries: &[(String, Origin)],
+    excludes: &[String],
+) -> Result<Expanded> {
+    expand_with_budgets(
+        root,
+        entries,
+        excludes,
+        ExcludedHandling::CountOnly,
+        Budgets::DEFAULT,
+    )
 }
 
 /// [`expand`] with injectable budgets (see [`Budgets`]).
@@ -136,6 +177,7 @@ fn expand_with_budgets(
     root: &Path,
     entries: &[(String, Origin)],
     excludes: &[String],
+    excluded_handling: ExcludedHandling,
     budgets: Budgets,
 ) -> Result<Expanded> {
     debug_assert!(
@@ -145,8 +187,10 @@ fn expand_with_budgets(
     let mut exp = Expander {
         root,
         excludes,
+        excluded_handling,
         files: BTreeMap::new(),
         excluded: BTreeMap::new(),
+        excluded_count: 0,
         missing_managed: Vec::new(),
         missing_explicit: Vec::new(),
         skipped_special: Vec::new(),
@@ -157,7 +201,13 @@ fn expand_with_budgets(
         budgets,
     };
     exp.add_sweep_dir(root)?;
+    // Identical (entry, origin) pairs expand once: `encrypt d d` must
+    // not walk — or count — the same tree twice.
+    let mut seen_entries: HashSet<(&str, Origin)> = HashSet::new();
     for (rel, origin) in entries {
+        if !seen_entries.insert((rel.as_str(), *origin)) {
+            continue;
+        }
         exp.add_entry(rel, *origin)?;
     }
     let suppressed = exp
@@ -189,12 +239,14 @@ fn expand_with_budgets(
         }
     }
 
+    let excluded_count = exp.excluded_count;
     Ok(Expanded {
         files: exp.files.into_values().collect(),
         missing_managed: exp.missing_managed,
         missing_explicit: exp.missing_explicit,
         skipped_special: exp.skipped_special,
         excluded: exp.excluded.into_values().collect(),
+        excluded_count,
         sweep_dirs: exp.sweep_dirs,
     })
 }
@@ -204,8 +256,13 @@ struct Expander<'a> {
     root: &'a Path,
     /// Sorted, deduplicated `excludes` entries in force.
     excludes: &'a [String],
+    /// Whether excluded files are recorded or only counted.
+    excluded_handling: ExcludedHandling,
     files: BTreeMap<String, TargetFile>,
     excluded: BTreeMap<String, ExcludedFile>,
+    /// Excluded files encountered (fresh records in `Record` mode, raw
+    /// encounters in `CountOnly` mode).
+    excluded_count: usize,
     missing_managed: Vec<String>,
     missing_explicit: Vec<String>,
     skipped_special: Vec<SkippedSpecial>,
@@ -226,11 +283,7 @@ impl<'a> Expander<'a> {
     /// coverage is carried by the walk state and children need only
     /// [`Self::exact_exclude`].
     fn covering_exclude(&self, rel: &str) -> Option<&'a str> {
-        let excludes: &'a [String] = self.excludes;
-        excludes
-            .iter()
-            .find(|e| paths::is_covered_by(rel, e))
-            .map(String::as_str)
+        paths::covering_entry(self.excludes, rel)
     }
 
     /// The `excludes` entry exactly equal to `rel`, if any.
@@ -242,21 +295,29 @@ impl<'a> Expander<'a> {
             .map(|i| excludes[i].as_str())
     }
 
-    /// Records one excluded regular file, deduplicating repeats.
-    fn add_excluded(
-        &mut self,
-        rel: &str,
-        abs: PathBuf,
-        named: bool,
-        via: &str,
-        md: &std::fs::Metadata,
-    ) -> Result<()> {
-        use std::os::unix::fs::MetadataExt;
+    /// Records (or, in counting mode, merely counts) one excluded
+    /// regular file. Records are deduplicated, capped like selected
+    /// files, and charged for every byte they retain — the relative
+    /// path twice (map key and record), the absolute path, and the
+    /// covering entry — so a huge excluded tree exhausts a budget, not
+    /// memory.
+    fn add_excluded(&mut self, rel: &str, abs: PathBuf, named: bool, via: &str) -> Result<()> {
+        if self.excluded_handling == ExcludedHandling::CountOnly {
+            self.excluded_count += 1;
+            return Ok(());
+        }
         if let Some(existing) = self.excluded.get_mut(rel) {
             existing.named |= named;
             return Ok(());
         }
-        self.charge_path(rel.len())?;
+        if self.excluded.len() >= self.budgets.max_files {
+            return Err(Error::Limit(format!(
+                "more than {} excluded files recorded in one invocation",
+                self.budgets.max_files
+            )));
+        }
+        self.charge_path(rel.len() * 2 + abs.as_os_str().len() + via.len())?;
+        self.excluded_count += 1;
         self.excluded.insert(
             rel.to_owned(),
             ExcludedFile {
@@ -264,7 +325,6 @@ impl<'a> Expander<'a> {
                 abs,
                 via: via.to_owned(),
                 named,
-                nlink: md.nlink(),
             },
         );
         Ok(())
@@ -296,10 +356,18 @@ impl<'a> Expander<'a> {
 
     /// Records a missing entry, charging its path bytes.
     fn add_missing(&mut self, rel: &str, origin: Origin) -> Result<()> {
-        self.charge_path(rel.len())?;
         match origin {
-            Origin::Managed => self.missing_managed.push(rel.to_owned()),
-            Origin::Explicit { .. } => self.missing_explicit.push(rel.to_owned()),
+            // Pre-declared exclusions legitimately name paths that do
+            // not exist yet: nothing to audit, nothing to report.
+            Origin::Exclusion => return Ok(()),
+            Origin::Managed => {
+                self.charge_path(rel.len())?;
+                self.missing_managed.push(rel.to_owned());
+            }
+            Origin::Explicit { .. } => {
+                self.charge_path(rel.len())?;
+                self.missing_explicit.push(rel.to_owned());
+            }
         }
         Ok(())
     }
@@ -331,8 +399,17 @@ impl<'a> Expander<'a> {
         {
             self.add_sweep_dir(parent)?;
         }
-        if origin == Origin::Managed {
-            self.check_ancestors(rel)?;
+        // Stored entries — managed and exclusion roots alike — are
+        // re-checked for symlinked or replaced ancestors on every run;
+        // explicit arguments were checked at minting. A `false` means
+        // an exclusion root became unreachable (an ancestor is now a
+        // regular file or a nested repository): nothing this domain
+        // encrypted can sit at such a path, so it gets the same silent
+        // hands-off treatment as a missing pre-declared exclusion.
+        if matches!(origin, Origin::Managed | Origin::Exclusion)
+            && !self.check_ancestors(rel, origin)?
+        {
+            return Ok(());
         }
         let md = match abs.symlink_metadata() {
             Ok(md) => md,
@@ -371,9 +448,9 @@ impl<'a> Expander<'a> {
         if ft.is_file() {
             if let Some(via) = excluded_via {
                 let named = matches!(origin, Origin::Explicit { named: true });
-                return self.add_excluded(rel, abs, named, via, &md);
+                return self.add_excluded(rel, abs, named, via);
             }
-            return self.add_file(rel, abs, origin, &md);
+            return self.add_file(rel, abs, origin);
         }
         // Symlink or special file (FIFO, socket, device). Under an
         // exclusion it is simply not the tool's business: not selected,
@@ -391,7 +468,9 @@ impl<'a> Expander<'a> {
             Origin::Explicit { .. } => Err(Error::Usage(format!(
                 "`{rel}` is {kind}; only regular files can be processed"
             ))),
-            Origin::Managed => self.skip_special(
+            // The `Exclusion` arm is defensive: an exclusion root is
+            // covered by itself, so specials return above.
+            Origin::Managed | Origin::Exclusion => self.skip_special(
                 rel.to_owned(),
                 ft.is_symlink(),
                 format!("skipping managed path `{rel}`: {kind}"),
@@ -399,35 +478,47 @@ impl<'a> Expander<'a> {
         }
     }
 
-    /// For a managed entry, requires that every intermediate directory
-    /// between the root and the entry is a real directory (never a
-    /// symlink) crossing no repository boundary and holding no foreign
-    /// domain config. A stored entry is re-checked on every run: a
-    /// directory replaced by a symlink since it was added must not
-    /// redirect operations outside the domain.
-    fn check_ancestors(&self, rel: &str) -> Result<()> {
+    /// For a stored entry (a managed one or an exclusion root),
+    /// requires that every intermediate directory between the root and
+    /// the entry is a real directory (never a symlink) crossing no
+    /// repository boundary and holding no foreign domain config. A
+    /// stored entry is re-checked on every run: a directory replaced by
+    /// a symlink since it was added must not redirect operations
+    /// outside the domain.
+    ///
+    /// Returns `false` when the entry should be silently skipped —
+    /// only for an exclusion root whose ancestor is now a regular file
+    /// or a nested-repository boundary: the excluded path cannot hold
+    /// anything this domain encrypted there, and a hard error would
+    /// brick every scan over an inert, hands-off entry. Managed entries
+    /// keep their hard errors, and a symlinked ancestor is refused for
+    /// both — a stored entry is never followed out of the domain.
+    fn check_ancestors(&self, rel: &str, origin: Origin) -> Result<bool> {
         let mut dir = self.root.to_path_buf();
         let Some((parents, _last)) = rel.rsplit_once('/') else {
-            return Ok(());
+            return Ok(true);
         };
         for comp in parents.split('/') {
             dir.push(comp);
             let md = match dir.symlink_metadata() {
                 Ok(md) => md,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(()); // Missing prefix: handled as a missing entry.
+                    return Ok(true); // Missing prefix: handled as a missing entry.
                 }
                 Err(e) => return Err(Error::io("inspecting", &dir, e)),
             };
             let ft = md.file_type();
             if ft.is_symlink() {
                 return Err(Error::Usage(format!(
-                    "managed path `{rel}` passes through the symlink `{}`; \
+                    "stored path `{rel}` passes through the symlink `{}`; \
                      refusing to follow it outside the domain",
                     report::escape_path(&dir)
                 )));
             }
             if !ft.is_dir() {
+                if origin == Origin::Exclusion {
+                    return Ok(false);
+                }
                 // Mirrors `add`'s "a file cannot cover them" conflict:
                 // a clear error beats the raw ENOTDIR the entry's own
                 // stat would otherwise produce.
@@ -437,9 +528,16 @@ impl<'a> Expander<'a> {
                     report::escape_path(&dir)
                 )));
             }
-            self.check_boundary(rel, &dir)?;
+            if origin == Origin::Exclusion {
+                if paths::exists_probe(&dir.join(".git"))? {
+                    return Ok(false);
+                }
+                self.check_foreign_config(rel, &dir)?;
+            } else {
+                self.check_boundary(rel, &dir)?;
+            }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Errors when `dir` (a directory below the root) is a nested
@@ -467,17 +565,12 @@ impl<'a> Expander<'a> {
         Ok(())
     }
 
-    /// Records one regular file, deduplicating repeats.
-    fn add_file(
-        &mut self,
-        rel: &str,
-        abs: PathBuf,
-        origin: Origin,
-        md: &std::fs::Metadata,
-    ) -> Result<()> {
-        use std::os::unix::fs::MetadataExt;
+    /// Records one regular file, deduplicating repeats. The retained
+    /// bytes — the relative path twice (map key and record) and the
+    /// absolute path — are all charged.
+    fn add_file(&mut self, rel: &str, abs: PathBuf, origin: Origin) -> Result<()> {
         let (named, explicit) = match origin {
-            Origin::Managed => (false, false),
+            Origin::Managed | Origin::Exclusion => (false, false),
             Origin::Explicit { named } => (named, true),
         };
         if let Some(existing) = self.files.get_mut(rel) {
@@ -492,7 +585,7 @@ impl<'a> Expander<'a> {
                 self.budgets.max_files
             )));
         }
-        self.charge_path(rel.len())?;
+        self.charge_path(rel.len() * 2 + abs.as_os_str().len())?;
         self.files.insert(
             rel.to_owned(),
             TargetFile {
@@ -500,7 +593,6 @@ impl<'a> Expander<'a> {
                 abs,
                 named,
                 explicit,
-                nlink: md.nlink(),
             },
         );
         Ok(())
@@ -540,6 +632,7 @@ impl<'a> Expander<'a> {
         let child_origin = match origin {
             Origin::Managed => Origin::Managed,
             Origin::Explicit { .. } => Origin::Explicit { named: false },
+            Origin::Exclusion => Origin::Exclusion,
         };
         for entry in std::fs::read_dir(abs).map_err(|e| Error::io("listing", abs, e))? {
             self.scanned += 1;
@@ -649,8 +742,8 @@ impl<'a> Expander<'a> {
             let via = excluded_via.or_else(|| self.exact_exclude(&crel));
             if md.file_type().is_file() {
                 match via {
-                    Some(v) => self.add_excluded(&crel, child_abs, false, v, &md)?,
-                    None => self.add_file(&crel, child_abs, child_origin, &md)?,
+                    Some(v) => self.add_excluded(&crel, child_abs, false, v)?,
+                    None => self.add_file(&crel, child_abs, child_origin)?,
                 }
             } else if via.is_some() {
                 // Symlink or special file under an exclusion: hands-off.
@@ -822,6 +915,7 @@ mod tests {
             root,
             std::slice::from_ref(&all),
             &[],
+            ExcludedHandling::Record,
             tiny(usize::MAX, usize::MAX, base + 4),
         )
         .unwrap_err();
@@ -837,6 +931,7 @@ mod tests {
             root,
             std::slice::from_ref(&all),
             &[],
+            ExcludedHandling::Record,
             tiny(usize::MAX, usize::MAX, base + 4),
         )
         .unwrap_err();
@@ -851,6 +946,7 @@ mod tests {
             root,
             std::slice::from_ref(&all),
             &[],
+            ExcludedHandling::Record,
             tiny(usize::MAX, usize::MAX, base + 4),
         )
         .unwrap_err();
@@ -864,6 +960,7 @@ mod tests {
             root,
             &[("missing-very-long-entry".into(), Origin::Managed)],
             &[],
+            ExcludedHandling::Record,
             tiny(usize::MAX, usize::MAX, base + 4),
         )
         .unwrap_err();
@@ -873,7 +970,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         touch(&root.join("ok.txt"));
-        let exp = expand_with_budgets(root, &[all], &[], Budgets::DEFAULT).unwrap();
+        let exp = expand_with_budgets(
+            root,
+            &[all],
+            &[],
+            ExcludedHandling::Record,
+            Budgets::DEFAULT,
+        )
+        .unwrap();
         assert_eq!(exp.files.len(), 1);
     }
 
@@ -890,6 +994,7 @@ mod tests {
             root,
             std::slice::from_ref(&all),
             &[],
+            ExcludedHandling::Record,
             tiny(2, usize::MAX, usize::MAX),
         )
         .unwrap_err();
@@ -899,6 +1004,7 @@ mod tests {
             root,
             std::slice::from_ref(&all),
             &[],
+            ExcludedHandling::Record,
             tiny(usize::MAX, 2, usize::MAX),
         )
         .unwrap_err();
@@ -907,7 +1013,14 @@ mod tests {
             "got: {err}"
         );
 
-        let exp = expand_with_budgets(root, &[all], &[], tiny(3, 3, usize::MAX)).unwrap();
+        let exp = expand_with_budgets(
+            root,
+            &[all],
+            &[],
+            ExcludedHandling::Record,
+            tiny(3, 3, usize::MAX),
+        )
+        .unwrap();
         assert_eq!(exp.files.len(), 3);
     }
 
@@ -1116,6 +1229,115 @@ mod tests {
     }
 
     #[test]
+    fn exclusion_roots_and_count_only_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(&root.join("indep/x.txt"));
+        let excludes = ["ghost.txt".to_owned(), "indep".to_owned()];
+        // Exclusion roots feed the excluded list; a missing root is
+        // silent (pre-declared exclusions are legal) and lands in no
+        // missing list.
+        let entries = [
+            ("indep".to_owned(), Origin::Exclusion),
+            ("ghost.txt".to_owned(), Origin::Exclusion),
+        ];
+        let exp = expand(root, &entries, &excludes).unwrap();
+        assert!(exp.files.is_empty());
+        let ex: Vec<&str> = exp.excluded.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(ex, ["indep/x.txt"]);
+        assert_eq!(exp.excluded_count, 1);
+        assert!(exp.missing_managed.is_empty() && exp.missing_explicit.is_empty());
+
+        // Counting mode retains nothing but still counts.
+        let exp = expand_count_only(root, &entries, &excludes).unwrap();
+        assert!(exp.excluded.is_empty());
+        assert_eq!(exp.excluded_count, 1);
+    }
+
+    #[test]
+    fn exclusion_roots_with_broken_ancestors_are_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // An ancestor became a regular file: the pre-declared exclusion
+        // `ghost/cache` cannot name anything this domain encrypted, so
+        // the root is silently unreachable instead of bricking scans.
+        touch(&root.join("ghost"));
+        // An ancestor became a nested repository: same treatment.
+        touch(&root.join("vendor/.git"));
+        touch(&root.join("vendor/blob.bin"));
+        let excludes = ["ghost/cache".to_owned(), "vendor/blob.bin".to_owned()];
+        let entries = [
+            ("ghost/cache".to_owned(), Origin::Exclusion),
+            ("vendor/blob.bin".to_owned(), Origin::Exclusion),
+        ];
+        let exp = expand(root, &entries, &excludes).unwrap();
+        assert!(exp.files.is_empty() && exp.excluded.is_empty());
+        assert!(exp.missing_managed.is_empty() && exp.skipped_special.is_empty());
+
+        // Managed entries keep their hard errors for the same shapes.
+        let err = expand(root, &[("ghost/cache".into(), Origin::Managed)], &[]).unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "got: {err}");
+
+        // A symlinked ancestor is refused for exclusion roots too:
+        // stored entries are never followed out of the domain.
+        std::os::unix::fs::symlink("/nonexistent", root.join("sym")).unwrap();
+        let err = expand(
+            root,
+            &[("sym/x".to_owned(), Origin::Exclusion)],
+            &["sym/x".to_owned()],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("symlink"), "got: {err}");
+    }
+
+    #[test]
+    fn duplicate_entries_expand_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(&root.join("d/keep.txt"));
+        touch(&root.join("d/skip.txt"));
+        let excludes = ["d/skip.txt".to_owned()];
+        let entries = [
+            ("d".to_owned(), Origin::Explicit { named: true }),
+            ("d".to_owned(), Origin::Explicit { named: true }),
+        ];
+        // `encrypt d d` walks (and counts) the tree once.
+        let exp = expand_count_only(root, &entries, &excludes).unwrap();
+        assert_eq!(exp.files.len(), 1);
+        assert_eq!(exp.excluded_count, 1);
+    }
+
+    #[test]
+    fn excluded_records_are_capped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(&root.join("ex/a"));
+        touch(&root.join("ex/b"));
+        touch(&root.join("ex/c"));
+        let excludes = ["ex".to_owned()];
+        let err = expand_with_budgets(
+            root,
+            &[(String::new(), Origin::Managed)],
+            &excludes,
+            ExcludedHandling::Record,
+            tiny(2, usize::MAX, usize::MAX),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("excluded files"), "got: {err}");
+        // Counting mode retains nothing, so no record cap applies.
+        let exp = expand_with_budgets(
+            root,
+            &[(String::new(), Origin::Managed)],
+            &excludes,
+            ExcludedHandling::CountOnly,
+            tiny(2, usize::MAX, usize::MAX),
+        )
+        .unwrap();
+        assert_eq!(exp.excluded_count, 3);
+        assert!(exp.excluded.is_empty());
+    }
+
+    #[test]
     fn excluded_paths_are_charged_against_budgets() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -1125,6 +1347,7 @@ mod tests {
             root,
             &[(String::new(), Origin::Managed)],
             &["exdir".to_owned()],
+            ExcludedHandling::Record,
             tiny(usize::MAX, usize::MAX, base + 8),
         )
         .unwrap_err();

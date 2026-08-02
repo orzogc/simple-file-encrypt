@@ -276,5 +276,9 @@ confidentiality for line-level diff and merge.
 A single format version (currently **1**) covers the config schema, both
 ciphertext formats, and all derivation/AD context strings. The tool
 refuses to operate on a config or ciphertext with a newer version, and
-refuses unknown config keys. Any breaking change bumps the version
-everywhere at once.
+refuses unknown config keys. Within a version the config schema may
+gain optional keys — older tools fail closed on them as unknown
+fields — so a config-only extension does not force a version bump that
+would needlessly declare all existing ciphertext incompatible. Any
+breaking change (removed keys, changed semantics, ciphertext or
+derivation changes) bumps the single version everywhere at once.

@@ -37,6 +37,10 @@ pub fn add(arg_paths: &[PathBuf], binary: bool, exclude: bool, force: bool) -> R
     }
 
     let mut announcements: Vec<String> = Vec::new();
+    // Informational lines ("already managed", …) are deferred too: an
+    // entry inserted earlier in this run may cover a later argument,
+    // and a report about it must not print unless the rewrite commits.
+    let mut reports: Vec<String> = Vec::new();
     let mut textish_added = false;
     for rel in &rels {
         if rel.is_empty() {
@@ -82,9 +86,9 @@ pub fn add(arg_paths: &[PathBuf], binary: bool, exclude: bool, force: bool) -> R
             .cloned()
         {
             if covering == *rel {
-                report::out(format!("`{rel}` is already managed"));
+                reports.push(format!("`{rel}` is already managed"));
             } else {
-                report::out(format!(
+                reports.push(format!(
                     "`{rel}` is already covered by the managed entry `{covering}`"
                 ));
             }
@@ -135,9 +139,9 @@ pub fn add(arg_paths: &[PathBuf], binary: bool, exclude: bool, force: bool) -> R
                 .cloned()
             {
                 if covering == *rel {
-                    report::out(format!("`{rel}` is already marked binary"));
+                    reports.push(format!("`{rel}` is already marked binary"));
                 } else {
-                    report::out(format!(
+                    reports.push(format!(
                         "`{rel}` is already covered by the force_binary entry `{covering}`"
                     ));
                 }
@@ -170,6 +174,9 @@ pub fn add(arg_paths: &[PathBuf], binary: bool, exclude: bool, force: bool) -> R
             report::out(line);
         }
     }
+    for line in reports {
+        report::out(line);
+    }
     // One note per command, at the decision point — not per file.
     if textish_added {
         report::note(super::TEXT_MODE_NOTE);
@@ -187,6 +194,7 @@ pub fn add(arg_paths: &[PathBuf], binary: bool, exclude: bool, force: bool) -> R
 /// to manage.
 fn add_excludes(domain: &mut super::Domain, rels: &[String], force: bool) -> Result<()> {
     let mut announcements: Vec<String> = Vec::new();
+    let mut reports: Vec<String> = Vec::new();
     let mut deferred_warnings: Vec<String> = Vec::new();
     for rel in rels {
         if rel.is_empty() {
@@ -222,9 +230,9 @@ fn add_excludes(domain: &mut super::Domain, rels: &[String], force: bool) -> Res
             .cloned()
         {
             if covering == *rel {
-                report::out(format!("`{rel}` is already excluded"));
+                reports.push(format!("`{rel}` is already excluded"));
             } else {
-                report::out(format!(
+                reports.push(format!(
                     "`{rel}` is already covered by the excludes entry `{covering}`"
                 ));
             }
@@ -305,6 +313,9 @@ fn add_excludes(domain: &mut super::Domain, rels: &[String], force: bool) -> Res
         for line in announcements {
             report::out(line);
         }
+    }
+    for line in reports {
+        report::out(line);
     }
     // Deferred like the announcements: an earlier error aborts the
     // rewrite, and the output must not claim a change that never

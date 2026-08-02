@@ -67,9 +67,7 @@ impl Config {
     /// Whether binary mode is forced for this canonical relative path
     /// (an exact entry or a covering directory entry).
     pub fn is_force_binary(&self, rel: &str) -> bool {
-        self.force_binary
-            .iter()
-            .any(|e| paths::is_covered_by(rel, e))
+        paths::covering_entry(&self.force_binary, rel).is_some()
     }
 
     /// Whether the exact entry is in the managed list.
@@ -80,10 +78,7 @@ impl Config {
     /// Returns the `excludes` entry covering this canonical relative
     /// path (an exact entry or a covering directory entry), if any.
     pub fn covering_exclude(&self, rel: &str) -> Option<&str> {
-        self.excludes
-            .iter()
-            .find(|e| paths::is_covered_by(rel, e))
-            .map(String::as_str)
+        paths::covering_entry(&self.excludes, rel)
     }
 }
 

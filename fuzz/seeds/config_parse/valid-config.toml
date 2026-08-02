@@ -21,9 +21,18 @@ paths = [
     "b.txt",
 ]
 
-# Maintained by hand or by `add --binary` / `remove --binary`: paths
-# (files or directories) always encrypted in binary (whole-file) mode,
-# even if their content looks like text. The tool only appends/removes.
+# Excluded paths: files and directories (recursive) never selected for
+# encryption, even under a managed directory. Maintained by the tool:
+# ascending byte order, deduplicated. Older versions of
+# simple-file-encrypt refuse a config that carries this key.
+excludes = [
+    "a dir/skip.md",
+    "vendor",
+]
+
+# Maintained by `add --binary` / `remove --binary`: paths (files or
+# directories) always encrypted in binary (whole-file) mode, even if
+# their content looks like text. Ascending byte order, deduplicated.
 force_binary = [
     "blob.bin",
 ]

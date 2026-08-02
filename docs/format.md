@@ -285,7 +285,8 @@ Hostile inputs must exhaust neither memory nor CPU. Hard limits
 | Files per operation (after expansion) | 65536 | all commands |
 | Directory entries examined per expansion or `init` scan | 1048576 (2²⁰) | expansion, `init` descendant scan |
 | Directory recursion depth | 128 | expansion, `init` descendant scan |
-| Path bytes retained per expansion (selected files, visited directories, skipped specials, missing entries) | 64 MiB | expansion |
+| Excluded-file records retained per expansion (audit-style commands; `encrypt`/`check` retain none) | 65536 | expansion |
+| Retained path bytes per expansion (selected and excluded records charge every string they keep — relative path twice, absolute path, covering entry — plus visited directories, skipped specials, missing entries) | 64 MiB | expansion |
 | Config file size | 1 MiB | config load |
 | `paths` + `force_binary` + `excludes` entries | 65536 | config load |
 | `wrapped_keys` entries | 64 | config load |
@@ -323,7 +324,13 @@ length per line, plus output) that can reach ~17–20x the input size
 ## Versioning
 
 Format version 1 covers the config schema, both ciphertext layouts, and
-all derivation/AD context strings (which embed `v1`). Any incompatible
-change bumps the version everywhere at once; the tool refuses newer
+all derivation/AD context strings (which embed `v1`). Within a version,
+the config schema may gain **optional keys** (`excludes` is one): a
+config not using them is byte-compatible in both directions, and an
+older tool rejects a config that carries one as an unknown field —
+fail-closed, though without the explicit "upgrade" hint a version bump
+would give. Removing a key, changing the meaning of an existing one, or
+touching a ciphertext layout or derivation string is an incompatible
+change and bumps the version everywhere at once; the tool refuses newer
 versions with a clear "upgrade simple-file-encrypt" error and refuses
 unknown or legacy layouts outright.

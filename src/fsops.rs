@@ -43,11 +43,17 @@ impl Snapshot {
     }
 
     /// Whether the file is still the one this snapshot was taken of.
+    /// Mode and link count are compared too: a hard link created (the
+    /// other name would keep a stale alias) or a permission change (a
+    /// concurrent `chmod` the restore step would silently undo)
+    /// mid-operation fails the file instead of being papered over.
     pub fn matches(&self, other: &Snapshot) -> bool {
         self.dev == other.dev
             && self.ino == other.ino
             && self.size == other.size
             && self.mtime == other.mtime
+            && self.mode == other.mode
+            && self.nlink == other.nlink
     }
 }
 

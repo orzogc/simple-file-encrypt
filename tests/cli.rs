@@ -2097,8 +2097,18 @@ fn exclude_probes_tolerate_hostile_names_in_hands_off_trees() {
     run_nopw(root, &["remove", "d"]).expect_code(0);
 }
 
+/// Grows the file to one byte past the 256 MiB cap (sparse), leaving
+/// its existing content as the prefix.
+fn grow_past_cap(root: &Path, rel: &str) {
+    let f = fs::OpenOptions::new()
+        .append(true)
+        .open(root.join(rel))
+        .unwrap();
+    f.set_len(256 * 1024 * 1024 + 1).unwrap();
+}
+
 #[test]
-fn oversize_excluded_probe_hits_are_foreign_by_construction() {
+fn oversize_foreign_excluded_probe_hits_block_nothing() {
     use std::io::Write as _;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -2108,24 +2118,80 @@ fn oversize_excluded_probe_hits_are_foreign_by_construction() {
     run_nopw(root, &["add", "d"]).expect_code(0);
 
     // A sparse file over the 256 MiB cap that starts with the binary
-    // magic: it probes as encrypted but cannot be this domain's
-    // ciphertext (both sides of the cap are enforced at crypto time).
+    // magic but authenticates under no ring key: foreign, and foreign
+    // content must block nothing.
     fs::create_dir_all(root.join("d")).unwrap();
     let mut f = fs::File::create(root.join("d/huge.bin")).unwrap();
     f.write_all(&BIN_MAGIC).unwrap();
+    f.write_all(&[0x01]).unwrap(); // valid version byte, junk chunk
     f.set_len(256 * 1024 * 1024 + 1).unwrap();
     drop(f);
     run_nopw(root, &["add", "--exclude", "--force", "d/huge.bin"]).expect_code(0);
 
-    // Deliberately excluded oversize content must block nothing.
     run_pw(root, PW, &["encrypt"]).expect_code(0);
     let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
-    assert_contains(&r.stderr, "cannot be this domain's ciphertext");
+    assert_contains(&r.stderr, "first unit does not authenticate");
     run_pw(root, PW, &["encrypt"]).expect_code(0);
     let r = run_pw(root, PW, &["verify"]).expect_code(0);
     assert_contains(&r.stdout, "ignored");
     run_pw(root, PW, &["rekey"]).expect_code(0);
     run_pw(root, PW, &["rekey", "--continue"]).expect_code(0);
+    run_pw(root, PW, &["rekey", "--prune"]).expect_code(0);
+}
+
+#[test]
+fn oversize_excluded_own_ciphertext_still_blocks_convergence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    // Two lines so the text ciphertext holds a complete first unit,
+    // and a NUL-bearing file large enough for two binary chunks, so
+    // the bounded first-chunk check has a full non-last chunk to
+    // authenticate.
+    write_file(root, "d/s.txt", b"secret one\nsecret two\n");
+    write_file(root, "d/b.bin", &vec![0u8; 130 * 1024]);
+    write_file(root, "d/other.txt", b"other\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "--force", "d/s.txt"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "--force", "d/b.bin"]).expect_code(0);
+
+    // Valid ciphertext with data appended past the size cap: its first
+    // unit still authenticates, so it is provably this domain's — the
+    // audited fix for "over-cap is assumed foreign", which would have
+    // let `rekey --prune` drop the key it needs. Both modes are
+    // exercised: text (header + first unit line) and binary (header +
+    // first full chunk).
+    let original = read_file(root, "d/s.txt");
+    let original_bin = read_file(root, "d/b.bin");
+    grow_past_cap(root, "d/s.txt");
+    grow_past_cap(root, "d/b.bin");
+
+    let r = run_pw(root, PW, &["verify"]).expect_code(1);
+    assert_contains(&r.stdout, "FAILED d/s.txt");
+    assert_contains(&r.stdout, "FAILED d/b.bin");
+    assert_contains(&r.stdout, "first unit authenticates");
+    // A fresh rekey warns and proceeds (an epoch can start with
+    // pending content); the convergence claims refuse.
+    let r = run_pw(root, PW, &["rekey"]).expect_code(0);
+    assert_contains(&r.stderr, "hidden from migration");
+    let r = run_pw(root, PW, &["rekey", "--continue"]).expect_code(1);
+    assert_contains(&r.stderr, "does not fully decrypt");
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot prune");
+    let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
+    assert_contains(&r.stderr, "exceeds the file-size cap");
+    assert_contains(&r.stderr, "restore the original content");
+
+    // Restoring the original bytes makes them recoverable again, and
+    // the rotation can converge.
+    fs::write(root.join("d/s.txt"), &original).unwrap();
+    fs::write(root.join("d/b.bin"), &original_bin).unwrap();
+    let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
+    assert_contains(&r.stdout, "decrypted d/s.txt (excluded; recovered)");
+    assert_contains(&r.stdout, "decrypted d/b.bin (excluded; recovered)");
+    assert_eq!(read_file(root, "d/s.txt"), b"secret one\nsecret two\n");
+    assert_eq!(read_file(root, "d/b.bin"), vec![0u8; 130 * 1024]);
     run_pw(root, PW, &["rekey", "--prune"]).expect_code(0);
 }
 
@@ -2244,4 +2310,90 @@ fn force_binary_normalization_and_dead_mark_warnings() {
     write_file(root, "ghost.csv", b"now here\n");
     let r = run_nopw(root, &["status"]).expect_code(0);
     assert!(!r.stderr.contains("matches nothing"), "{}", r.stderr);
+}
+
+#[test]
+fn independent_exclusions_are_audited() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "orphan.txt", b"secret\n");
+    write_file(root, "d/managed.txt", b"managed\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+
+    // The audited gap: encrypt a file, force-remove its entry, then
+    // force-exclude it — an exclusion no managed entry covers, which
+    // the expansion previously never walked.
+    run_pw(root, PW, &["encrypt", "orphan.txt"]).expect_code(0);
+    run_nopw(root, &["remove", "--force", "orphan.txt"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "--force", "orphan.txt"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+
+    // Every audit surface sees the independent exclusion.
+    let r = run_nopw(root, &["status"]).expect_code(0);
+    assert!(status_line(&r.stdout, "excluded", "orphan.txt"));
+    let r = run_pw(root, PW, &["verify"]).expect_code(1);
+    assert_contains(&r.stdout, "FAILED orphan.txt");
+    let r = run_pw(root, PW, &["rekey"]).expect_code(0);
+    assert_contains(&r.stderr, "hidden from migration");
+    let r = run_pw(root, PW, &["rekey", "--continue"]).expect_code(1);
+    assert_contains(&r.stderr, "orphan.txt");
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot prune");
+
+    // The argument-less decrypt is the repair channel here too.
+    let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
+    assert_contains(&r.stdout, "decrypted orphan.txt (excluded; recovered)");
+    assert_eq!(read_file(root, "orphan.txt"), b"secret\n");
+    run_pw(root, PW, &["rekey", "--continue"]).expect_code(0);
+    run_pw(root, PW, &["rekey", "--prune"]).expect_code(0);
+    run_pw(root, PW, &["verify"]).expect_code(0);
+
+    // A pre-declared exclusion for a nonexistent path stays silent:
+    // no bogus "missing managed path" warnings from the audit roots,
+    // and no refusal anywhere.
+    run_nopw(root, &["add", "--exclude", "ghost.txt"]).expect_code(0);
+    let r = run_pw(root, PW, &["verify"]).expect_code(0);
+    assert!(!r.stdout.contains("ghost.txt"), "{}", r.stdout);
+    assert!(!r.stderr.contains("ghost.txt"), "{}", r.stderr);
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(0);
+    assert!(!r.stderr.contains("ghost.txt"), "{}", r.stderr);
+
+    // A pre-declared exclusion whose ancestor later becomes a regular
+    // file is silently unreachable — not an error that would brick
+    // every scan while `remove --exclude` cannot mint the path either.
+    run_nopw(root, &["add", "--exclude", "future/cache.bin"]).expect_code(0);
+    write_file(root, "future", b"now a file\n");
+    run_nopw(root, &["status"]).expect_code(0);
+    run_pw(root, PW, &["verify"]).expect_code(0);
+}
+
+#[test]
+fn excluded_recovery_reports_serial_failures() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/a.txt", b"aaa\n");
+    write_file(root, "d/b.txt", b"bbb\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "--force", "d/a.txt"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "--force", "d/b.txt"]).expect_code(0);
+
+    // A read-only directory makes the first recovery replacement fail:
+    // the repair pass reports completed / failed / not attempted like
+    // the main pass instead of aborting without a summary.
+    fs::set_permissions(root.join("d"), fs::Permissions::from_mode(0o555)).unwrap();
+    let r = run_pw(root, PW, &["decrypt"]).expect_code(1);
+    assert_contains(&r.stderr, "failed:\n  d/a.txt");
+    assert_contains(&r.stderr, "not attempted (1):\n  d/b.txt");
+
+    fs::set_permissions(root.join("d"), fs::Permissions::from_mode(0o755)).unwrap();
+    let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
+    assert_contains(&r.stdout, "decrypted d/a.txt (excluded; recovered)");
+    assert_contains(&r.stdout, "decrypted d/b.txt (excluded; recovered)");
+    assert_eq!(read_file(root, "d/a.txt"), b"aaa\n");
+    assert_eq!(read_file(root, "d/b.txt"), b"bbb\n");
 }

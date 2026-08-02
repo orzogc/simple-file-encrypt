@@ -4,13 +4,13 @@
 
 use std::path::PathBuf;
 
-use crate::crypto::KdfGate;
+use crate::crypto::{DomainKey, KdfGate};
 use crate::error::{Error, Result};
 use crate::probe::{Probe, probe};
 use crate::select::{self, Origin};
 use crate::{binmode, fsops, report, textmode};
 
-use super::run_serial;
+use super::{Domain, run_serial};
 
 /// Options of the `decrypt` command.
 pub struct DecryptOpts {
@@ -26,14 +26,11 @@ pub struct DecryptOpts {
 /// Runs the `decrypt` command.
 pub fn decrypt(opts: &DecryptOpts) -> Result<()> {
     let (domain, rels) = super::open_domain(&opts.paths, true)?;
+    // Without arguments the audit entries are used, so independent
+    // exclusions (paths outside every managed entry) are visible to
+    // the repair pass too — not only exclusions under managed trees.
     let entries: Vec<(String, Origin)> = if rels.is_empty() {
-        domain
-            .loaded
-            .config
-            .paths
-            .iter()
-            .map(|p| (p.clone(), Origin::Managed))
-            .collect()
+        super::audit_entries(&domain.loaded.config)
     } else {
         rels.into_iter()
             .map(|r| (r, Origin::Explicit { named: true }))
@@ -63,11 +60,16 @@ pub fn decrypt(opts: &DecryptOpts) -> Result<()> {
     // exactly what decrypt must return to plaintext. Probe hits count
     // as work to do; excluded plaintext is skipped and exempt from
     // `--require-encrypted` (its plaintext is intentional).
-    let mut recover: Vec<&select::ExcludedFile> = Vec::new();
+    let mut recover: Vec<select::TargetFile> = Vec::new();
     for ex in &expanded.excluded {
         let prefix = fsops::read_prefix(&ex.abs, crate::consts::PROBE_PREFIX_LEN)?;
         match probe(&prefix) {
-            Probe::TextV1 | Probe::Binary => recover.push(ex),
+            Probe::TextV1 | Probe::Binary => recover.push(select::TargetFile {
+                rel: ex.rel.clone(),
+                abs: ex.abs.clone(),
+                named: ex.named,
+                explicit: false,
+            }),
             Probe::TextUnrecognized => report::note(format!(
                 "`{}` is excluded and has an unrecognized `#simple-file-encrypt` header; left untouched",
                 ex.rel
@@ -108,87 +110,104 @@ pub fn decrypt(opts: &DecryptOpts) -> Result<()> {
             Probe::TextV1 => textmode::decrypt(keys.as_slice(), &file.rel, &data.content)?,
             Probe::Binary => binmode::decrypt(keys.as_slice(), &file.rel, &data.content)?,
         };
-        if file.nlink > 1 {
-            report::warn(format!(
-                "`{}` has {} hard links; the other links keep the previous (encrypted) content",
-                file.rel, file.nlink
-            ));
-        }
+        warn_hard_links(&file.rel, data.snap.nlink);
         domain.loaded.ensure_fresh()?;
         fsops::atomic_replace(&file.abs, &data.snap, &pt)?;
         Ok(Some(format!("decrypted {}", file.rel)))
     })?;
 
-    // Recovery pass over excluded probe hits: this domain's ciphertext
-    // is decrypted; content that fails authentication is noted and left
-    // untouched — deliberately excluded foreign-looking content must
-    // never block a full decrypt. I/O errors still abort.
-    for ex in recover {
-        let data = match fsops::read_capped(&ex.abs, crate::consts::MAX_FILE_SIZE, "file") {
-            Ok(data) => data,
-            // Both sides of the size cap are enforced, so an over-cap
-            // probe hit cannot be this domain's ciphertext.
-            Err(Error::Limit(_)) => {
+    // Recovery pass over excluded probe hits, with the same serial
+    // stop-at-first-error semantics and completed/failed/not-attempted
+    // report as the main pass. This domain's ciphertext is decrypted;
+    // content that fails authentication is noted and left untouched —
+    // deliberately excluded foreign-looking content must never block a
+    // full decrypt.
+    run_serial(&recover, |ex| recover_excluded(&domain, &keys, ex))
+}
+
+/// Warns when the file about to be replaced has other hard links (they
+/// keep the previous, encrypted content).
+fn warn_hard_links(rel: &str, nlink: u64) {
+    if nlink > 1 {
+        report::warn(format!(
+            "`{rel}` has {nlink} hard links; the other links keep the previous (encrypted) content"
+        ));
+    }
+}
+
+/// Processes one excluded probe hit of the repair pass: decrypt it when
+/// it is this domain's ciphertext, note and leave everything else.
+fn recover_excluded(
+    domain: &Domain,
+    keys: &[DomainKey],
+    ex: &select::TargetFile,
+) -> Result<Option<String>> {
+    let data = match fsops::read_capped(&ex.abs, crate::consts::MAX_FILE_SIZE, "file") {
+        Ok(data) => data,
+        // Too large to decrypt in memory: classify from a bounded
+        // prefix. A first unit of this domain means damaged (possibly
+        // appended-to) ciphertext worth pointing at; anything else is
+        // foreign and left alone.
+        Err(Error::Limit(_)) => {
+            let prefix = fsops::read_prefix(&ex.abs, crate::consts::PROBE_PREFIX_LEN)?;
+            match super::classify_oversize_excluded(keys, &ex.rel, &ex.abs, probe(&prefix))? {
+                super::ExcludedCiphertext::FirstUnitOnly(idx) => report::note(format!(
+                    "`{}` is excluded and holds this domain's ciphertext (first unit \
+                     authenticates under ring entry {idx}) but exceeds the file-size cap — \
+                     appended-to or damaged; left untouched, restore the original content \
+                     manually (e.g. from git)",
+                    ex.rel
+                )),
+                _ => report::note(format!(
+                    "`{}` is excluded, probes as encrypted, and exceeds the file-size cap, but \
+                     its first unit does not authenticate under this domain's keys; left \
+                     untouched",
+                    ex.rel
+                )),
+            }
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    let kind = probe(&data.content);
+    let result = match kind {
+        Probe::TextV1 => textmode::decrypt(keys, &ex.rel, &data.content),
+        Probe::Binary => binmode::decrypt(keys, &ex.rel, &data.content),
+        // The file changed since the prefix probe; leave it alone.
+        _ => return Ok(None),
+    };
+    match result {
+        Ok((pt, _)) => {
+            warn_hard_links(&ex.rel, data.snap.nlink);
+            domain.loaded.ensure_fresh()?;
+            fsops::atomic_replace(&ex.abs, &data.snap, &pt)?;
+            Ok(Some(format!("decrypted {} (excluded; recovered)", ex.rel)))
+        }
+        Err(e @ Error::Io { .. }) => Err(e),
+        Err(_) => {
+            // Ours-but-damaged and foreign content get distinct notes:
+            // the former needs manual resolution, and pointing at
+            // "foreign" would send the user the wrong way.
+            let first = match kind {
+                Probe::TextV1 => textmode::authenticate_first(keys, &ex.rel, &data.content).ok(),
+                Probe::Binary => binmode::authenticate_first(keys, &ex.rel, &data.content).ok(),
+                _ => None,
+            };
+            if let Some(idx) = first {
                 report::note(format!(
-                    "`{}` is excluded and probes as encrypted but exceeds the file-size cap, so \
-                     it cannot be this domain's ciphertext; left untouched",
+                    "`{}` is excluded and holds this domain's ciphertext (first unit \
+                     authenticates under ring entry {idx}) but does not fully decrypt — damaged \
+                     or mixing key epochs; left untouched, resolve it manually",
                     ex.rel
                 ));
-                continue;
+            } else {
+                report::note(format!(
+                    "`{}` is excluded and probes as encrypted but does not authenticate under \
+                     this domain's keys; left untouched",
+                    ex.rel
+                ));
             }
-            Err(e) => return Err(e),
-        };
-        let kind = probe(&data.content);
-        let result = match kind {
-            Probe::TextV1 => textmode::decrypt(keys.as_slice(), &ex.rel, &data.content),
-            Probe::Binary => binmode::decrypt(keys.as_slice(), &ex.rel, &data.content),
-            // The file changed since the prefix probe; leave it alone.
-            _ => continue,
-        };
-        match result {
-            Ok((pt, _)) => {
-                if ex.nlink > 1 {
-                    report::warn(format!(
-                        "`{}` has {} hard links; the other links keep the previous (encrypted) \
-                         content",
-                        ex.rel, ex.nlink
-                    ));
-                }
-                domain.loaded.ensure_fresh()?;
-                fsops::atomic_replace(&ex.abs, &data.snap, &pt)?;
-                report::out(format!("decrypted {} (excluded; recovered)", ex.rel));
-            }
-            Err(e @ Error::Io { .. }) => return Err(e),
-            Err(_) => {
-                // Ours-but-damaged and foreign content get distinct
-                // notes: the former needs manual resolution, and
-                // pointing at "foreign" would send the user the wrong
-                // way.
-                let first = match kind {
-                    Probe::TextV1 => {
-                        textmode::authenticate_first(keys.as_slice(), &ex.rel, &data.content).ok()
-                    }
-                    Probe::Binary => {
-                        binmode::authenticate_first(keys.as_slice(), &ex.rel, &data.content).ok()
-                    }
-                    _ => None,
-                };
-                if let Some(idx) = first {
-                    report::note(format!(
-                        "`{}` is excluded and holds this domain's ciphertext (first unit \
-                         authenticates under ring entry {idx}) but does not fully decrypt — \
-                         damaged or mixing key epochs; left untouched, resolve it manually",
-                        ex.rel
-                    ));
-                } else {
-                    report::note(format!(
-                        "`{}` is excluded and probes as encrypted but does not authenticate \
-                         under this domain's keys; left untouched",
-                        ex.rel
-                    ));
-                }
-            }
+            Ok(None)
         }
     }
-    Ok(())
 }

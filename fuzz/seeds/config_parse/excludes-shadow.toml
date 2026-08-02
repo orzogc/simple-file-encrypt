@@ -1,0 +1,17 @@
+version = 1
+salt = "abababababababababababababababab"
+wrapped_keys = [
+    "111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+]
+paths = ["secrets", "secrets/keep.txt"]
+# `secrets` shadows `secrets/keep.txt`? No — the exclusion below does:
+# an exclude equal to (or covering) an exact managed entry must be
+# rejected as a contradiction.
+excludes = ["secrets/keep.txt"]
+force_binary = []
+
+[kdf]
+algorithm = "argon2id"
+memory_kib = 65536
+iterations = 3
+parallelism = 1

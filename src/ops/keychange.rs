@@ -5,7 +5,7 @@
 use crate::crypto::{self, KdfGate};
 use crate::error::{Error, Result};
 use crate::probe::{Probe, probe};
-use crate::select::{self, Origin, TargetFile};
+use crate::select::{self, TargetFile};
 use crate::{binmode, fsops, pwinput, report, textmode};
 
 use super::Domain;
@@ -74,13 +74,11 @@ pub enum RekeyMode {
 /// Runs the `rekey` command.
 pub fn rekey(mode: RekeyMode, gate: &KdfGate) -> Result<()> {
     let (mut domain, _) = super::open_domain(&[], true)?;
-    let entries: Vec<(String, Origin)> = domain
-        .loaded
-        .config
-        .paths
-        .iter()
-        .map(|p| (p.clone(), Origin::Managed))
-        .collect();
+    // The audit entries include independent exclusions as roots: an
+    // exclusion outside every managed entry can hide this domain's
+    // ciphertext just as well as one below a managed directory, and
+    // rotation must see it to warn or refuse.
+    let entries = super::audit_entries(&domain.loaded.config);
     let expanded = select::expand(domain.root(), &entries, &domain.loaded.config.excludes)?;
     fsops::sweep_temps(domain.root(), expanded.sweep_dirs.clone());
 
@@ -242,15 +240,29 @@ fn scan_excluded_ciphertext(
     let mut hits = Vec::new();
     for ex in excluded {
         let prefix = fsops::read_prefix(&ex.abs, crate::consts::PROBE_PREFIX_LEN)?;
-        if !probe(&prefix).is_hit() {
+        let prefix_kind = probe(&prefix);
+        if !prefix_kind.is_hit() {
             continue;
         }
         let data = match fsops::read_capped(&ex.abs, crate::consts::MAX_FILE_SIZE, "file") {
             Ok(data) => data,
-            // Both sides of the size cap are enforced, so an over-cap
-            // probe hit cannot be this domain's ciphertext: foreign,
-            // and foreign content never blocks rotation.
-            Err(Error::Limit(_)) => continue,
+            // Too large to authenticate whole: classify from a bounded
+            // prefix. A first unit of this domain — valid ciphertext
+            // with data appended past the cap, or damage — must block
+            // convergence like any in-cap damaged file; foreign blobs
+            // still authenticate under no key and block nothing.
+            Err(Error::Limit(_)) => {
+                if let super::ExcludedCiphertext::FirstUnitOnly(idx) =
+                    super::classify_oversize_excluded(keys, &ex.rel, &ex.abs, prefix_kind)?
+                {
+                    hits.push(ExcludedHit {
+                        rel: ex.rel.clone(),
+                        idx,
+                        fully: false,
+                    });
+                }
+                continue;
+            }
             Err(e) => return Err(e),
         };
         let kind = probe(&data.content);

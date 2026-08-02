@@ -55,7 +55,11 @@ pub fn encrypt(opts: &EncryptOpts) -> Result<()> {
             .map(|r| (r, Origin::Explicit { named: true }))
             .collect()
     };
-    let expanded = select::expand(domain.root(), &entries, &domain.loaded.config.excludes)?;
+    // Excluded files are counted for the note but never retained:
+    // encrypt does not touch them, so a huge excluded tree costs no
+    // memory here.
+    let expanded =
+        select::expand_count_only(domain.root(), &entries, &domain.loaded.config.excludes)?;
     if let Some(missing) = expanded.missing_explicit.first() {
         return Err(Error::Usage(format!("`{missing}` does not exist on disk")));
     }
@@ -74,10 +78,10 @@ pub fn encrypt(opts: &EncryptOpts) -> Result<()> {
                 &domain.loaded.config.paths,
             )),
     );
-    if !expanded.excluded.is_empty() {
+    if expanded.excluded_count > 0 {
         report::note(format!(
             "skipping {} excluded file(s)",
-            expanded.excluded.len()
+            expanded.excluded_count
         ));
     }
     if expanded.files.is_empty() {
@@ -216,7 +220,7 @@ pub(crate) fn encrypt_pass(
         match action {
             Action::Skip => Ok(Some(format!("skipped {} (already encrypted)", file.rel))),
             Action::Encrypt => {
-                refuse_hard_links(file, "encrypting it")?;
+                refuse_hard_links(&file.rel, data.snap.nlink, "encrypting it")?;
                 let mode = pick_mode(&domain.loaded, &file.rel, &data.content);
                 let ct = super::encrypt_content(keys, &file.rel, mode, &data.content)?;
                 domain.loaded.ensure_fresh()?;
@@ -224,7 +228,7 @@ pub(crate) fn encrypt_pass(
                 Ok(Some(format!("encrypted {}", file.rel)))
             }
             Action::Migrate(stored) => {
-                refuse_hard_links(file, "migrating it")?;
+                refuse_hard_links(&file.rel, data.snap.nlink, "migrating it")?;
                 // Decrypt in memory only; plaintext never touches disk.
                 let (pt, _) = match stored {
                     Probe::Binary => binmode::decrypt(keys, &file.rel, &data.content)?,

@@ -74,7 +74,8 @@ jobs:
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/release/simple-file-encrypt" "$stage/"
           strip "$stage/simple-file-encrypt"
-          cp README.md LICENSE "$stage/"
+          cp README.md README_zh-CN.md LICENSE CHANGELOG.md SECURITY.md "$stage/"
+          cp -r docs "$stage/docs"
           tar -czf "${stage}.tar.gz" "$stage"
           if command -v sha256sum >/dev/null; then
             sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"

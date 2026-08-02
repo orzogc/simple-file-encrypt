@@ -61,16 +61,10 @@ struct ChunkPlan {
     last: bool,
 }
 
-/// Structurally parses a binary ciphertext: header fields, chunk
-/// boundaries, and overall lengths. No cryptography.
-fn parse_structure(path: &str, ct: &[u8]) -> Result<Vec<ChunkPlan>> {
-    // 16-byte header + at least one (possibly empty) chunk + 32-byte tag.
-    if ct.len() < BIN_HEADER_LEN + SIV_LEN + FILE_TAG_LEN {
-        return Err(Error::format(
-            path,
-            "binary ciphertext shorter than the 64-byte minimum",
-        ));
-    }
+/// Validates the 16-byte header fields (version, flags, reserved).
+/// The caller guarantees `ct` holds at least the header and probed the
+/// magic.
+fn validate_header(path: &str, ct: &[u8]) -> Result<()> {
     debug_assert_eq!(ct[..8], BIN_MAGIC, "caller probes before parsing");
     let version = ct[8];
     if version != 0x01 {
@@ -93,6 +87,20 @@ fn parse_structure(path: &str, ct: &[u8]) -> Result<Vec<ChunkPlan>> {
             "non-zero reserved bytes in binary header",
         ));
     }
+    Ok(())
+}
+
+/// Structurally parses a binary ciphertext: header fields, chunk
+/// boundaries, and overall lengths. No cryptography.
+fn parse_structure(path: &str, ct: &[u8]) -> Result<Vec<ChunkPlan>> {
+    // 16-byte header + at least one (possibly empty) chunk + 32-byte tag.
+    if ct.len() < BIN_HEADER_LEN + SIV_LEN + FILE_TAG_LEN {
+        return Err(Error::format(
+            path,
+            "binary ciphertext shorter than the 64-byte minimum",
+        ));
+    }
+    validate_header(path, ct)?;
 
     let body_len = ct.len() - BIN_HEADER_LEN - FILE_TAG_LEN;
     let mut chunks = Vec::with_capacity(body_len / CHUNK_DISK + 1);
@@ -146,6 +154,42 @@ fn select_key(
 pub fn authenticate_first(keys: &[DomainKey], path: &str, ct: &[u8]) -> Result<usize> {
     let chunks = parse_structure(path, ct)?;
     Ok(select_key(keys, path, ct, &chunks[0])?.0)
+}
+
+/// Bounded first-chunk authentication for a file too large to read
+/// whole: `prefix` must hold the header and one full on-disk chunk. In
+/// any valid ciphertext larger than the size cap the first chunk is
+/// full and non-last, so it is tried with that associated data alone;
+/// a small single-chunk ciphertext with data appended past the cap
+/// carries a last-chunk AD whose extent a prefix cannot recover, and
+/// reads as non-authentic (a documented residual). Returns the
+/// authenticating key index.
+pub fn authenticate_first_bounded(keys: &[DomainKey], path: &str, prefix: &[u8]) -> Result<usize> {
+    if prefix.len() < BIN_HEADER_LEN + CHUNK_DISK {
+        return Err(Error::format(
+            path,
+            "prefix too short for a full first chunk",
+        ));
+    }
+    // The probe and this read are separate reads: re-check the magic
+    // instead of trusting a snapshot of a file another program may
+    // have replaced in between (the full-parse path has the caller's
+    // probe and the parse on the same buffer; this one does not).
+    if prefix[..BIN_MAGIC.len()] != BIN_MAGIC {
+        return Err(Error::format(
+            path,
+            "binary magic missing (the file changed between reads)",
+        ));
+    }
+    validate_header(path, prefix)?;
+    let unit = &prefix[BIN_HEADER_LEN..BIN_HEADER_LEN + CHUNK_DISK];
+    for (i, key) in keys.iter().enumerate() {
+        let fk = FileKeys::derive(key, path);
+        if fk.unit_decrypt(&ad_bin(0, false), unit).is_some() {
+            return Ok(i);
+        }
+    }
+    Err(Error::auth(path, crate::textmode::FIRST_UNIT_AUTH_HINT))
 }
 
 /// Decrypts a binary ciphertext, trying ring keys in order on the first

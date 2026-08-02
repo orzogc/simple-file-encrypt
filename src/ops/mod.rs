@@ -282,6 +282,31 @@ where
     Ok(())
 }
 
+/// Expansion entries for the audit-style commands — `status`, `verify`,
+/// `decrypt` without arguments, and `rekey`: every managed entry, plus
+/// every `excludes` entry no managed entry covers, as an audit root.
+/// An exclusion outside every managed entry would otherwise never be
+/// walked, hiding stranded ciphertext from the very scans that promise
+/// to flag it. Exclusions covered by a managed entry are reached by
+/// the managed walk itself (a covering *file* entry means the excluded
+/// path cannot exist on disk), so only the independent ones become
+/// roots. `encrypt` and `check` do not consume excluded content and
+/// keep their plain managed entries.
+pub(crate) fn audit_entries(config: &config::Config) -> Vec<(String, crate::select::Origin)> {
+    use crate::select::Origin;
+    let mut entries: Vec<(String, Origin)> = config
+        .paths
+        .iter()
+        .map(|p| (p.clone(), Origin::Managed))
+        .collect();
+    for exclude in &config.excludes {
+        if paths::covering_entry(&config.paths, exclude).is_none() {
+            entries.push((exclude.clone(), Origin::Exclusion));
+        }
+    }
+    entries
+}
+
 /// How content under an excluded path that probes as ciphertext relates
 /// to this domain's key ring. Exclusion hides a file from `encrypt` and
 /// `rekey` migration, so its holding *our* ciphertext is a stranding
@@ -326,14 +351,64 @@ pub(crate) fn classify_excluded_ciphertext(
     }
 }
 
+/// Bounded classification for an excluded probe hit whose file exceeds
+/// the in-memory cap. Only the first unit can be checked from a capped
+/// prefix, so `Authentic` is never produced: the hit is at best
+/// `FirstUnitOnly` — this domain's ciphertext with data appended past
+/// the cap, or otherwise damaged — which blocks key-rotation
+/// convergence exactly like an in-cap damaged file, while an over-cap
+/// foreign blob authenticates under no key and blocks nothing.
+///
+/// Residual gaps, both harmless or documented: an empty-file marker
+/// header with appended data reads as foreign (the recoverable
+/// plaintext is empty either way), and a single-chunk binary
+/// ciphertext carries a last-chunk AD whose extent a prefix cannot
+/// recover, so with enough appended data it reads as foreign too
+/// (see `docs/cli.md`).
+pub(crate) fn classify_oversize_excluded(
+    keys: &[DomainKey],
+    rel: &str,
+    abs: &Path,
+    kind: crate::probe::Probe,
+) -> Result<ExcludedCiphertext> {
+    use crate::probe::Probe;
+    // The window holds everything a valid first unit can need: the
+    // binary header plus one full chunk, or the longest exact text
+    // header line plus the base64 of a maximum-size unit. A first line
+    // or unit still unterminated within it cannot be valid ciphertext.
+    let window = match kind {
+        Probe::Binary => {
+            crate::consts::BIN_HEADER_LEN + crate::consts::CHUNK_SIZE + crate::consts::SIV_LEN
+        }
+        Probe::TextV1 => {
+            (crate::consts::MAX_UNIT_DECODED * 4).div_ceil(3) as usize
+                + crate::consts::PROBE_PREFIX_LEN
+        }
+        _ => return Ok(ExcludedCiphertext::Foreign),
+    };
+    let prefix = fsops::read_prefix(abs, window)?;
+    let first = match kind {
+        Probe::Binary => crate::binmode::authenticate_first_bounded(keys, rel, &prefix),
+        // The text checker only inspects the header line and the first
+        // unit line, so a prefix is enough.
+        Probe::TextV1 => crate::textmode::authenticate_first(keys, rel, &prefix),
+        _ => unreachable!("handled above"),
+    };
+    Ok(match first {
+        Ok(idx) => ExcludedCiphertext::FirstUnitOnly(idx),
+        Err(_) => ExcludedCiphertext::Foreign,
+    })
+}
+
 /// Refuses to replace a file with more than one hard link when
-/// (re-)encrypting: the other links would keep a stale alias.
-pub fn refuse_hard_links(file: &TargetFile, action: &str) -> Result<()> {
-    if file.nlink > 1 {
+/// (re-)encrypting: the other links would keep a stale alias. `nlink`
+/// comes from the read-time snapshot, so a link created after target
+/// expansion is still caught.
+pub fn refuse_hard_links(rel: &str, nlink: u64, action: &str) -> Result<()> {
+    if nlink > 1 {
         return Err(Error::Usage(format!(
-            "`{}` has {} hard links; {action} would leave the other links pointing at a stale copy — \
-             resolve the links first",
-            file.rel, file.nlink
+            "`{rel}` has {nlink} hard links; {action} would leave the other links pointing at a \
+             stale copy — resolve the links first"
         )));
     }
     Ok(())

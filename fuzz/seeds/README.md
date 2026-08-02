@@ -15,7 +15,9 @@ seeds use the harness's fixed key (`[0x42; 32]`) and path (`"fuzz"`).
 
 | Seed | Reaches |
 |---|---|
-| `config_parse/valid-config.toml` | full config validation of a well-formed config |
+| `config_parse/valid-config.toml` | full config validation of a well-formed config (with `excludes`) |
+| `config_parse/excludes-shadow.toml` | the exclude-shadows-managed-entry contradiction rejection |
+| `config_parse/excludes-overlap.toml` | overlapping/duplicate exclusions and a shadowed `force_binary` mark |
 | `text_decrypt/valid-units` | header + two authentic unit lines, decrypts cleanly |
 | `text_decrypt/valid-empty-marker` | the authenticated empty-file marker path |
 | `bin_decrypt/valid-small` | one-chunk binary ciphertext incl. file tag |

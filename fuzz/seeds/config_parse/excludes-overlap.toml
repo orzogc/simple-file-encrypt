@@ -1,0 +1,16 @@
+version = 1
+salt = "abababababababababababababababab"
+wrapped_keys = [
+    "111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+]
+paths = ["secrets"]
+# Overlapping and duplicate exclusions: redundant but valid; the loader
+# sorts and deduplicates.
+excludes = ["secrets/a", "secrets/a/b", "secrets/a/b", "unmanaged/tree"]
+force_binary = ["secrets/a"]
+
+[kdf]
+algorithm = "argon2id"
+memory_kib = 65536
+iterations = 3
+parallelism = 1

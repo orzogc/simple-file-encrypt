@@ -33,14 +33,12 @@ impl ScanOutcome {
     }
 }
 
-/// Builds the entry list for a scan: managed entries without arguments,
-/// explicit entries otherwise.
-fn scan_entries(managed: &[String], rels: Vec<String>) -> Vec<(String, Origin)> {
+/// Builds the entry list for a scan: the audit entries (managed plus
+/// independent-exclusion roots — see [`super::audit_entries`]) without
+/// arguments, explicit entries otherwise.
+fn scan_entries(config: &crate::config::Config, rels: Vec<String>) -> Vec<(String, Origin)> {
     if rels.is_empty() {
-        managed
-            .iter()
-            .map(|p| (p.clone(), Origin::Managed))
-            .collect()
+        super::audit_entries(config)
     } else {
         rels.into_iter()
             .map(|r| (r, Origin::Explicit { named: true }))
@@ -52,7 +50,7 @@ fn scan_entries(managed: &[String], rels: Vec<String>) -> Vec<(String, Origin)> 
 /// Needs no password; exit 0 regardless of states.
 pub fn status() -> Result<()> {
     let (domain, _) = super::open_domain(&[], false)?;
-    let entries = scan_entries(&domain.loaded.config.paths, Vec::new());
+    let entries = scan_entries(&domain.loaded.config, Vec::new());
     let expanded = select::expand(domain.root(), &entries, &domain.loaded.config.excludes)?;
 
     // A `force_binary` entry that names nothing on disk is silently
@@ -144,14 +142,29 @@ pub fn status() -> Result<()> {
 /// errors. Missing files are ignored.
 pub fn check(arg_paths: &[PathBuf]) -> Result<ScanOutcome> {
     let (domain, rels) = super::open_domain(arg_paths, false)?;
-    let entries = scan_entries(&domain.loaded.config.paths, rels);
-    let expanded = select::expand(domain.root(), &entries, &domain.loaded.config.excludes)?;
-
     // Excluded paths are exempt from the gate: their plaintext is
     // intentional, and a keyless probe cannot tell this domain's
     // stranded ciphertext from deliberately excluded foreign-looking
     // content. `verify` and `rekey --continue`/`--prune` are the
-    // authoritative gates for that state.
+    // authoritative gates for that state. Exclusions are therefore
+    // neither expanded as roots nor retained (`expand_count_only`):
+    // check pays nothing for them.
+    let entries: Vec<(String, Origin)> = if rels.is_empty() {
+        domain
+            .loaded
+            .config
+            .paths
+            .iter()
+            .map(|p| (p.clone(), Origin::Managed))
+            .collect()
+    } else {
+        rels.into_iter()
+            .map(|r| (r, Origin::Explicit { named: true }))
+            .collect()
+    };
+    let expanded =
+        select::expand_count_only(domain.root(), &entries, &domain.loaded.config.excludes)?;
+
     let mut violations = 0usize;
     let mut operational = 0usize;
     for file in &expanded.files {
@@ -199,7 +212,7 @@ pub fn check(arg_paths: &[PathBuf]) -> Result<ScanOutcome> {
 /// failures do.
 pub fn verify(arg_paths: &[PathBuf], gate: &KdfGate) -> Result<ScanOutcome> {
     let (domain, rels) = super::open_domain(arg_paths, false)?;
-    let entries = scan_entries(&domain.loaded.config.paths, rels);
+    let entries = scan_entries(&domain.loaded.config, rels);
     let expanded = select::expand(domain.root(), &entries, &domain.loaded.config.excludes)?;
     let keys = super::read_password_and_unlock(&domain.loaded, gate)?;
 
@@ -285,10 +298,16 @@ pub fn verify(arg_paths: &[PathBuf], gate: &KdfGate) -> Result<ScanOutcome> {
                                 &data.content,
                                 kind,
                             ))),
-                            // Both sides of the size cap are enforced,
-                            // so an over-cap probe hit cannot be this
-                            // domain's ciphertext.
-                            Err(Error::Limit(_)) => Ok(Some(super::ExcludedCiphertext::Foreign)),
+                            // Too large to authenticate whole:
+                            // classify from a bounded prefix — a first
+                            // unit of this domain (valid ciphertext
+                            // with data appended past the cap, or
+                            // damage) must still fail verify, not pass
+                            // as foreign.
+                            Err(Error::Limit(_)) => {
+                                super::classify_oversize_excluded(&keys, &ex.rel, &ex.abs, kind)
+                                    .map(Some)
+                            }
                             Err(e) => Err(e),
                         }
                     }

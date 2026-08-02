@@ -274,6 +274,27 @@ pub fn is_covered_by(path: &str, entry: &str) -> bool {
             && path.as_bytes()[entry.len()] == b'/')
 }
 
+/// Returns the entry of a sorted, deduplicated list that covers `rel`
+/// (equals it, or is an ancestor directory entry), if any. Only `rel`
+/// itself and each of its `/`-ancestors can cover it, so the lookup is
+/// one binary search per ancestor — O(depth × log n) — instead of a
+/// scan of the whole list, which the 65536-entry config cap would let
+/// a hostile config turn quadratic.
+pub fn covering_entry<'a>(sorted: &'a [String], rel: &str) -> Option<&'a str> {
+    debug_assert!(sorted.is_sorted(), "coverage lookup needs a sorted list");
+    if rel.is_empty() {
+        return None;
+    }
+    let mut end = rel.len();
+    loop {
+        let candidate = &rel[..end];
+        if let Ok(i) = sorted.binary_search_by(|e| e.as_str().cmp(candidate)) {
+            return Some(sorted[i].as_str());
+        }
+        end = candidate.rfind('/')?;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +414,38 @@ mod tests {
         assert!(is_covered_by("a", "a"));
         assert!(!is_covered_by("ab", "a"));
         assert!(!is_covered_by("a", "a/b"));
+    }
+
+    #[test]
+    fn covering_entry_matches_the_linear_scan() {
+        let entries: Vec<String> = ["a", "a/x", "b/c", "long/nested/dir"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        // The fast lookup must agree with a linear `is_covered_by` scan
+        // on *whether* something covers; when several entries cover
+        // (`a` and `a/x`), either is a valid answer, so only the
+        // returned entry's own coverage is asserted.
+        for rel in [
+            "a",
+            "a/b",
+            "a/x/y",
+            "ab",
+            "b",
+            "b/c",
+            "b/c/d/e",
+            "long/nested/dir/f",
+            "long/nested",
+            "",
+            "zzz",
+        ] {
+            let linear = entries.iter().any(|e| is_covered_by(rel, e));
+            let fast = covering_entry(&entries, rel);
+            assert_eq!(fast.is_some(), linear, "rel = {rel:?}");
+            if let Some(e) = fast {
+                assert!(is_covered_by(rel, e), "rel = {rel:?}, entry = {e:?}");
+            }
+        }
+        assert_eq!(covering_entry(&[], "a/b"), None);
     }
 }
