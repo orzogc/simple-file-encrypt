@@ -5,7 +5,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 
 use crate::consts::*;
-use crate::crypto::{AD_TEXT, AD_TEXT_EMPTY, DomainKey, FileKeys};
+use crate::crypto::{AD_TEXT, AD_TEXT_EMPTY, DomainKey, FileKeys, ScanBudget, UnitScan};
 use crate::error::{Error, Result};
 
 /// Splits plaintext into lines at `\n` (terminators not included; `\r`
@@ -238,29 +238,49 @@ pub fn authenticate_first(keys: &[DomainKey], path: &str, ct: &[u8]) -> Result<u
 /// The first line is skipped whatever its form (a valid header, a
 /// damaged one, or the empty-file marker — whose junk-followed form
 /// stays decisively foreign, as nothing recoverable is lost). Lines
-/// that fail to decode are skipped, not fatal: damage is the expected
-/// input. At most `MAX_UNITS` lines are examined — a valid ciphertext
-/// of this domain never holds more, so appended lines past that point
-/// cannot be its units. A hit ends the scan; the full-scan worst case
-/// is reserved for content that authenticates nowhere.
-pub fn authenticate_any(keys: &[DomainKey], path: &str, ct: &[u8]) -> Option<usize> {
-    let nl = ct.iter().position(|&b| b == b'\n')?;
+/// that fail to decode are skipped without charging the budget: they
+/// cost only their length in checks, damage is the expected input,
+/// and skipping them free is what lets a surviving unit be found
+/// behind any amount of shredded content — a line *count* cutoff
+/// would let a flood of junk lines hide real units past it.
+/// Authentication attempts draw on `budget`; when it cannot cover the
+/// next attempt the scan reports [`UnitScan::Inconclusive`], never a
+/// decisive no. [`UnitScan::NoMatch`] therefore certifies that every
+/// decodable line of `ct` was tried against every ring key.
+pub fn authenticate_any(
+    keys: &[DomainKey],
+    path: &str,
+    ct: &[u8],
+    budget: &mut ScanBudget,
+) -> UnitScan {
+    let Some(nl) = ct.iter().position(|&b| b == b'\n') else {
+        // A single unterminated line: no unit lines exist at all, so
+        // the (empty) scan is complete.
+        return UnitScan::NoMatch;
+    };
     let body = &ct[nl + 1..];
     let fks: Vec<FileKeys> = keys.iter().map(|k| FileKeys::derive(k, path)).collect();
-    for (n, line) in body.split(|&b| b == b'\n').enumerate() {
-        if n as u64 >= MAX_UNITS {
-            break;
+    for line in body.split(|&b| b == b'\n') {
+        // A unit decodes to at least one 16-byte SIV (22 base64
+        // chars): shorter lines are skipped before the
+        // error-allocating decoder, so a flood of them costs only the
+        // split.
+        if line.len() < EMPTY_MARKER_B64_LEN {
+            continue;
         }
         let Ok(unit) = decode_unit(path, line) else {
             continue;
         };
         for (i, fk) in fks.iter().enumerate() {
+            if !budget.charge(unit.len()) {
+                return UnitScan::Inconclusive;
+            }
             if fk.unit_decrypt(AD_TEXT, &unit).is_some() {
-                return Some(i);
+                return UnitScan::Found(i);
             }
         }
     }
-    None
+    UnitScan::NoMatch
 }
 
 /// Decrypts a text ciphertext, trying ring keys in order on the first
@@ -509,6 +529,11 @@ mod tests {
         ));
     }
 
+    /// [`authenticate_any`] with a fresh full budget.
+    fn scan(ks: &[DomainKey], path: &str, ct: &[u8]) -> UnitScan {
+        authenticate_any(ks, path, ct, &mut ScanBudget::full())
+    }
+
     #[test]
     fn authenticate_any_finds_surviving_units() {
         let ks = keys(2);
@@ -520,14 +545,14 @@ mod tests {
         // authenticates under ring entry 1.
         let broken = [lines[0], b"!!!not-base64!!!", lines[2], b""].join(&b'\n');
         assert!(authenticate_first(&ks, "f.txt", &broken).is_err());
-        assert_eq!(authenticate_any(&ks, "f.txt", &broken), Some(1));
+        assert_eq!(scan(&ks, "f.txt", &broken), UnitScan::Found(1));
 
         // First unit replaced by a well-formed unit of another path:
         // still recognized through the second unit.
         let alien = FileKeys::derive(&ks[0], "other.txt").unit_encrypt(AD_TEXT, b"x");
         let alien_b64 = STANDARD_NO_PAD.encode(&alien);
         let swapped = [lines[0], alien_b64.as_bytes(), lines[2], b""].join(&b'\n');
-        assert_eq!(authenticate_any(&ks, "f.txt", &swapped), Some(1));
+        assert_eq!(scan(&ks, "f.txt", &swapped), UnitScan::Found(1));
 
         // A damaged header line (probing as unrecognized) still leaves
         // the unit lines recognizable.
@@ -538,13 +563,26 @@ mod tests {
             b"",
         ]
         .join(&b'\n');
-        assert_eq!(authenticate_any(&ks, "f.txt", &bad_header), Some(1));
+        assert_eq!(scan(&ks, "f.txt", &bad_header), UnitScan::Found(1));
 
-        // Every unit destroyed, foreign content, or a wrong path: no hit.
+        // A flood of undecodable lines before the surviving unit is
+        // skipped for free — a line-count cutoff here once let junk
+        // floods hide real units past the scan horizon.
+        let mut flooded = lines[0].to_vec();
+        for _ in 0..100_000 {
+            flooded.extend_from_slice(b"\n!");
+        }
+        flooded.push(b'\n');
+        flooded.extend_from_slice(lines[2]);
+        flooded.push(b'\n');
+        assert_eq!(scan(&ks, "f.txt", &flooded), UnitScan::Found(1));
+
+        // Every unit destroyed, foreign content, or a wrong path:
+        // decisively no match (the scan is complete).
         let all_bad = [lines[0], b"AAAA", b"BBBB", b""].join(&b'\n');
-        assert_eq!(authenticate_any(&ks, "f.txt", &all_bad), None);
-        assert_eq!(authenticate_any(&ks, "moved.txt", &ct), None);
-        assert_eq!(authenticate_any(&ks, "f.txt", b"no newline at all"), None);
+        assert_eq!(scan(&ks, "f.txt", &all_bad), UnitScan::NoMatch);
+        assert_eq!(scan(&ks, "moved.txt", &ct), UnitScan::NoMatch);
+        assert_eq!(scan(&ks, "f.txt", b"no newline at all"), UnitScan::NoMatch);
 
         // The empty-file marker with appended junk stays unrecognized:
         // the marker line is the header line and is skipped, and the
@@ -553,7 +591,44 @@ mod tests {
         let empty_ct = encrypt(&fk, "f.txt", b"").unwrap();
         let mut with_junk = empty_ct.clone();
         with_junk.extend_from_slice(b"QUFBQUFBQUFBQUFBQUFBQUFBQUFBQQ\n");
-        assert_eq!(authenticate_any(&ks, "f.txt", &with_junk), None);
+        assert_eq!(scan(&ks, "f.txt", &with_junk), UnitScan::NoMatch);
+    }
+
+    #[test]
+    fn authenticate_any_reports_budget_exhaustion_as_inconclusive() {
+        let ks = keys(2);
+        let fk = FileKeys::derive(&ks[1], "f.txt");
+        let ct = encrypt(&fk, "f.txt", b"one\ntwo\n").unwrap();
+        let lines: Vec<&[u8]> = ct.split(|&x| x == b'\n').collect();
+        // Two decodable-but-alien units in front of the real one.
+        let alien = FileKeys::derive(&ks[0], "other.txt").unit_encrypt(AD_TEXT, b"x");
+        let alien_b64 = STANDARD_NO_PAD.encode(&alien);
+        let padded = [
+            lines[0],
+            alien_b64.as_bytes(),
+            alien_b64.as_bytes(),
+            lines[1],
+            b"",
+        ]
+        .join(&b'\n');
+
+        // A budget too small for even one attempt: inconclusive, never
+        // a decisive no — the unscanned real unit must stay possible.
+        let mut tiny = ScanBudget::with(0);
+        assert_eq!(
+            authenticate_any(&ks, "f.txt", &padded, &mut tiny),
+            UnitScan::Inconclusive
+        );
+        // A budget that covers the alien units but dies before the
+        // real one: still inconclusive.
+        let per_attempt = alien.len() as u64 + SCAN_ATTEMPT_OVERHEAD;
+        let mut partial = ScanBudget::with(4 * per_attempt);
+        assert_eq!(
+            authenticate_any(&ks, "f.txt", &padded, &mut partial),
+            UnitScan::Inconclusive
+        );
+        // A full budget reaches the real unit.
+        assert_eq!(scan(&ks, "f.txt", &padded), UnitScan::Found(1));
     }
 
     #[test]

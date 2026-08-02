@@ -2195,11 +2195,11 @@ fn oversize_ambiguous_binary_blocks_convergence() {
 
     let r = run_pw(root, PW, &["verify"]).expect_code(1);
     assert_contains(&r.stdout, "FAILED d/tiny.bin");
-    assert_contains(&r.stdout, "cannot be authenticated");
+    assert_contains(&r.stdout, "cannot be conclusively classified");
     let r = run_pw(root, PW, &["rekey"]).expect_code(0);
-    assert_contains(&r.stderr, "cannot be authenticated");
+    assert_contains(&r.stderr, "cannot be conclusively classified");
     let r = run_pw(root, PW, &["rekey", "--continue"]).expect_code(1);
-    assert_contains(&r.stderr, "indistinguishable from foreign content");
+    assert_contains(&r.stderr, "cannot be conclusively classified");
     let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
     assert_contains(&r.stderr, "cannot prune");
     let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
@@ -2480,6 +2480,139 @@ fn unrecognized_header_with_surviving_units_is_still_ours() {
     run_pw(root, PW, &["rekey"]).expect_code(0); // mint, so prune has work
     let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
     assert_contains(&r.stderr, "cannot prune");
+
+    // `decrypt` cannot repair a damaged header and reads no password
+    // for a keyless note; it points at `verify` as the keyed arbiter
+    // instead of guessing between ours-but-damaged and foreign.
+    let r = run_nopw(root, &["decrypt", "d/s.txt"]).expect_code(0);
+    assert_contains(&r.stderr, "run `verify`");
+}
+
+#[test]
+fn surviving_unit_behind_a_line_flood_still_blocks_convergence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/s.txt", b"secret one\nsecret two\n");
+    write_file(root, "d/other.txt", b"other\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "--force", "d/s.txt"]).expect_code(0);
+
+    // Insert 2^22 undecodable junk lines between the header and the
+    // intact units. A line-count scan cutoff once stopped right here
+    // and read the file as foreign — verify passed and `rekey --prune`
+    // dropped the key the units past the flood still need.
+    let ct = read_file(root, "d/s.txt");
+    let header_end = ct.iter().position(|&b| b == b'\n').unwrap() + 1;
+    let mut flooded = ct[..header_end].to_vec();
+    flooded.extend(std::iter::repeat_n(&b"!\n"[..], 1 << 22).flatten());
+    flooded.extend_from_slice(&ct[header_end..]);
+    fs::write(root.join("d/s.txt"), &flooded).unwrap();
+
+    let r = run_pw(root, PW, &["verify"]).expect_code(1);
+    assert_contains(&r.stdout, "FAILED d/s.txt");
+    assert_contains(&r.stdout, "a unit authenticates under ring entry");
+    run_pw(root, PW, &["rekey"]).expect_code(0); // mint, so prune has work
+    let r = run_pw(root, PW, &["rekey", "--continue"]).expect_code(1);
+    assert_contains(&r.stderr, "does not fully decrypt");
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot prune");
+
+    // The refusals kept the old key: the restored ciphertext recovers.
+    fs::write(root.join("d/s.txt"), &ct).unwrap();
+    let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
+    assert_contains(&r.stdout, "decrypted d/s.txt (excluded; recovered)");
+    assert_eq!(read_file(root, "d/s.txt"), b"secret one\nsecret two\n");
+}
+
+#[test]
+fn oversize_excluded_text_with_prepended_flood_is_ambiguous() {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/s.txt", b"secret one\nsecret two\n");
+    write_file(root, "d/other.txt", b"other\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "--force", "d/s.txt"]).expect_code(0);
+
+    // Push the real units past the cap-sized prefix: header, then a
+    // sparse NUL flood past the cap, then the original unit lines.
+    // The prefix scan cannot see the units, and that absence must
+    // read as ambiguous (blocking convergence) — not as foreign, the
+    // classification that would let `rekey --prune` drop their key.
+    let ct = read_file(root, "d/s.txt");
+    let header_end = ct.iter().position(|&b| b == b'\n').unwrap() + 1;
+    let f = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(root.join("d/s.txt"))
+        .unwrap();
+    let mut f = f;
+    f.write_all(&ct[..header_end]).unwrap();
+    f.set_len(256 * 1024 * 1024 + 1).unwrap();
+    f.seek(SeekFrom::End(0)).unwrap();
+    f.write_all(b"\n").unwrap();
+    f.write_all(&ct[header_end..]).unwrap();
+    drop(f);
+
+    let r = run_pw(root, PW, &["verify"]).expect_code(1);
+    assert_contains(&r.stdout, "FAILED d/s.txt");
+    assert_contains(&r.stdout, "cannot be conclusively classified");
+    run_pw(root, PW, &["rekey"]).expect_code(0); // mint, so prune has work
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot prune");
+
+    // Restoring the original bytes resolves it.
+    fs::write(root.join("d/s.txt"), &ct).unwrap();
+    let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
+    assert_contains(&r.stdout, "decrypted d/s.txt (excluded; recovered)");
+    assert_eq!(read_file(root, "d/s.txt"), b"secret one\nsecret two\n");
+}
+
+#[test]
+fn exact_managed_directory_becoming_a_repository_is_a_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "vendor/s.txt", b"secret\n");
+    write_file(root, "d/other.txt", b"other\n");
+    init_domain(root);
+    run_nopw(root, &["add", "vendor", "d"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+
+    // The exact managed entry itself becomes a repository root. That
+    // must be recorded like a boundary discovered inside a walk —
+    // reported by the read-only scans and refused by the convergence
+    // claims — not a hard error that aborts every audit-style command.
+    write_file(root, "vendor/.git", b"gitdir: elsewhere\n");
+
+    let r = run_nopw(root, &["status"]).expect_code(0);
+    assert!(status_line(&r.stdout, "boundary", "vendor"));
+    let r = run_pw(root, PW, &["verify"]).expect_code(0);
+    assert_contains(&r.stdout, "boundary vendor");
+    let r = run_pw(root, PW, &["rekey"]).expect_code(0);
+    assert_contains(&r.stderr, "not audited");
+    let r = run_pw(root, PW, &["rekey", "--continue"]).expect_code(1);
+    assert_contains(&r.stderr, "nested repository `vendor`");
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot prune");
+    // `remove vendor` is stopped even earlier, by domain resolution:
+    // an explicit argument that is itself a repository root resolves
+    // to no domain. Clearing this state starts with moving the `.git`
+    // entry aside, exactly as the convergence refusal advises.
+    let r = run_nopw(root, &["remove", "vendor"]).expect_code(1);
+    assert_contains(&r.stderr, "outside any simple-file-encrypt domain");
+
+    // Removing the boundary lets everything converge again.
+    fs::remove_file(root.join("vendor/.git")).unwrap();
+    let r = run_pw(root, PW, &["decrypt", "vendor/s.txt"]).expect_code(0);
+    assert_contains(&r.stdout, "decrypted vendor/s.txt");
+    assert_eq!(read_file(root, "vendor/s.txt"), b"secret\n");
+    run_pw(root, PW, &["rekey", "--continue"]).expect_code(0);
+    run_pw(root, PW, &["rekey", "--prune"]).expect_code(0);
 }
 
 #[test]

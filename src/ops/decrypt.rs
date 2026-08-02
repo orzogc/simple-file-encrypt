@@ -70,8 +70,15 @@ pub fn decrypt(opts: &DecryptOpts) -> Result<()> {
                 named: ex.named,
                 explicit: false,
             }),
+            // Not queued for recovery: the damaged header makes a full
+            // decrypt impossible, so there is nothing to restore, and
+            // reading a password just to sharpen this note would break
+            // the password-only-when-needed contract. `verify` is the
+            // keyed arbiter for this shape.
             Probe::TextUnrecognized => report::note(format!(
-                "`{}` is excluded and has an unrecognized `#simple-file-encrypt` header; left untouched",
+                "`{}` is excluded and has an unrecognized `#simple-file-encrypt` header; left \
+                 untouched — run `verify` to check whether its unit lines still authenticate \
+                 as this domain's",
                 ex.rel
             )),
             Probe::Plain => {
@@ -159,9 +166,9 @@ fn recover_excluded(
                     ex.rel
                 )),
                 super::ExcludedCiphertext::Ambiguous => report::note(format!(
-                    "`{}` is excluded, exceeds the file-size cap, and cannot be authenticated \
-                     from a bounded prefix — if it is a single-chunk ciphertext of this domain \
-                     with appended data, restore the original bytes; left untouched",
+                    "`{}` is excluded and cannot be conclusively classified (over-cap content, \
+                     or a unit scan cut short by its work budget) — if it is this domain's \
+                     ciphertext, restore the original bytes; left untouched",
                     ex.rel
                 )),
                 _ => report::note(format!(
@@ -195,24 +202,34 @@ fn recover_excluded(
             // "foreign" would send the user the wrong way. Any
             // surviving unit proves ownership, so the scan does not
             // stop at the first one.
-            let owned = match kind {
-                Probe::TextV1 => textmode::authenticate_any(keys, &ex.rel, &data.content),
-                Probe::Binary => binmode::authenticate_any(keys, &ex.rel, &data.content),
-                _ => None,
+            let mut budget = crate::crypto::ScanBudget::full();
+            let scan = match kind {
+                Probe::TextV1 => {
+                    textmode::authenticate_any(keys, &ex.rel, &data.content, &mut budget)
+                }
+                Probe::Binary => {
+                    binmode::authenticate_any(keys, &ex.rel, &data.content, &mut budget)
+                }
+                _ => crate::crypto::UnitScan::NoMatch,
             };
-            if let Some(idx) = owned {
-                report::note(format!(
+            match scan {
+                crate::crypto::UnitScan::Found(idx) => report::note(format!(
                     "`{}` is excluded and holds this domain's ciphertext (a unit \
                      authenticates under ring entry {idx}) but does not fully decrypt — damaged \
                      or mixing key epochs; left untouched, resolve it manually",
                     ex.rel
-                ));
-            } else {
-                report::note(format!(
+                )),
+                crate::crypto::UnitScan::Inconclusive => report::note(format!(
+                    "`{}` is excluded and cannot be conclusively classified (the unit-scan \
+                     work budget ran out) — if it is this domain's ciphertext, restore the \
+                     original bytes; left untouched",
+                    ex.rel
+                )),
+                crate::crypto::UnitScan::NoMatch => report::note(format!(
                     "`{}` is excluded and probes as encrypted but does not authenticate under \
                      this domain's keys; left untouched",
                     ex.rel
-                ));
+                )),
             }
             Ok(None)
         }

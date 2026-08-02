@@ -294,6 +294,67 @@ impl FileKeys {
     }
 }
 
+/// Outcome of scanning ciphertext units against the whole key ring
+/// (`textmode::authenticate_any` / `binmode::authenticate_any`).
+///
+/// The three-way split exists because "no hit" means two very
+/// different things: a *complete* scan with no hit proves the content
+/// holds nothing of this domain's, while a scan cut short proves
+/// nothing at all — and conflating them once let content with
+/// surviving units past the scan horizon read as foreign, unblocking
+/// `rekey --prune` from the very key those units still need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitScan {
+    /// Some unit authenticated under the ring entry with this index.
+    Found(usize),
+    /// Every candidate unit of the scanned content was tried against
+    /// every ring key and none authenticated. Only a complete scan may
+    /// return this; callers may treat the content as foreign.
+    NoMatch,
+    /// The scan ended before every candidate unit could be tried (the
+    /// work budget ran out). Absence of a hit proves nothing; callers
+    /// must treat the content as possibly this domain's.
+    Inconclusive,
+}
+
+/// Work budget for one file's unit scan, counted in processed-byte
+/// equivalents: each authentication attempt charges the unit's length
+/// plus [`SCAN_ATTEMPT_OVERHEAD`]. The scan functions refuse to run an
+/// attempt the budget cannot cover and report the scan as
+/// [`UnitScan::Inconclusive`] instead, so exhaustion degrades toward
+/// blocking key rotation, never toward "foreign".
+pub struct ScanBudget {
+    /// Remaining processed-byte equivalents.
+    remaining: u64,
+}
+
+impl ScanBudget {
+    /// A fresh full budget of [`SCAN_BUDGET`] equivalents.
+    pub fn full() -> ScanBudget {
+        ScanBudget {
+            remaining: SCAN_BUDGET,
+        }
+    }
+
+    /// A budget of exactly `limit` equivalents; for tests and callers
+    /// that need a tighter bound.
+    pub fn with(limit: u64) -> ScanBudget {
+        ScanBudget { remaining: limit }
+    }
+
+    /// Tries to charge one authentication attempt over `len` unit
+    /// bytes; `false` means the budget is exhausted and the attempt
+    /// must not run.
+    pub fn charge(&mut self, len: usize) -> bool {
+        let cost = len as u64 + SCAN_ATTEMPT_OVERHEAD;
+        if self.remaining < cost {
+            return false;
+        }
+        self.remaining -= cost;
+        true
+    }
+}
+
 /// Builds the associated data of binary chunk `index`.
 pub fn ad_bin(index: u64, last: bool) -> Vec<u8> {
     let mut ad = Vec::with_capacity(AD_BIN_PREFIX.len() + 9);

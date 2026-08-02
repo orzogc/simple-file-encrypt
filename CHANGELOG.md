@@ -113,6 +113,39 @@ ciphertext layouts, and all derivation strings.
   per-file insertion shifted the list's whole tail every time and went
   quadratic on a large directory of new files; `remove` finds managed
   entries by binary search.
+- **"Foreign" is now only ever the verdict of a complete unit scan.**
+  The any-unit scan stopped after `MAX_UNITS` lines and reported the
+  cutoff as "no match": 2^22 junk lines inserted before intact units
+  hid them past the horizon, verify passed, and `rekey --prune`
+  dropped the key those units still need — breaking the stated
+  invariant that any surviving unit blocks convergence. The scan now
+  skips undecodable lines for free (a surviving unit is found behind
+  any amount of shredded content, with no line cutoff at all) and
+  meters authentication attempts against a per-file work budget;
+  running out reports the scan as inconclusive, which blocks
+  convergence as ambiguous — the same conservative path over-cap
+  content takes. Over-cap text hits without a surviving unit in the
+  cap-sized prefix are likewise ambiguous now instead of foreign:
+  prepended damage can push real units past any prefix, so a prefix
+  can prove ownership but never disprove it. The budget also bounds
+  the scan's worst-case CPU against hostile floods of valid-looking
+  units (found by external review).
+- **An exact managed directory entry that becomes a repository root
+  is recorded as a boundary** — reported by `status`/`verify`, warned
+  about by a fresh `rekey`, refused by `--continue`/`--prune` — like
+  a boundary discovered inside a walk, instead of hard-erroring every
+  audit-style command. Explicit arguments naming a repository root
+  keep the hard error (found by external review).
+- `decrypt`'s note for an excluded unrecognized-header file points at
+  `verify` as the keyed arbiter of ours-vs-foreign, instead of
+  implying the shape was checked (it never was: `decrypt` cannot
+  repair a header, and reads no password for a keyless note).
+- `read_capped` re-stats the open descriptor after reading and fails
+  on any snapshot mismatch, so a same-size in-place rewrite during
+  the read no longer slips past the length check (best-effort, as
+  local TOCTOU stays outside the threat model).
+- A `v*` tag push no longer runs the CI suite twice (once for the
+  tag, once through the release workflow's call).
 
 ### Compatibility
 

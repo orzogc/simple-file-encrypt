@@ -474,8 +474,20 @@ impl<'a> Expander<'a> {
             }
             // The entry itself may be a nested-repository root or hold a
             // foreign config (the domain root is exempt); ancestors were
-            // checked above, children are checked during the walk.
+            // checked above, children are checked during the walk. A
+            // *managed* entry that has itself become a repository root
+            // is recorded as a boundary, exactly like one discovered
+            // during a walk: a directory can be encrypted first and
+            // gain a `.git` later, and one such entry must not abort
+            // every audit-style scan — `status`/`verify` report it and
+            // `rekey --continue`/`--prune` refuse to converge past it.
+            // An explicit argument keeps the hard error: the user names
+            // the repository itself, which needs its own domain.
             if !rel.is_empty() {
+                if matches!(origin, Origin::Managed) && paths::exists_probe(&abs.join(".git"))? {
+                    report::note(format!("skipping nested repository `{rel}`"));
+                    return self.skip_boundary(rel.to_owned());
+                }
                 self.check_boundary(rel, &abs)?;
             }
             return self.walk_dir(rel, &abs, dir_id(&md), origin, 0, None);
@@ -909,9 +921,21 @@ mod tests {
         touch(&root.join("vendor/inner.txt"));
         let err = expand(root, &[("vendor/inner.txt".into(), Origin::Managed)], &[]).unwrap_err();
         assert!(err.to_string().contains("nested repository"));
-        // The directory entry itself being a nested-repository root is
-        // caught too, not only files beneath it.
-        let err = expand(root, &[("vendor".into(), Origin::Managed)], &[]).unwrap_err();
+        // A managed *directory* entry that is itself a
+        // nested-repository root is recorded as a boundary instead —
+        // a directory can be encrypted first and gain a `.git` later,
+        // and one such entry must not abort every audit-style scan.
+        let exp = expand(root, &[("vendor".into(), Origin::Managed)], &[]).unwrap();
+        assert!(exp.files.is_empty());
+        assert_eq!(exp.skipped_boundaries, ["vendor"]);
+        // An explicit argument naming the repository root keeps the
+        // hard error: it needs its own domain.
+        let err = expand(
+            root,
+            &[("vendor".into(), Origin::Explicit { named: true })],
+            &[],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("nested repository"));
     }
 

@@ -1,10 +1,11 @@
 //! Property tests: encryption round-trips losslessly for arbitrary byte
-//! sequences in both modes, ciphertext is deterministic, and unit-region
-//! tampering never yields a successful decryption.
+//! sequences in both modes, ciphertext is deterministic, unit-region
+//! tampering never yields a successful decryption, and a budget-cut
+//! unit scan never downgrades a find to a decisive no.
 
 use proptest::prelude::*;
 use simple_file_encrypt::consts::TEXT_HEADER_V1;
-use simple_file_encrypt::crypto::{DomainKey, FileKeys};
+use simple_file_encrypt::crypto::{DomainKey, FileKeys, ScanBudget, UnitScan};
 use simple_file_encrypt::probe::{Probe, probe};
 use simple_file_encrypt::{binmode, textmode};
 use zeroize::Zeroizing;
@@ -104,4 +105,65 @@ proptest! {
         let cb = textmode::encrypt(&fk, "p/q.txt", &b).unwrap();
         prop_assert_eq!(ca.len(), cb.len());
     }
+
+    /// The ownership-scan safety invariant: whatever the budget, a
+    /// scan may weaken a find into "inconclusive" but never into the
+    /// decisive "no match" that lets `rekey --prune` treat content as
+    /// foreign — and a budget-cut scan never invents a find either.
+    /// The scanned content mixes damage, alien units, and real units
+    /// in arbitrary order; the unbudgeted scan is the ground truth.
+    #[test]
+    fn budget_cut_text_scans_never_go_decisive(
+        pieces in prop::collection::vec(
+            prop_oneof![
+                2 => Just(0u8), // an undecodable junk line
+                2 => Just(1u8), // a decodable unit of another path
+                1 => Just(2u8), // a real unit of this path
+            ],
+            0..12,
+        ),
+        budget in 0u64..40_000,
+    ) {
+        let ks = keys();
+        let fk = FileKeys::derive(&ks[1], "p/q.txt");
+        let alien = FileKeys::derive(&ks[0], "elsewhere.txt");
+        let mut ct = format!("{TEXT_HEADER_V1}\n").into_bytes();
+        for (n, piece) in pieces.iter().enumerate() {
+            match piece {
+                0 => ct.extend_from_slice(b"!!!junk-line-that-cannot-decode!!!"),
+                1 => ct.extend_from_slice(&unit_line(&alien, &format!("alien {n}"))),
+                _ => ct.extend_from_slice(&unit_line(&fk, &format!("real {n}"))),
+            }
+            ct.push(b'\n');
+        }
+        let full = textmode::authenticate_any(
+            &ks, "p/q.txt", &ct, &mut ScanBudget::with(u64::MAX),
+        );
+        let cut = textmode::authenticate_any(
+            &ks, "p/q.txt", &ct, &mut ScanBudget::with(budget),
+        );
+        match full {
+            UnitScan::Found(idx) => prop_assert!(
+                matches!(cut, UnitScan::Inconclusive) || cut == UnitScan::Found(idx),
+                "a budget cut downgraded {full:?} to {cut:?}"
+            ),
+            UnitScan::NoMatch => prop_assert!(
+                matches!(cut, UnitScan::NoMatch | UnitScan::Inconclusive),
+                "a budget cut turned no-match into {cut:?}"
+            ),
+            UnitScan::Inconclusive => prop_assert!(
+                false, "an unbudgeted scan cannot be inconclusive"
+            ),
+        }
+    }
+}
+
+/// One ciphertext unit line holding `text`, encrypted under `fk`'s
+/// bound path (the path argument of `encrypt` is error context only).
+fn unit_line(fk: &FileKeys, text: &str) -> Vec<u8> {
+    let ct = textmode::encrypt(fk, "ctx", text.as_bytes()).unwrap();
+    ct.split(|&b| b == b'\n')
+        .nth(1)
+        .expect("header line is followed by a unit line")
+        .to_vec()
 }

@@ -536,15 +536,16 @@ authenticates the first unit).
 `check` exempts: an excluded file that probes as encrypted is
 authenticated against the ring. If it decrypts under any ring key —
 or **any unit** of it authenticates while the file does not fully
-decrypt (damaged, truncated, appended to, mixing key epochs, or grown
-past the size cap; every unit line and binary chunk is scanned — text
-over-cap hits from a cap-sized prefix, binary over-cap hits by their
-first chunk with the ambiguous fallback described under `rekey` — and
-a damaged header does not end the scan) — that is **this domain's
-ciphertext hidden from migration**, reported as a failure; content in which no unit
-authenticates is deliberately excluded foreign-looking material and
-is only noted (see the residual-shapes list under `rekey`). Excluded
-plaintext is not reported at all.
+decrypt (damaged, truncated, appended to, prepended to, mixing key
+epochs, or grown past the size cap; every unit line and binary chunk
+is scanned, and a damaged header does not end the scan) — that is
+**this domain's ciphertext hidden from migration**, reported as a
+failure. A hit whose scan could not complete — over-cap content, or
+the per-file work budget running out — is ambiguous and fails too
+(see `rekey`). Only content a *complete* scan clears is treated as
+deliberately excluded foreign-looking material and merely noted (see
+the residual-shapes list under `rekey`). Excluded plaintext is not
+reported at all.
 
 ### `passwd` (alias `p`)
 
@@ -617,30 +618,39 @@ binary chunk; a destroyed header or first unit does not end the scan)
 fresh `rekey` warns and proceeds (consistent with its tolerance for
 missing paths); `--continue` and `--prune` refuse — the fix is
 `decrypt` (which recovers excluded ciphertext) or `remove --exclude`.
-Excluded content that authenticates under no key is foreign and never
-blocks rotation. A hit too large to read whole is classified from a
-bounded prefix: *text* is scanned line by line from a cap-sized
-prefix, which holds every unit a valid ciphertext of this domain
-could have, so appended-to or damaged over-cap text blocks
-convergence exactly like an in-cap file; *binary* is decided from its
-header plus first chunk, and a valid header whose first chunk does
-not authenticate is **ambiguous** — a single-chunk ciphertext of this
-domain with appended data is indistinguishable from foreign content
-(its last-chunk extent is unrecoverable), and since ambiguity blocks
-convergence exactly like a proven hit, scanning further chunks could
-only sharpen the message — so `--continue` and `--prune` refuse it
-too; restore the original bytes or move the file out to resolve it. Two shapes stay decisively foreign: a structurally
-invalid (or newer-version) binary header on an over-cap file, and an
-empty-file marker header with appended data (the recoverable
-plaintext is empty, so nothing can be lost). What remains genuinely
-indistinguishable from foreign ciphertext — and reads as foreign — is
-a hit with **no surviving unit**: every unit destroyed, a single-unit
-file whose only unit is damaged, or a short single-chunk binary
-ciphertext with appended data (its chunk extent is unrecoverable).
-The on-disk copy is beyond repair in those states, but git history
-may still hold an intact one — restore it *before* pruning, and treat
-`verify`'s "ignored" lines as worth a look when content under an
-exclusion was ever encrypted here.
+Excluded content is read as foreign — never blocking rotation — only
+after a **complete** scan: every unit line and grid chunk of the
+whole file tried against every ring key. Two things can keep a scan
+from being complete, and both degrade to **ambiguous** (blocking
+convergence exactly like a proven hit), never to foreign. First, the
+per-file work budget: a hostile flood of valid-looking units cannot
+push a scan into minutes — it runs the budget out instead, and the
+scan reports itself cut short (any realistic file under a small ring
+scans to a decisive verdict well within the budget). Second, the
+size cap: a hit too large to read whole is scanned from a cap-sized
+prefix, where a surviving unit is decisive proof of ownership but
+finding none proves nothing — prepended damage can push real units
+past any prefix. An over-cap *binary* hit is decided from its header
+plus first chunk (a valid header whose first chunk does not
+authenticate is ambiguous: a single-chunk ciphertext with appended
+data is unrecognizable from any prefix, and since ambiguity already
+blocks convergence, scanning further chunks could only sharpen the
+message); an over-cap file cannot be intact ciphertext of *any*
+domain anyway (the cap binds both sides), so a v1 header there is
+realistically ciphertext-plus-junk of some kind. Restore the
+original bytes or move the file out to resolve an ambiguous hit. The
+one over-cap shape read as decisively foreign is a structurally
+invalid (or newer-version) binary header. In-cap, after the complete
+scan, two shapes remain genuinely indistinguishable from foreign
+ciphertext — and read as foreign: a hit with **no surviving unit**
+(every unit destroyed, or a single-unit file whose only unit is
+damaged — including the empty-file marker followed by junk, where
+the recoverable plaintext is empty so nothing can be lost), and a
+short single-chunk binary ciphertext with appended data (its chunk
+extent is unrecoverable). The on-disk copy is beyond repair in those
+states, but git history may still hold an intact one — restore it
+*before* pruning, and treat `verify`'s "ignored" lines as worth a
+look when content under an exclusion was ever encrypted here.
 
 A fresh `rekey`, by contrast, may start a new epoch while managed
 paths are missing or skipped: exit 0 then means the epoch started and

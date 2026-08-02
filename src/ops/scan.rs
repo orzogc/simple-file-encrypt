@@ -351,10 +351,10 @@ pub fn verify(arg_paths: &[PathBuf], gate: &KdfGate) -> Result<ScanOutcome> {
             Ok(Some(super::ExcludedCiphertext::Ambiguous)) => {
                 failures += 1;
                 report::out(format!(
-                    "FAILED {}: excluded path exceeds the file-size cap and cannot be \
-                     authenticated from a bounded prefix — a single-chunk binary ciphertext of \
-                     this domain with appended data is indistinguishable from foreign content; \
-                     restore the original bytes or move the file out of the tree",
+                    "FAILED {}: excluded path cannot be conclusively classified (over-cap \
+                     content, or a unit scan cut short by its work budget) — if it is this \
+                     domain's ciphertext it is hidden from migration; restore the original \
+                     bytes or move the file out of the tree",
                     ex.rel
                 ));
             }

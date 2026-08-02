@@ -110,6 +110,24 @@ pub const MAX_CONFIG_ENTRIES: usize = 65536;
 /// Hard cap on key-ring entries.
 pub const MAX_RING_LEN: usize = 64;
 
+/// Work budget for one file's any-unit scan (the excluded-content
+/// ownership arbiter), in processed-byte equivalents: every
+/// authentication attempt charges the unit's length plus
+/// [`SCAN_ATTEMPT_OVERHEAD`]. 4 GiB is seconds of AES-SIV on current
+/// hardware, and generous enough that any in-cap file scans to a
+/// decisive verdict under a small ring (256 MiB of the shortest
+/// possible units times four keys stays within it); a hostile flood
+/// of valid-looking units under a large ring runs out instead of
+/// running for minutes. Exhaustion is reported as inconclusive —
+/// which blocks key rotation — never as foreign.
+pub const SCAN_BUDGET: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Fixed per-attempt surcharge in the scan budget: AES-SIV setup (key
+/// schedule and CMAC initialization) costs about as much as a hundred
+/// body bytes even for an empty unit, so a flood of tiny units cannot
+/// make the fixed cost disappear from the accounting.
+pub const SCAN_ATTEMPT_OVERHEAD: u64 = 128;
+
 /// Hard cap on password length in bytes.
 pub const MAX_PASSWORD_LEN: usize = 4096;
 

@@ -153,9 +153,9 @@ pub fn rekey(mode: RekeyMode, gate: &KdfGate) -> Result<()> {
     for hit in &excluded_hits {
         report::warn(match hit.kind {
             super::ExcludedCiphertext::Ambiguous => format!(
-                "excluded path `{}` exceeds the file-size cap and cannot be authenticated; if it \
-                 is this domain's ciphertext with appended data it stays on its old key — \
-                 restore the original bytes or move it out of the tree",
+                "excluded path `{}` cannot be conclusively classified (over-cap content, or a \
+                 unit scan cut short by its work budget); if it is this domain's ciphertext it \
+                 stays on its old key — restore the original bytes or move it out of the tree",
                 hit.rel
             ),
             _ => format!(
@@ -326,10 +326,9 @@ fn excluded_hit_message(hit: &ExcludedHit) -> String {
             hit.rel
         ),
         super::ExcludedCiphertext::Ambiguous => format!(
-            "excluded path `{}` exceeds the file-size cap and cannot be authenticated from a \
-             bounded prefix — a single-chunk binary ciphertext of this domain with appended data \
-             is indistinguishable from foreign content; restore the original bytes or move the \
-             file out of the tree first",
+            "excluded path `{}` cannot be conclusively classified (over-cap content, or a unit \
+             scan cut short by its work budget) — it may be this domain's ciphertext hidden \
+             from migration; restore the original bytes or move the file out of the tree first",
             hit.rel
         ),
         super::ExcludedCiphertext::Foreign => unreachable!("foreign content is never a hit"),

@@ -3,7 +3,7 @@
 //! header, lengths, and the ordered chunk SIVs (see `docs/format.md`).
 
 use crate::consts::*;
-use crate::crypto::{DomainKey, FileKeys, ad_bin};
+use crate::crypto::{DomainKey, FileKeys, ScanBudget, UnitScan, ad_bin};
 use crate::error::{Error, Result};
 
 /// On-disk size of a full chunk: `CHUNK_SIZE + SIV_LEN`.
@@ -204,13 +204,22 @@ pub fn authenticate_first_bounded(keys: &[DomainKey], path: &str, prefix: &[u8])
 /// grid cannot know — the last chunk's extent. The structure is never
 /// *trusted* for the other chunks: truncated or appended-to content
 /// can reparse self-consistently with every boundary shifted, while
-/// the grid stays aligned with whatever survived. A hit ends the scan;
-/// the full-scan worst case is reserved for content that authenticates
-/// nowhere.
-pub fn authenticate_any(keys: &[DomainKey], path: &str, ct: &[u8]) -> Option<usize> {
+/// the grid stays aligned with whatever survived. Authentication
+/// attempts draw on `budget`; when it cannot cover the next attempt
+/// the scan reports [`UnitScan::Inconclusive`], never a decisive no,
+/// so [`UnitScan::NoMatch`] certifies a complete scan. A hit ends the
+/// scan; the full-scan worst case is reserved for content that
+/// authenticates nowhere.
+pub fn authenticate_any(
+    keys: &[DomainKey],
+    path: &str,
+    ct: &[u8],
+    budget: &mut ScanBudget,
+) -> UnitScan {
     let fks: Vec<FileKeys> = keys.iter().map(|k| FileKeys::derive(k, path)).collect();
-    if let Some(k) = authenticate_grid(&fks, ct) {
-        return Some(k);
+    match authenticate_grid(&fks, ct, budget) {
+        UnitScan::NoMatch => {}
+        decisive => return decisive,
     }
     if let Ok(chunks) = parse_structure(path, ct) {
         let body = &ct[BIN_HEADER_LEN..];
@@ -218,12 +227,15 @@ pub fn authenticate_any(keys: &[DomainKey], path: &str, ct: &[u8]) -> Option<usi
         let plan = &chunks[i];
         let unit = &body[plan.start..plan.end];
         for (k, fk) in fks.iter().enumerate() {
+            if !budget.charge(unit.len()) {
+                return UnitScan::Inconclusive;
+            }
             if fk.unit_decrypt(&ad_bin(i as u64, true), unit).is_some() {
-                return Some(k);
+                return UnitScan::Found(k);
             }
         }
     }
-    None
+    UnitScan::NoMatch
 }
 
 /// Grid scan over content whose chunk boundaries cannot be trusted: an
@@ -238,22 +250,32 @@ pub fn authenticate_any(keys: &[DomainKey], path: &str, ct: &[u8]) -> Option<usi
 /// full single-chunk ciphertext with data appended. Last chunks other
 /// than that one have unrecoverable extents and cannot be tried here:
 /// a short single-chunk ciphertext with data appended stays
-/// unrecognizable from a grid (the documented residual). Returns the
-/// ring index of the first hit.
-fn authenticate_grid(fks: &[FileKeys], ct: &[u8]) -> Option<usize> {
-    let body = ct.get(BIN_HEADER_LEN..)?;
+/// unrecognizable from a grid (the documented residual). Attempts draw
+/// on `budget`; exhaustion reports [`UnitScan::Inconclusive`].
+fn authenticate_grid(fks: &[FileKeys], ct: &[u8], budget: &mut ScanBudget) -> UnitScan {
+    let Some(body) = ct.get(BIN_HEADER_LEN..) else {
+        return UnitScan::NoMatch;
+    };
     for i in 0..body.len() / CHUNK_DISK {
         let unit = &body[i * CHUNK_DISK..(i + 1) * CHUNK_DISK];
         for (k, fk) in fks.iter().enumerate() {
-            if fk.unit_decrypt(&ad_bin(i as u64, false), unit).is_some() {
-                return Some(k);
+            if !budget.charge(unit.len()) {
+                return UnitScan::Inconclusive;
             }
-            if i == 0 && fk.unit_decrypt(&ad_bin(0, true), unit).is_some() {
-                return Some(k);
+            if fk.unit_decrypt(&ad_bin(i as u64, false), unit).is_some() {
+                return UnitScan::Found(k);
+            }
+            if i == 0 {
+                if !budget.charge(unit.len()) {
+                    return UnitScan::Inconclusive;
+                }
+                if fk.unit_decrypt(&ad_bin(0, true), unit).is_some() {
+                    return UnitScan::Found(k);
+                }
             }
         }
     }
-    None
+    UnitScan::NoMatch
 }
 
 /// Decrypts a binary ciphertext, trying ring keys in order on the first
@@ -449,6 +471,11 @@ mod tests {
         assert!(err.to_string().contains("zero-length chunk"), "got: {err}");
     }
 
+    /// [`authenticate_any`] with a fresh full budget.
+    fn scan(ks: &[DomainKey], path: &str, ct: &[u8]) -> UnitScan {
+        authenticate_any(ks, path, ct, &mut ScanBudget::full())
+    }
+
     #[test]
     fn authenticate_any_finds_surviving_chunks() {
         let ks = keys(2);
@@ -462,26 +489,26 @@ mod tests {
         let mut broken = ct.clone();
         broken[BIN_HEADER_LEN + 10] ^= 1;
         assert!(authenticate_first(&ks, "blob", &broken).is_err());
-        assert_eq!(authenticate_any(&ks, "blob", &broken), Some(1));
+        assert_eq!(scan(&ks, "blob", &broken), UnitScan::Found(1));
 
         // Appended data shifts the parsed extents; the intact first
         // chunk still sits on the grid as a non-last chunk.
         let mut appended = ct.clone();
         appended.extend_from_slice(&[0u8; 100]);
-        assert_eq!(authenticate_any(&ks, "blob", &appended), Some(1));
+        assert_eq!(scan(&ks, "blob", &appended), UnitScan::Found(1));
 
         // Truncation into the middle of a chunk reparses
         // self-consistently with every boundary shifted (the tail of
         // chunk 0 reads as a "last chunk"): only the grid, which never
         // trusts the reparse, still finds the intact first chunk.
         let truncated = &ct[..BIN_HEADER_LEN + CHUNK_DISK + 7];
-        assert_eq!(authenticate_any(&ks, "blob", truncated), Some(1));
+        assert_eq!(scan(&ks, "blob", truncated), UnitScan::Found(1));
 
         // A damaged header (bad version) with an intact body: the grid
         // fallback ignores the header fields.
         let mut bad_version = ct.clone();
         bad_version[8] = 0x7f;
-        assert_eq!(authenticate_any(&ks, "blob", &bad_version), Some(1));
+        assert_eq!(scan(&ks, "blob", &bad_version), UnitScan::Found(1));
 
         // A full single-chunk ciphertext with appended data: slot 0 is
         // full and non-last after reparsing, and the extra
@@ -489,7 +516,7 @@ mod tests {
         let full_single = encrypt(&fk, "blob", &vec![7u8; CHUNK_SIZE]).unwrap();
         let mut grown = full_single.clone();
         grown.extend_from_slice(&[0u8; 200]);
-        assert_eq!(authenticate_any(&ks, "blob", &grown), Some(1));
+        assert_eq!(scan(&ks, "blob", &grown), UnitScan::Found(1));
 
         // A short single-chunk ciphertext with appended data stays
         // unrecognizable: its chunk extent cannot be recovered (the
@@ -497,13 +524,27 @@ mod tests {
         let short_single = encrypt(&fk, "blob", b"tiny").unwrap();
         let mut grown_short = short_single.clone();
         grown_short.extend_from_slice(&[0u8; 200]);
-        assert_eq!(authenticate_any(&ks, "blob", &grown_short), None);
+        assert_eq!(scan(&ks, "blob", &grown_short), UnitScan::NoMatch);
 
-        // Foreign content and wrong paths authenticate nowhere.
-        assert_eq!(authenticate_any(&ks, "moved", &ct), None);
+        // Foreign content and wrong paths authenticate nowhere; the
+        // complete scan is decisive.
+        assert_eq!(scan(&ks, "moved", &ct), UnitScan::NoMatch);
         let mut junk = header_v1().to_vec();
         junk.extend_from_slice(&vec![0u8; 3 * CHUNK_DISK]);
-        assert_eq!(authenticate_any(&ks, "blob", &junk), None);
+        assert_eq!(scan(&ks, "blob", &junk), UnitScan::NoMatch);
+
+        // An exhausted budget is inconclusive, never a decisive no:
+        // the chunks it could not try may include a surviving one.
+        let mut tiny = ScanBudget::with(0);
+        assert_eq!(
+            authenticate_any(&ks, "blob", &broken, &mut tiny),
+            UnitScan::Inconclusive
+        );
+        let mut partial = ScanBudget::with(CHUNK_DISK as u64 + SCAN_ATTEMPT_OVERHEAD);
+        assert_eq!(
+            authenticate_any(&ks, "blob", &broken, &mut partial),
+            UnitScan::Inconclusive
+        );
     }
 
     #[test]

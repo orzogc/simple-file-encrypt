@@ -92,7 +92,8 @@ pub fn read_capped(path: &Path, cap: u64, what: &str) -> Result<FileData> {
     let mut content = Vec::with_capacity(md.size() as usize);
     // Read at most cap + 1 bytes: one byte past the cap proves the file
     // grew (or lied about its size) without an unbounded allocation.
-    let mut limited = file.take(cap.saturating_add(1));
+    // The descriptor is borrowed, not consumed: it is re-statted below.
+    let mut limited = (&file).take(cap.saturating_add(1));
     limited
         .read_to_end(&mut content)
         .map_err(|e| Error::io("reading", path, e))?;
@@ -109,6 +110,23 @@ pub fn read_capped(path: &Path, cap: u64, what: &str) -> Result<FileData> {
             path,
             std::io::Error::other(
                 "file changed size while being read; retry when nothing else is writing it",
+            ),
+        ));
+    }
+    // Re-stat the open descriptor: a same-size in-place rewrite during
+    // the read keeps the length equal but moves the mtime, and the
+    // read-only commands (`verify`, classification) have no later
+    // pre-rename check to catch it. Best-effort — a race inside the
+    // read-to-stat window remains, as documented in the threat model.
+    let md_after = file
+        .metadata()
+        .map_err(|e| Error::io("inspecting", path, e))?;
+    if !snap.matches(&Snapshot::of(&md_after)) {
+        return Err(Error::io(
+            "reading",
+            path,
+            std::io::Error::other(
+                "file changed while being read; retry when nothing else is writing it",
             ),
         ));
     }

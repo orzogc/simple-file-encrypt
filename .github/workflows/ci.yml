@@ -5,6 +5,9 @@ name: CI
 
 on:
   push:
+    # Branches only: a v* tag push runs the suite once through
+    # release.yml's workflow_call instead of twice.
+    branches: ["**"]
   pull_request:
   # Lets release.yml run this whole suite as one job before building.
   workflow_call:
