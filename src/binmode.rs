@@ -93,6 +93,27 @@ fn validate_header(path: &str, ct: &[u8]) -> Result<()> {
 /// Structurally parses a binary ciphertext: header fields, chunk
 /// boundaries, and overall lengths. No cryptography.
 fn parse_structure(path: &str, ct: &[u8]) -> Result<Vec<ChunkPlan>> {
+    validate_header_present(path, ct)?;
+    parse_layout(path, ct)
+}
+
+/// Validates the header once the minimum length holds.
+fn validate_header_present(path: &str, ct: &[u8]) -> Result<()> {
+    if ct.len() < BIN_HEADER_LEN + SIV_LEN + FILE_TAG_LEN {
+        return Err(Error::format(
+            path,
+            "binary ciphertext shorter than the 64-byte minimum",
+        ));
+    }
+    validate_header(path, ct)
+}
+
+/// Chunk boundaries implied by the total length alone — independent
+/// of the header *fields*, which are as damageable as any unit: the
+/// ownership scan must be able to locate the last chunk of a
+/// ciphertext whose version byte was flipped, so this deliberately
+/// skips [`validate_header`] (the decrypt path validates separately).
+fn parse_layout(path: &str, ct: &[u8]) -> Result<Vec<ChunkPlan>> {
     // 16-byte header + at least one (possibly empty) chunk + 32-byte tag.
     if ct.len() < BIN_HEADER_LEN + SIV_LEN + FILE_TAG_LEN {
         return Err(Error::format(
@@ -100,8 +121,6 @@ fn parse_structure(path: &str, ct: &[u8]) -> Result<Vec<ChunkPlan>> {
             "binary ciphertext shorter than the 64-byte minimum",
         ));
     }
-    validate_header(path, ct)?;
-
     let body_len = ct.len() - BIN_HEADER_LEN - FILE_TAG_LEN;
     let mut chunks = Vec::with_capacity(body_len / CHUNK_DISK + 1);
     let mut remaining = body_len;
@@ -185,14 +204,18 @@ pub fn authenticate_any_prefix(
 /// surviving chunks still need.
 ///
 /// The fixed grid of [`authenticate_grid`] does the bulk of the work;
-/// on top of it, a parseable structure contributes the one thing the
-/// grid cannot know — the last chunk's extent. The structure is never
-/// *trusted* for the other chunks: truncated or appended-to content
-/// can reparse self-consistently with every boundary shifted, while
-/// the grid stays aligned with whatever survived. Authentication
-/// attempts draw on `budget`; when it cannot cover the next attempt
-/// the scan reports [`UnitScan::Inconclusive`], never a decisive no,
-/// so [`UnitScan::NoMatch`] certifies a complete scan. A hit ends the
+/// on top of it, a parseable *layout* contributes the one thing the
+/// grid cannot know — the last chunk's extent. The layout comes from
+/// the total length alone ([`parse_layout`]), not from the header
+/// fields: a flipped version byte must not hide the intact last chunk
+/// of a small ciphertext the grid has no slot for. The layout is
+/// never *trusted* for the other chunks either: truncated or
+/// appended-to content can reparse self-consistently with every
+/// boundary shifted, while the grid stays aligned with whatever
+/// survived. Authentication attempts draw on `budget`; when it cannot
+/// cover the next attempt the scan reports
+/// [`UnitScan::Inconclusive`], never a decisive no, so
+/// [`UnitScan::NoMatch`] certifies a complete scan. A hit ends the
 /// scan; the full-scan worst case is reserved for content that
 /// authenticates nowhere.
 pub fn authenticate_any(
@@ -206,7 +229,7 @@ pub fn authenticate_any(
         UnitScan::NoMatch => {}
         decisive => return decisive,
     }
-    if let Ok(chunks) = parse_structure(path, ct) {
+    if let Ok(chunks) = parse_layout(path, ct) {
         let body = &ct[BIN_HEADER_LEN..];
         let i = chunks.len() - 1;
         let plan = &chunks[i];
@@ -494,6 +517,14 @@ mod tests {
         let mut bad_version = ct.clone();
         bad_version[8] = 0x7f;
         assert_eq!(scan(&ks, "blob", &bad_version), UnitScan::Found(1));
+
+        // The same damage on a *small single-chunk* ciphertext, which
+        // the grid has no slot for: the last chunk's extent comes from
+        // the length-only layout, so a flipped version byte does not
+        // hide it either.
+        let mut small_bad = encrypt(&fk, "blob", b"tiny").unwrap();
+        small_bad[8] = 0x7f;
+        assert_eq!(scan(&ks, "blob", &small_bad), UnitScan::Found(1));
 
         // A full single-chunk ciphertext with appended data: slot 0 is
         // full and non-last after reparsing, and the extra

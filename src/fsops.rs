@@ -737,6 +737,14 @@ mod tests {
         let taken = snap(&path);
         std::fs::hard_link(&path, dir.path().join("l")).unwrap();
         assert!(!taken.matches(&snap(&path)));
+
+        // The ctime field must stay in the comparison: it is what
+        // catches a same-size rewrite that restores the mtime (ctime
+        // cannot be set from userspace). A pure value check avoids
+        // depending on filesystem timestamp granularity.
+        let mut shifted = taken;
+        shifted.ctime.1 ^= 1;
+        assert!(!taken.matches(&shifted));
     }
 
     /// `/proc` files report size 0 but yield content: they exercise the

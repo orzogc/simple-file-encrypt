@@ -168,6 +168,29 @@ ciphertext layouts, and all derivation strings.
   instead of ignored-foreign); binary scans got the same budget-cut
   property test as text ones, and both scanners gained fuzz targets
   exercising arbitrary budget cutoffs.
+- **A flipped header byte on a small in-cap single-chunk ciphertext
+  no longer reads as foreign.** The binary scan located the last
+  chunk through the structure parser, which validated the header
+  first, so a small single-chunk ciphertext (nothing on the grid)
+  with a damaged version byte was never tried at all — the in-cap
+  sibling of the over-cap header-blind fix. Chunk boundaries come
+  from the total length alone, so the scan now derives them without
+  touching the header fields.
+- The `authenticate_any` fuzz targets run in CI beside the decrypt
+  ones, with committed authentic seeds (a surviving unit behind an
+  alien one, header-damaged chunks, budgets that die mid-scan) — a
+  mutation-only fuzzer cannot forge an AES-SIV unit, so without seeds
+  the `Found` verdicts were unreachable; their budget prefix grew to
+  three bytes so a budget-cut scan can afford a full-chunk attempt,
+  and the header-blind prefix grid is held to the same
+  found/no-match/inconclusive invariant instead of a bare no-panic
+  check.
+- The concurrent-modification snapshot documentation lists the full
+  compared set — `(device, inode)`, size, mtime, ctime, mode, link
+  count — and a value-level test pins the ctime field; the
+  probe-boundary residual is spelled out next to the scan guarantees
+  (content whose magic itself was destroyed reads as plaintext and
+  never reaches the ownership scans).
 
 ### Compatibility
 

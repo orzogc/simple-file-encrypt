@@ -9,7 +9,10 @@ use simple_file_encrypt::crypto::{ScanBudget, UnitScan};
 // must never harden a verdict — see text_authenticate_any.rs.
 fuzz_target!(|data: &[u8]| {
     let keys = vec![zeroize::Zeroizing::new([0x42u8; 32])];
-    let (budget_bytes, rest) = data.split_at(data.len().min(2));
+    // Three budget bytes (big-endian): the maximum, ~16 MiB, covers a
+    // full-chunk authentication attempt (~64 KiB + overhead), so the
+    // budget-cut scan can reach every verdict on any input shape.
+    let (budget_bytes, rest) = data.split_at(data.len().min(3));
     let budget = budget_bytes.iter().fold(0u64, |a, &b| a << 8 | u64::from(b));
     let mut input = Vec::with_capacity(rest.len() + 8);
     // Keep the magic so the input reaches past the probe like real
@@ -20,6 +23,17 @@ fuzz_target!(|data: &[u8]| {
 
     let full = binmode::authenticate_any(&keys, "fuzz", &input, &mut ScanBudget::with(u64::MAX));
     let cut = binmode::authenticate_any(&keys, "fuzz", &input, &mut ScanBudget::with(budget));
+    check(full, cut);
+
+    // The header-blind prefix grid holds the same invariant.
+    let full_prefix =
+        binmode::authenticate_any_prefix(&keys, "fuzz", &input, &mut ScanBudget::with(u64::MAX));
+    let cut_prefix =
+        binmode::authenticate_any_prefix(&keys, "fuzz", &input, &mut ScanBudget::with(budget));
+    check(full_prefix, cut_prefix);
+});
+
+fn check(full: UnitScan, cut: UnitScan) {
     match full {
         UnitScan::Found(i) => {
             assert!(cut == UnitScan::Found(i) || cut == UnitScan::Inconclusive);
@@ -29,6 +43,4 @@ fuzz_target!(|data: &[u8]| {
         }
         UnitScan::Inconclusive => unreachable!("an unbudgeted scan cannot be inconclusive"),
     }
-
-    let _ = binmode::authenticate_any_prefix(&keys, "fuzz", &input, &mut ScanBudget::with(budget));
-});
+}

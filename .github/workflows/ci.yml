@@ -119,10 +119,12 @@ jobs:
         # `cargo fuzz run` has no --locked; assert the fuzz lockfile is
         # in sync separately so it cannot drift silently.
       - run: cargo metadata --locked --manifest-path fuzz/Cargo.toml --format-version 1 > /dev/null
-      - run: mkdir -p fuzz/corpus/config_parse fuzz/corpus/text_decrypt fuzz/corpus/bin_decrypt
+      - run: mkdir -p fuzz/corpus/config_parse fuzz/corpus/text_decrypt fuzz/corpus/bin_decrypt fuzz/corpus/text_authenticate_any fuzz/corpus/bin_authenticate_any
       - run: cargo fuzz run config_parse fuzz/corpus/config_parse fuzz/seeds/config_parse -- -max_total_time=60 -max_len=1048576
       - run: cargo fuzz run text_decrypt fuzz/corpus/text_decrypt fuzz/seeds/text_decrypt -- -max_total_time=60 -max_len=1048576
       - run: cargo fuzz run bin_decrypt fuzz/corpus/bin_decrypt fuzz/seeds/bin_decrypt -- -max_total_time=60 -max_len=1048576
+      - run: cargo fuzz run text_authenticate_any fuzz/corpus/text_authenticate_any fuzz/seeds/text_authenticate_any -- -max_total_time=60 -max_len=1048576
+      - run: cargo fuzz run bin_authenticate_any fuzz/corpus/bin_authenticate_any fuzz/seeds/bin_authenticate_any -- -max_total_time=60 -max_len=1048576
         # A crash input is a one-of-a-kind reproducer; losing it to the
         # runner teardown would leave only the (truncated) log.
       - name: Upload crash artifacts

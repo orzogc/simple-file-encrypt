@@ -302,11 +302,14 @@ the error message names this cause.
   config does not hold would be undecryptable — re-running resumes
   from the visible config.
 - Immediately before the rename, the tool re-checks that the target is
-  still the file it read: same `(device, inode)`, size, and mtime. A
-  mismatch (an editor or build tool rewrote it mid-operation) fails
-  that file instead of destroying the concurrent change. The check is
-  best-effort — a race within the window remains possible
-  (see [threat-model.md](threat-model.md)). The config gets the same
+  still the file it read: same `(device, inode)`, size, mtime, ctime,
+  permission mode, and link count (reads re-check the same snapshot
+  against the open descriptor as soon as they finish; the ctime
+  catches a same-size rewrite that restores the mtime, since it cannot
+  be set from userspace). A mismatch (an editor or build tool rewrote
+  it mid-operation) fails that file instead of destroying the
+  concurrent change. The check is best-effort — a race within the
+  window remains possible (see [threat-model.md](threat-model.md)). The config gets the same
   treatment: before writing any ciphertext, the tool verifies that
   `.simple-file-encrypt.toml` is still the file it loaded, so a mid-run
   replacement (a `git checkout` in another terminal) aborts the command
@@ -543,7 +546,10 @@ authenticated against the ring. If it decrypts under any ring key —
 or **any unit** of it authenticates while the file does not fully
 decrypt (damaged, truncated, appended to, prepended to, mixing key
 epochs, or grown past the size cap; every unit line and binary chunk
-is scanned, and a damaged header does not end the scan) — that is
+is scanned, and a damaged header does not end the scan — though the
+*probe* must still hit: content whose text magic prefix or 8-byte
+binary magic was itself destroyed reads as plaintext and never
+reaches these scans, the unauthenticated-framing residual) — that is
 **this domain's ciphertext hidden from migration**, reported as a
 failure. A hit whose scan could not complete — over-cap content, or
 the per-file work budget running out — is ambiguous and fails too
