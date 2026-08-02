@@ -1352,6 +1352,41 @@ fn auto_add_registers_all_files_before_encrypting() {
 }
 
 #[test]
+fn auto_add_merges_a_large_batch_in_one_pass() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    // Existing managed entries sorting *after* the new batch, so under
+    // per-file insertion every new entry landed at the front of the
+    // list (the quadratic worst case the batched merge replaced); the
+    // behavior must be identical either way.
+    for i in 0..40 {
+        write_file(root, &format!("zz/f{i:02}.txt"), b"old\n");
+    }
+    init_domain(root);
+    run_pw(root, PW, &["encrypt", "zz"]).expect_code(0);
+    for i in 0..1500 {
+        write_file(
+            root,
+            &format!("aa/f{i:04}.txt"),
+            format!("s{i}\n").as_bytes(),
+        );
+    }
+    let r = run_pw(root, PW, &["encrypt", "aa"]).expect_code(0);
+    assert_contains(&r.stdout, "added aa/f0000.txt");
+    assert_contains(&r.stdout, "added aa/f1499.txt");
+    assert_eq!(read_config(root).matches("\"aa/f").count(), 1500);
+
+    // The merged list is a working managed list: re-encrypting adds
+    // nothing (every file is covered and already encrypted), and the
+    // ciphertext decrypts.
+    let r = run_pw(root, PW, &["encrypt", "aa"]).expect_code(0);
+    assert!(!r.stdout.contains("added "), "no re-adds:\n{}", r.stdout);
+    assert_contains(&r.stdout, "skipped aa/f0000.txt (already encrypted)");
+    run_pw(root, PW, &["decrypt", "aa/f0777.txt"]).expect_code(0);
+    assert_eq!(read_file(root, "aa/f0777.txt"), b"s777\n");
+}
+
+#[test]
 fn overlong_password_input_is_bounded() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();

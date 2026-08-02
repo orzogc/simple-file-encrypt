@@ -387,7 +387,7 @@ pub fn remove(arg_paths: &[PathBuf], force: bool, binary: bool, exclude: bool) -
             ));
             continue;
         }
-        if !domain.loaded.config.paths.contains(rel) {
+        if !domain.loaded.config.is_managed(rel) {
             if let Some(covering) = paths::covering_entry(&domain.loaded.config.paths, rel) {
                 return Err(Error::Usage(format!(
                     "`{rel}` is covered by the managed directory entry `{covering}`, not an entry itself; \

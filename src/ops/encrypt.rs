@@ -10,7 +10,7 @@ use crate::probe::{Probe, probe};
 use crate::select::{self, Origin, TargetFile};
 use crate::{binmode, fsops, report, textmode};
 
-use super::{Domain, Mode, insert_sorted, pick_mode, refuse_hard_links, run_serial};
+use super::{Domain, Mode, pick_mode, refuse_hard_links, run_serial};
 
 /// Options of the `encrypt` command.
 pub struct EncryptOpts {
@@ -189,12 +189,22 @@ pub(crate) fn encrypt_pass(
         for file in files {
             if file.explicit
                 && crate::paths::covering_entry(&domain.loaded.config.paths, &file.rel).is_none()
-                && insert_sorted(&mut domain.loaded.config.paths, &file.rel)
             {
                 added.push(file.rel.clone());
             }
         }
+        // One sorted merge instead of one `Vec::insert` per file: the
+        // expanded set holds each rel once and sibling files never
+        // cover one another, so deferring the insertions changes no
+        // coverage decision above — while per-file insertion would
+        // shift O(existing entries) strings for every new file, going
+        // quadratic on a large directory of new files.
+        added.sort_unstable();
+        added.dedup();
         if !added.is_empty() {
+            domain.loaded.config.paths.extend(added.iter().cloned());
+            domain.loaded.config.paths.sort_unstable();
+            domain.loaded.config.paths.dedup();
             domain.loaded.rewrite()?;
             for rel in &added {
                 report::out(format!("added {rel}"));

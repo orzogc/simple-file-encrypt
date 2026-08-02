@@ -108,6 +108,11 @@ ciphertext layouts, and all derivation strings.
   work.
 - `encrypt`'s auto-add and the `add`/`remove` coverage lookups use the
   sorted-list ancestor search instead of linear scans.
+- `encrypt`'s auto-add batches new entries into one sorted merge
+  instead of inserting each into the managed list separately — the
+  per-file insertion shifted the list's whole tail every time and went
+  quadratic on a large directory of new files; `remove` finds managed
+  entries by binary search.
 
 ### Compatibility
 
