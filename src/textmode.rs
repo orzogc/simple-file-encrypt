@@ -228,6 +228,41 @@ pub fn authenticate_first(keys: &[DomainKey], path: &str, ct: &[u8]) -> Result<u
     }
 }
 
+/// Scans every unit line for one that authenticates under any ring
+/// key: the arbiter between damaged ciphertext of this domain and
+/// foreign content once full decryption has failed. Any authenticating
+/// unit — not just the first — proves the content was encrypted here,
+/// so a destroyed first line must not let `rekey --prune` drop the key
+/// the surviving lines still need.
+///
+/// The first line is skipped whatever its form (a valid header, a
+/// damaged one, or the empty-file marker — whose junk-followed form
+/// stays decisively foreign, as nothing recoverable is lost). Lines
+/// that fail to decode are skipped, not fatal: damage is the expected
+/// input. At most `MAX_UNITS` lines are examined — a valid ciphertext
+/// of this domain never holds more, so appended lines past that point
+/// cannot be its units. A hit ends the scan; the full-scan worst case
+/// is reserved for content that authenticates nowhere.
+pub fn authenticate_any(keys: &[DomainKey], path: &str, ct: &[u8]) -> Option<usize> {
+    let nl = ct.iter().position(|&b| b == b'\n')?;
+    let body = &ct[nl + 1..];
+    let fks: Vec<FileKeys> = keys.iter().map(|k| FileKeys::derive(k, path)).collect();
+    for (n, line) in body.split(|&b| b == b'\n').enumerate() {
+        if n as u64 >= MAX_UNITS {
+            break;
+        }
+        let Ok(unit) = decode_unit(path, line) else {
+            continue;
+        };
+        for (i, fk) in fks.iter().enumerate() {
+            if fk.unit_decrypt(AD_TEXT, &unit).is_some() {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
 /// Decrypts a text ciphertext, trying ring keys in order on the first
 /// unit and requiring every later unit to authenticate under the same
 /// key. Returns the plaintext and the ring-key index used.
@@ -472,6 +507,53 @@ mod tests {
             authenticate_first(&ks, "f.txt", &bad),
             Err(Error::Format { .. })
         ));
+    }
+
+    #[test]
+    fn authenticate_any_finds_surviving_units() {
+        let ks = keys(2);
+        let fk = FileKeys::derive(&ks[1], "f.txt");
+        let ct = encrypt(&fk, "f.txt", b"one\ntwo\n").unwrap();
+        let lines: Vec<&[u8]> = ct.split(|&x| x == b'\n').collect();
+
+        // First unit destroyed (invalid base64): the second still
+        // authenticates under ring entry 1.
+        let broken = [lines[0], b"!!!not-base64!!!", lines[2], b""].join(&b'\n');
+        assert!(authenticate_first(&ks, "f.txt", &broken).is_err());
+        assert_eq!(authenticate_any(&ks, "f.txt", &broken), Some(1));
+
+        // First unit replaced by a well-formed unit of another path:
+        // still recognized through the second unit.
+        let alien = FileKeys::derive(&ks[0], "other.txt").unit_encrypt(AD_TEXT, b"x");
+        let alien_b64 = STANDARD_NO_PAD.encode(&alien);
+        let swapped = [lines[0], alien_b64.as_bytes(), lines[2], b""].join(&b'\n');
+        assert_eq!(authenticate_any(&ks, "f.txt", &swapped), Some(1));
+
+        // A damaged header line (probing as unrecognized) still leaves
+        // the unit lines recognizable.
+        let bad_header = [
+            &b"#simple-file-encrypt v1 texx"[..],
+            lines[1],
+            lines[2],
+            b"",
+        ]
+        .join(&b'\n');
+        assert_eq!(authenticate_any(&ks, "f.txt", &bad_header), Some(1));
+
+        // Every unit destroyed, foreign content, or a wrong path: no hit.
+        let all_bad = [lines[0], b"AAAA", b"BBBB", b""].join(&b'\n');
+        assert_eq!(authenticate_any(&ks, "f.txt", &all_bad), None);
+        assert_eq!(authenticate_any(&ks, "moved.txt", &ct), None);
+        assert_eq!(authenticate_any(&ks, "f.txt", b"no newline at all"), None);
+
+        // The empty-file marker with appended junk stays unrecognized:
+        // the marker line is the header line and is skipped, and the
+        // junk authenticates nowhere (a documented residual — the
+        // recoverable plaintext is empty, so nothing is lost).
+        let empty_ct = encrypt(&fk, "f.txt", b"").unwrap();
+        let mut with_junk = empty_ct.clone();
+        with_junk.extend_from_slice(b"QUFBQUFBQUFBQUFBQUFBQUFBQUFBQQ\n");
+        assert_eq!(authenticate_any(&ks, "f.txt", &with_junk), None);
     }
 
     #[test]

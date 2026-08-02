@@ -201,11 +201,16 @@ KDF-related global options, honored by every command that runs Argon2:
   and the scans and key rotation must see it to warn, refuse, or
   recover. A missing independent exclusion is silently fine
   (pre-declared exclusions are legal), and so is one whose ancestor
-  has become a regular file or a nested-repository boundary — nothing
-  this domain encrypted can sit at such a path, and an inert hands-off
-  entry must not brick every scan. A symlinked ancestor is still
-  refused, exactly as for managed entries: stored entries are never
-  followed out of the domain.
+  has become a regular file — nothing can sit below a file, so there
+  is nothing to audit — or a nested-repository boundary, which is
+  hands-off by declaration like every boundary beneath an exclusion:
+  ciphertext this domain wrote there *before* the repository appeared
+  is beyond the guards and a later prune can strand it (the threat
+  model's documented residual — decrypt before excluding, deleting,
+  or turning directories into repositories). An inert hands-off entry
+  must not brick every scan; a symlinked ancestor is still refused,
+  exactly as for managed entries: stored entries are never followed
+  out of the domain.
 
 ### Encrypt-time bookkeeping (auto-add)
 
@@ -375,9 +380,11 @@ under a ring key is decrypted normally (reported as recovered), and
 counts as work to do for the password contract. One that fails
 authentication is noted and left untouched — deliberately excluded
 foreign-looking content (see `add --exclude --force`) must never block
-a full `decrypt`. A hit too large to decrypt in memory is classified
-from a bounded prefix and noted (this domain's first unit → restore
-the original content manually; otherwise foreign). Excluded plaintext
+a full `decrypt`; the note distinguishes ours-but-damaged (some unit
+still authenticates) from foreign. A hit too large to decrypt in
+memory is classified from a bounded prefix and noted (a surviving
+unit of this domain → restore the original content manually;
+otherwise ambiguous or foreign). Excluded plaintext
 is skipped (silently unless named) and exempt from
 `--require-encrypted`: its plaintext is intentional. The repair pass
 runs after the main pass with the same serial stop-at-first-error
@@ -528,13 +535,16 @@ authenticates the first unit).
 `verify` is also the authoritative gate for excluded paths, which
 `check` exempts: an excluded file that probes as encrypted is
 authenticated against the ring. If it decrypts under any ring key —
-or its first unit authenticates but the file does not fully decrypt
-(damaged, mixing key epochs, or grown past the size cap, where only
-the first unit can be checked from a bounded prefix) — that is **this
-domain's ciphertext hidden from migration**, reported as a failure;
-content that authenticates under no key is deliberately excluded
-foreign-looking material and is only noted. Excluded plaintext is not
-reported at all.
+or **any unit** of it authenticates while the file does not fully
+decrypt (damaged, truncated, appended to, mixing key epochs, or grown
+past the size cap; every unit line and binary chunk is scanned — text
+over-cap hits from a cap-sized prefix, binary over-cap hits by their
+first chunk with the ambiguous fallback described under `rekey` — and
+a damaged header does not end the scan) — that is **this domain's
+ciphertext hidden from migration**, reported as a failure; content in which no unit
+authenticates is deliberately excluded foreign-looking material and
+is only noted (see the residual-shapes list under `rekey`). Excluded
+plaintext is not reported at all.
 
 ### `passwd` (alias `p`)
 
@@ -601,30 +611,36 @@ inside a managed tree: their content was never verified.
 Excluded paths — including independent exclusions outside every
 managed entry, which are expanded as audit roots — are checked against
 the ring on every `rekey`: content there that authenticates under any
-ring key (fully, or first-unit-only) is this domain's ciphertext
-**hidden from the migration pass**. A fresh `rekey` warns and proceeds
-(consistent with its tolerance for missing paths); `--continue` and
-`--prune` refuse — the fix is `decrypt` (which recovers excluded
-ciphertext) or `remove --exclude`. Excluded content that authenticates
-under no key is foreign and never blocks rotation. A hit too large to
-read whole is classified by its first unit from a bounded prefix:
-valid ciphertext with data appended past the size cap still blocks
-convergence, and an over-cap *binary* probe hit with a valid header
-whose first chunk does not authenticate is **ambiguous** — a
-single-chunk ciphertext of this domain with appended data is
-indistinguishable from foreign content (its last-chunk extent is
-unrecoverable from a prefix), so `--continue` and `--prune` refuse it
-too; restore the original bytes or move the file out to resolve it.
-Two shapes stay decisively foreign: a structurally invalid (or
-newer-version) binary header, and an empty-file marker header with
-appended data (the recoverable plaintext is empty, so nothing can be
-lost). *In-cap* excluded probe hits that authenticate under no ring
-key are likewise treated as foreign — a complete foreign ciphertext,
-the very content `add --exclude --force` exists for, is
-indistinguishable there from a damaged or appended-to ciphertext of
-this domain whose first unit was destroyed; treat `verify`'s
-"ignored" lines as worth a look when content under an exclusion was
-ever encrypted here.
+ring key — fully, or through **any surviving unit** (text line or
+binary chunk; a destroyed header or first unit does not end the scan)
+— is this domain's ciphertext **hidden from the migration pass**. A
+fresh `rekey` warns and proceeds (consistent with its tolerance for
+missing paths); `--continue` and `--prune` refuse — the fix is
+`decrypt` (which recovers excluded ciphertext) or `remove --exclude`.
+Excluded content that authenticates under no key is foreign and never
+blocks rotation. A hit too large to read whole is classified from a
+bounded prefix: *text* is scanned line by line from a cap-sized
+prefix, which holds every unit a valid ciphertext of this domain
+could have, so appended-to or damaged over-cap text blocks
+convergence exactly like an in-cap file; *binary* is decided from its
+header plus first chunk, and a valid header whose first chunk does
+not authenticate is **ambiguous** — a single-chunk ciphertext of this
+domain with appended data is indistinguishable from foreign content
+(its last-chunk extent is unrecoverable), and since ambiguity blocks
+convergence exactly like a proven hit, scanning further chunks could
+only sharpen the message — so `--continue` and `--prune` refuse it
+too; restore the original bytes or move the file out to resolve it. Two shapes stay decisively foreign: a structurally
+invalid (or newer-version) binary header on an over-cap file, and an
+empty-file marker header with appended data (the recoverable
+plaintext is empty, so nothing can be lost). What remains genuinely
+indistinguishable from foreign ciphertext — and reads as foreign — is
+a hit with **no surviving unit**: every unit destroyed, a single-unit
+file whose only unit is damaged, or a short single-chunk binary
+ciphertext with appended data (its chunk extent is unrecoverable).
+The on-disk copy is beyond repair in those states, but git history
+may still hold an intact one — restore it *before* pruning, and treat
+`verify`'s "ignored" lines as worth a look when content under an
+exclusion was ever encrypted here.
 
 A fresh `rekey`, by contrast, may start a new epoch while managed
 paths are missing or skipped: exit 0 then means the epoch started and

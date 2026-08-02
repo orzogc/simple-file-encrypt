@@ -2255,7 +2255,7 @@ fn oversize_excluded_own_ciphertext_still_blocks_convergence() {
     let r = run_pw(root, PW, &["verify"]).expect_code(1);
     assert_contains(&r.stdout, "FAILED d/s.txt");
     assert_contains(&r.stdout, "FAILED d/b.bin");
-    assert_contains(&r.stdout, "first unit authenticates");
+    assert_contains(&r.stdout, "a unit authenticates under ring entry");
     // A fresh rekey warns and proceeds (an epoch can start with
     // pending content); the convergence claims refuse.
     let r = run_pw(root, PW, &["rekey"]).expect_code(0);
@@ -2301,7 +2301,7 @@ fn damaged_excluded_ciphertext_is_reported_as_ours() {
 
     let r = run_pw(root, PW, &["verify"]).expect_code(1);
     assert_contains(&r.stdout, "FAILED d/s.txt");
-    assert_contains(&r.stdout, "first unit authenticates");
+    assert_contains(&r.stdout, "a unit authenticates under ring entry");
     let r = run_pw(root, PW, &["rekey", "--continue"]).expect_code(1);
     assert_contains(&r.stderr, "does not fully decrypt");
 
@@ -2311,6 +2311,217 @@ fn damaged_excluded_ciphertext_is_reported_as_ours() {
     let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
     assert_contains(&r.stderr, "damaged or mixing key epochs");
     assert_eq!(read_file(root, "d/s.txt"), damaged);
+}
+
+#[test]
+fn destroyed_first_unit_excluded_ciphertext_still_blocks_convergence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/s.txt", b"secret one\nsecret two\n");
+    write_file(root, "d/b.bin", &vec![0u8; 65536 + 100]); // two binary chunks
+    write_file(root, "d/other.txt", b"other\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "--force", "d/s.txt"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "--force", "d/b.bin"]).expect_code(0);
+
+    // Destroy the *first* unit of each while later units survive. Full
+    // decryption and first-unit authentication both fail, which the
+    // audited gap classified as foreign — verify passed and `rekey
+    // --prune` dropped the key the surviving units still need.
+    let original = read_file(root, "d/s.txt");
+    let original_bin = read_file(root, "d/b.bin");
+    tamper_first_unit(root, "d/s.txt");
+    let mut bin = original_bin.clone();
+    bin[16 + 10] ^= 1; // inside chunk 0
+    fs::write(root.join("d/b.bin"), &bin).unwrap();
+
+    let r = run_pw(root, PW, &["verify"]).expect_code(1);
+    assert_contains(&r.stdout, "FAILED d/s.txt");
+    assert_contains(&r.stdout, "FAILED d/b.bin");
+    assert_contains(&r.stdout, "a unit authenticates under ring entry");
+    let r = run_pw(root, PW, &["rekey"]).expect_code(0);
+    assert_contains(&r.stderr, "hidden from migration");
+    let r = run_pw(root, PW, &["rekey", "--continue"]).expect_code(1);
+    assert_contains(&r.stderr, "does not fully decrypt");
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot prune");
+
+    // The refusals kept the old key in the ring: restoring the
+    // original ciphertext recovers the plaintext.
+    fs::write(root.join("d/s.txt"), &original).unwrap();
+    fs::write(root.join("d/b.bin"), &original_bin).unwrap();
+    let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
+    assert_contains(&r.stdout, "decrypted d/s.txt (excluded; recovered)");
+    assert_contains(&r.stdout, "decrypted d/b.bin (excluded; recovered)");
+    assert_eq!(read_file(root, "d/s.txt"), b"secret one\nsecret two\n");
+    assert_eq!(read_file(root, "d/b.bin"), vec![0u8; 65536 + 100]);
+}
+
+#[test]
+fn truncated_or_appended_excluded_binary_is_still_ours() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/trunc.bin", &vec![0u8; 3 * 65536]);
+    write_file(root, "d/app.bin", &vec![0u8; 65536 + 100]);
+    write_file(root, "d/other.txt", b"other\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "--force", "d/trunc.bin"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "--force", "d/app.bin"]).expect_code(0);
+
+    // Truncation into the middle of a chunk reparses self-consistently
+    // with shifted boundaries; appending shifts the parsed extents the
+    // same way. In both cases the intact leading chunks still sit on
+    // the fixed grid and prove the content is this domain's.
+    let ct = read_file(root, "d/trunc.bin");
+    fs::write(root.join("d/trunc.bin"), &ct[..16 + 65552 + 7]).unwrap();
+    let mut ct = read_file(root, "d/app.bin");
+    ct.extend_from_slice(b"junk appended by another tool");
+    fs::write(root.join("d/app.bin"), &ct).unwrap();
+
+    let r = run_pw(root, PW, &["verify"]).expect_code(1);
+    assert_contains(&r.stdout, "FAILED d/trunc.bin");
+    assert_contains(&r.stdout, "FAILED d/app.bin");
+    assert_contains(&r.stdout, "a unit authenticates under ring entry");
+    run_pw(root, PW, &["rekey"]).expect_code(0); // mint, so prune has work
+    let r = run_pw(root, PW, &["rekey", "--continue"]).expect_code(1);
+    assert_contains(&r.stderr, "does not fully decrypt");
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot prune");
+}
+
+#[test]
+fn oversize_excluded_text_with_destroyed_first_unit_blocks_convergence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/s.txt", b"secret one\nsecret two\n");
+    write_file(root, "d/other.txt", b"other\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "--force", "d/s.txt"]).expect_code(0);
+
+    // First unit destroyed *and* grown past the cap: the bounded scan
+    // must still find the surviving second unit in the cap-sized
+    // prefix instead of writing the file off as foreign.
+    tamper_first_unit(root, "d/s.txt");
+    grow_past_cap(root, "d/s.txt");
+
+    let r = run_pw(root, PW, &["verify"]).expect_code(1);
+    assert_contains(&r.stdout, "FAILED d/s.txt");
+    assert_contains(&r.stdout, "a unit authenticates under ring entry");
+    run_pw(root, PW, &["rekey"]).expect_code(0); // mint, so prune has work
+    let r = run_pw(root, PW, &["rekey", "--continue"]).expect_code(1);
+    assert_contains(&r.stderr, "does not fully decrypt");
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot prune");
+}
+
+#[test]
+fn unrecognized_header_with_surviving_units_is_still_ours() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/s.txt", b"secret one\nsecret two\n");
+    write_file(root, "d/other.txt", b"other\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "--force", "d/s.txt"]).expect_code(0);
+
+    // The header line is as damageable as any unit: a one-byte change
+    // makes it probe as unrecognized, but the intact unit lines still
+    // prove the content is this domain's.
+    let ct = String::from_utf8(read_file(root, "d/s.txt")).unwrap();
+    let bad = ct.replacen("v1 text\n", "v1 texz\n", 1);
+    assert_ne!(ct, bad);
+    fs::write(root.join("d/s.txt"), bad).unwrap();
+
+    let r = run_pw(root, PW, &["verify"]).expect_code(1);
+    assert_contains(&r.stdout, "FAILED d/s.txt");
+    assert_contains(&r.stdout, "a unit authenticates under ring entry");
+    run_pw(root, PW, &["rekey"]).expect_code(0); // mint, so prune has work
+    let r = run_pw(root, PW, &["rekey", "--prune"]).expect_code(1);
+    assert_contains(&r.stderr, "cannot prune");
+}
+
+#[test]
+fn empty_marker_with_appended_data_stays_foreign() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/empty.txt", b"");
+    write_file(root, "d/other.txt", b"other\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "--force", "d/empty.txt"]).expect_code(0);
+
+    // A marker header with appended junk stays decisively foreign (the
+    // documented residual): the marker line is the header line, no
+    // unit line can vouch for the file, and the recoverable plaintext
+    // is empty — so nothing blocks, and nothing is lost.
+    let mut ct = read_file(root, "d/empty.txt");
+    ct.extend_from_slice(b"QUFBQUFBQUFBQUFBQUFBQUFBQUFBQQ\n");
+    fs::write(root.join("d/empty.txt"), &ct).unwrap();
+
+    let r = run_pw(root, PW, &["verify"]).expect_code(0);
+    assert_contains(&r.stdout, "ignored");
+    run_pw(root, PW, &["rekey"]).expect_code(0);
+    run_pw(root, PW, &["rekey", "--continue"]).expect_code(0);
+    run_pw(root, PW, &["rekey", "--prune"]).expect_code(0);
+}
+
+#[test]
+fn nested_repository_under_exclusion_is_hands_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_file(root, "d/keep.txt", b"keep\n");
+    write_file(root, "vault/s.txt", b"secret\n");
+    init_domain(root);
+    run_nopw(root, &["add", "d"]).expect_code(0);
+    run_nopw(root, &["add", "vault/s.txt"]).expect_code(0);
+    run_pw(root, PW, &["encrypt"]).expect_code(0);
+    run_nopw(root, &["remove", "--force", "vault/s.txt"]).expect_code(0);
+    run_nopw(root, &["add", "--exclude", "--force", "vault"]).expect_code(0);
+
+    // While the exclusion is walkable, the guards see the stranded
+    // ciphertext.
+    let r = run_pw(root, PW, &["verify"]).expect_code(1);
+    assert_contains(&r.stdout, "FAILED vault/s.txt");
+    run_pw(root, PW, &["rekey"]).expect_code(0);
+    run_pw(root, PW, &["rekey", "--continue"]).expect_code(1);
+
+    // A `.git` entry turns the excluded tree into a nested repository:
+    // hands-off by double declaration (exclusion + repository
+    // boundary), silently invisible to every guard. This fixates the
+    // documented residual of the threat model — the prune below
+    // discards the key `vault/s.txt` still needs; decrypt before
+    // excluding, deleting, or turning directories into repositories.
+    write_file(root, "vault/.git", b"gitdir: elsewhere\n");
+    let r = run_pw(root, PW, &["verify"]).expect_code(0);
+    assert!(
+        !r.stdout.contains("vault"),
+        "excluded repo must be invisible:\n{}",
+        r.stdout
+    );
+    run_pw(root, PW, &["rekey", "--continue"]).expect_code(0);
+    run_pw(root, PW, &["rekey", "--prune"]).expect_code(0);
+
+    // Removing the boundary afterwards does not help: the key is gone,
+    // and the stranded ciphertext now authenticates under nothing.
+    fs::remove_file(root.join("vault/.git")).unwrap();
+    let r = run_pw(root, PW, &["verify"]).expect_code(0);
+    assert_contains(&r.stdout, "ignored");
+    let r = run_pw(root, PW, &["decrypt"]).expect_code(0);
+    assert_contains(&r.stderr, "does not authenticate");
+    let left = read_file(root, "vault/s.txt");
+    assert!(
+        left.starts_with(TEXT_HEADER.as_bytes()),
+        "still ciphertext, untouched"
+    );
+    assert_ne!(left, b"secret\n");
 }
 
 #[test]

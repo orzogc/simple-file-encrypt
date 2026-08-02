@@ -50,11 +50,9 @@ ciphertext layouts, and all derivation strings.
   external review).
 - **Over-cap excluded probe hits are no longer assumed foreign.** A
   valid ciphertext with data appended past the 256 MiB cap is
-  recognized by bounded first-unit authentication (binary: header plus
-  first chunk; text: header plus first unit line) and blocks
-  key-rotation convergence like any damaged file, instead of letting
-  `rekey --prune` discard its key. One residual is documented: a
-  single-chunk binary ciphertext with appended data reads as foreign.
+  recognized from a bounded prefix and blocks key-rotation convergence
+  like any damaged file, instead of letting `rekey --prune` discard
+  its key.
 - **Excluded records are bounded.** Excluded files retained for the
   audit-style commands are capped at 65536 (like selected files) and
   every retained string is charged against the 64 MiB expansion
@@ -88,6 +86,22 @@ ciphertext layouts, and all derivation strings.
   letting `rekey --prune` drop the key. It is now classified as
   ambiguous: `verify` fails it and `--continue`/`--prune` refuse until
   the original bytes are restored or the file is moved out.
+- **Any surviving unit now proves excluded ciphertext is this
+  domain's.** Classification of excluded probe hits authenticated only
+  the first unit, so a ciphertext whose first line or chunk was
+  destroyed — but whose later units were intact — read as foreign:
+  `verify` passed and `rekey --prune` dropped the key the surviving
+  units still need. Every text line and binary chunk is now scanned
+  (over-cap text from a cap-sized prefix; over-cap binary keeps its
+  ambiguous fallback, which already blocks convergence), including
+  files whose header was damaged — an unrecognized-header text file
+  with authenticating unit lines is ours, not foreign. Truncated and
+  appended-to binaries are matched on the fixed chunk grid, and a
+  full single-chunk ciphertext with appended data is recognized as
+  well. What still reads as foreign is a hit with no surviving unit —
+  every unit destroyed, a damaged single-unit file, or a short
+  single-chunk binary ciphertext with appended data — see
+  `docs/cli.md` (found by external review).
 - Overlapping expansion roots (`paths = ["d", "d/sub"]`, overlapping
   exclusions) walk each real directory once, deduplicated by identity:
   excluded counts stay accurate and the scan budget charges actual

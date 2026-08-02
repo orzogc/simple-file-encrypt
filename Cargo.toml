@@ -39,6 +39,13 @@ tempfile = "3.27.0"
 [profile.release]
 lto = true
 
+# The cryptographic dependencies are orders of magnitude slower without
+# optimization, and the integration tests exercise cap-sized (256 MiB)
+# unit scans; the workspace's own code stays unoptimized for fast
+# incremental builds and debugging.
+[profile.dev.package."*"]
+opt-level = 2
+
 [lints.rust]
 missing_docs = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs_dep)'] }

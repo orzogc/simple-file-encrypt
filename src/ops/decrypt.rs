@@ -145,14 +145,14 @@ fn recover_excluded(
     let data = match fsops::read_capped(&ex.abs, crate::consts::MAX_FILE_SIZE, "file") {
         Ok(data) => data,
         // Too large to decrypt in memory: classify from a bounded
-        // prefix. A first unit of this domain means damaged (possibly
-        // appended-to) ciphertext worth pointing at; anything else is
-        // foreign and left alone.
+        // prefix. A surviving unit of this domain means damaged
+        // (possibly appended-to) ciphertext worth pointing at;
+        // anything else is foreign and left alone.
         Err(Error::Limit(_)) => {
             let prefix = fsops::read_prefix(&ex.abs, crate::consts::PROBE_PREFIX_LEN)?;
             match super::classify_oversize_excluded(keys, &ex.rel, &ex.abs, probe(&prefix))? {
-                super::ExcludedCiphertext::FirstUnitOnly(idx) => report::note(format!(
-                    "`{}` is excluded and holds this domain's ciphertext (first unit \
+                super::ExcludedCiphertext::PartiallyAuthentic(idx) => report::note(format!(
+                    "`{}` is excluded and holds this domain's ciphertext (a unit \
                      authenticates under ring entry {idx}) but exceeds the file-size cap — \
                      appended-to or damaged; left untouched, restore the original content \
                      manually (e.g. from git)",
@@ -166,8 +166,7 @@ fn recover_excluded(
                 )),
                 _ => report::note(format!(
                     "`{}` is excluded, probes as encrypted, and exceeds the file-size cap, but \
-                     its first unit does not authenticate under this domain's keys; left \
-                     untouched",
+                     nothing in it authenticates under this domain's keys; left untouched",
                     ex.rel
                 )),
             }
@@ -193,15 +192,17 @@ fn recover_excluded(
         Err(_) => {
             // Ours-but-damaged and foreign content get distinct notes:
             // the former needs manual resolution, and pointing at
-            // "foreign" would send the user the wrong way.
-            let first = match kind {
-                Probe::TextV1 => textmode::authenticate_first(keys, &ex.rel, &data.content).ok(),
-                Probe::Binary => binmode::authenticate_first(keys, &ex.rel, &data.content).ok(),
+            // "foreign" would send the user the wrong way. Any
+            // surviving unit proves ownership, so the scan does not
+            // stop at the first one.
+            let owned = match kind {
+                Probe::TextV1 => textmode::authenticate_any(keys, &ex.rel, &data.content),
+                Probe::Binary => binmode::authenticate_any(keys, &ex.rel, &data.content),
                 _ => None,
             };
-            if let Some(idx) = first {
+            if let Some(idx) = owned {
                 report::note(format!(
-                    "`{}` is excluded and holds this domain's ciphertext (first unit \
+                    "`{}` is excluded and holds this domain's ciphertext (a unit \
                      authenticates under ring entry {idx}) but does not fully decrypt — damaged \
                      or mixing key epochs; left untouched, resolve it manually",
                     ex.rel

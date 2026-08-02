@@ -264,12 +264,13 @@ fn scan_excluded_ciphertext(
         let data = match fsops::read_capped(&ex.abs, crate::consts::MAX_FILE_SIZE, "file") {
             Ok(data) => data,
             // Too large to authenticate whole: classify from a bounded
-            // prefix. A first unit of this domain — valid ciphertext
-            // with data appended past the cap, or damage — must block
-            // convergence like any in-cap damaged file; foreign blobs
-            // still authenticate under no key and block nothing.
+            // prefix. A surviving unit of this domain — valid
+            // ciphertext with data appended past the cap, or damage —
+            // must block convergence like any in-cap damaged file;
+            // foreign blobs still authenticate under no key and block
+            // nothing.
             Err(Error::Limit(_)) => {
-                if let kind @ (super::ExcludedCiphertext::FirstUnitOnly(_)
+                if let kind @ (super::ExcludedCiphertext::PartiallyAuthentic(_)
                 | super::ExcludedCiphertext::Ambiguous) =
                     super::classify_oversize_excluded(keys, &ex.rel, &ex.abs, prefix_kind)?
                 {
@@ -285,7 +286,7 @@ fn scan_excluded_ciphertext(
         let kind = probe(&data.content);
         match super::classify_excluded_ciphertext(keys, &ex.rel, &data.content, kind) {
             kind @ (super::ExcludedCiphertext::Authentic(_)
-            | super::ExcludedCiphertext::FirstUnitOnly(_)
+            | super::ExcludedCiphertext::PartiallyAuthentic(_)
             | super::ExcludedCiphertext::Ambiguous) => hits.push(ExcludedHit {
                 rel: ex.rel.clone(),
                 kind,
@@ -303,8 +304,9 @@ fn boundary_message(boundary: &str) -> String {
         "nested repository `{boundary}` sits inside a managed tree; its contents were never \
          audited, and anything this domain encrypted there before it became a repository would \
          be stranded — decrypt such files first (temporarily moving its `.git` entry aside lets \
-         `decrypt` reach them), then move the repository out of the managed tree or `remove` \
-         the covering entry"
+         `decrypt` reach them), then move the repository out of the managed tree or, if it \
+         stays in place, `remove --force` the covering entry (a plain `remove` refuses while \
+         the boundary blocks its probe)"
     )
 }
 
@@ -317,8 +319,8 @@ fn excluded_hit_message(hit: &ExcludedHit) -> String {
              covering entry first",
             hit.rel, hit.rel
         ),
-        super::ExcludedCiphertext::FirstUnitOnly(idx) => format!(
-            "excluded path `{}` holds this domain's ciphertext (first unit authenticates under \
+        super::ExcludedCiphertext::PartiallyAuthentic(idx) => format!(
+            "excluded path `{}` holds this domain's ciphertext (a unit authenticates under \
              ring entry {idx}) but does not fully decrypt — it is damaged or mixes key epochs; \
              resolve it manually first",
             hit.rel

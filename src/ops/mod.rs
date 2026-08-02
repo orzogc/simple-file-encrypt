@@ -316,9 +316,14 @@ pub(crate) fn audit_entries(config: &config::Config) -> Vec<(String, crate::sele
 pub(crate) enum ExcludedCiphertext {
     /// Fully decrypts under the given ring entry: stranded ciphertext.
     Authentic(usize),
-    /// Only the first unit authenticates (under the given ring entry):
-    /// ours, but damaged or mixing key epochs — manual resolution.
-    FirstUnitOnly(usize),
+    /// At least one unit (text line or binary chunk) authenticates
+    /// under the given ring entry but the file does not fully decrypt:
+    /// this domain's ciphertext, damaged (a destroyed unit,
+    /// truncation, appended data) or mixing key epochs — manual
+    /// resolution. Any surviving unit proves ownership; requiring the
+    /// *first* unit would let one destroyed line or chunk disguise the
+    /// rest as foreign and un-block `rekey --prune`.
+    PartiallyAuthentic(usize),
     /// An over-cap binary probe hit with a valid header whose first
     /// full chunk does not authenticate: indistinguishable from a
     /// single-chunk ciphertext of this domain with data appended past
@@ -327,13 +332,16 @@ pub(crate) enum ExcludedCiphertext {
     /// like this domain's ciphertext where it matters: key rotation
     /// must not converge past what it cannot rule out.
     Ambiguous,
-    /// Authenticates under no ring key: foreign or moved content.
+    /// Authenticates under no ring key: foreign or moved content —
+    /// or this domain's ciphertext with *every* unit destroyed, which
+    /// no key ring can tell apart (a documented residual).
     Foreign,
 }
 
 /// Classifies an excluded probe hit against the ring. `kind` must be
-/// the probe of `content`; unrecognized headers are `Foreign` (they
-/// cannot be v1 ciphertext of this domain).
+/// the probe of `content`. An unrecognized text header still gets its
+/// unit lines scanned — the header line is as damageable as any unit,
+/// and only the lines can prove ownership.
 pub(crate) fn classify_excluded_ciphertext(
     keys: &[DomainKey],
     rel: &str,
@@ -341,41 +349,58 @@ pub(crate) fn classify_excluded_ciphertext(
     kind: crate::probe::Probe,
 ) -> ExcludedCiphertext {
     use crate::probe::Probe;
-    let (full, first) = match kind {
-        Probe::TextV1 => (
-            crate::textmode::decrypt(keys, rel, content).map(|(_, idx)| idx),
-            crate::textmode::authenticate_first(keys, rel, content),
-        ),
-        Probe::Binary => (
-            crate::binmode::decrypt(keys, rel, content).map(|(_, idx)| idx),
-            crate::binmode::authenticate_first(keys, rel, content),
-        ),
-        _ => return ExcludedCiphertext::Foreign,
+    let full = match kind {
+        Probe::TextV1 => crate::textmode::decrypt(keys, rel, content).map(|(_, idx)| idx),
+        Probe::Binary => crate::binmode::decrypt(keys, rel, content).map(|(_, idx)| idx),
+        Probe::TextUnrecognized => {
+            return match crate::textmode::authenticate_any(keys, rel, content) {
+                Some(idx) => ExcludedCiphertext::PartiallyAuthentic(idx),
+                None => ExcludedCiphertext::Foreign,
+            };
+        }
+        Probe::Plain => return ExcludedCiphertext::Foreign,
     };
-    match (full, first) {
-        (Ok(idx), _) => ExcludedCiphertext::Authentic(idx),
-        (Err(_), Ok(idx)) => ExcludedCiphertext::FirstUnitOnly(idx),
-        (Err(_), Err(_)) => ExcludedCiphertext::Foreign,
+    match full {
+        Ok(idx) => ExcludedCiphertext::Authentic(idx),
+        Err(_) => {
+            let any = match kind {
+                Probe::TextV1 => crate::textmode::authenticate_any(keys, rel, content),
+                Probe::Binary => crate::binmode::authenticate_any(keys, rel, content),
+                _ => unreachable!("handled above"),
+            };
+            match any {
+                Some(idx) => ExcludedCiphertext::PartiallyAuthentic(idx),
+                None => ExcludedCiphertext::Foreign,
+            }
+        }
     }
 }
 
 /// Bounded classification for an excluded probe hit whose file exceeds
-/// the in-memory cap. Only the first unit can be checked from a capped
-/// prefix, so `Authentic` is never produced: the hit is at best
-/// `FirstUnitOnly` — this domain's ciphertext with data appended past
-/// the cap, or otherwise damaged — which blocks key-rotation
-/// convergence exactly like an in-cap damaged file, while an over-cap
-/// foreign blob authenticates under no key and blocks nothing.
+/// the in-memory cap. A valid ciphertext of this domain fits under the
+/// cap, so a cap-sized prefix holds every unit it could have and the
+/// unit scans below are as complete as the in-cap ones; `Authentic` is
+/// still never produced (the whole file cannot be checked), the hit is
+/// at best `PartiallyAuthentic` — this domain's ciphertext with data
+/// appended past the cap, or otherwise damaged — which blocks
+/// key-rotation convergence exactly like an in-cap damaged file, while
+/// an over-cap foreign blob authenticates under no key and blocks
+/// nothing.
 ///
-/// A binary prefix with a valid header whose first chunk fails
-/// authentication is `Ambiguous`, not `Foreign`: it may be a
-/// single-chunk ciphertext of this domain with appended data, and an
-/// over-cap file cannot be intact ciphertext of *any* domain (the cap
-/// binds both sides), so a well-formed v1 binary header there is
-/// realistically ciphertext-plus-junk of some kind. The one residual
-/// read as foreign is an empty-file marker header with appended data:
-/// the recoverable plaintext is empty, so nothing is lost
-/// (see `docs/cli.md`).
+/// Binary hits are decided from a header-plus-one-chunk window: a
+/// valid header whose first chunk fails authentication is `Ambiguous`,
+/// never plain foreign — a single-chunk ciphertext of this domain with
+/// appended data is unrecognizable from any prefix, and an over-cap
+/// file cannot be intact ciphertext of *any* domain (the cap binds
+/// both sides), so a well-formed v1 binary header there is
+/// realistically ciphertext-plus-junk of some kind. Ambiguity already
+/// blocks convergence exactly like a proven-ours hit, so scanning the
+/// remaining chunks could only sharpen the message, not the outcome —
+/// not worth a cap-sized read plus a full grid scan per run (the
+/// in-cap classifier has no such conservative fallback, which is why
+/// it does scan every unit). The one residual read as foreign is an
+/// empty-file marker header with appended data: the recoverable
+/// plaintext is empty, so nothing is lost (see `docs/cli.md`).
 pub(crate) fn classify_oversize_excluded(
     keys: &[DomainKey],
     rel: &str,
@@ -383,41 +408,35 @@ pub(crate) fn classify_oversize_excluded(
     kind: crate::probe::Probe,
 ) -> Result<ExcludedCiphertext> {
     use crate::probe::Probe;
-    // The window holds everything a valid first unit can need: the
-    // binary header plus one full chunk, or the longest exact text
-    // header line plus the base64 of a maximum-size unit. A first line
-    // or unit still unterminated within it cannot be valid ciphertext.
-    let window = match kind {
-        Probe::Binary => {
-            crate::consts::BIN_HEADER_LEN + crate::consts::CHUNK_SIZE + crate::consts::SIV_LEN
-        }
-        Probe::TextV1 => {
-            (crate::consts::MAX_UNIT_DECODED * 4).div_ceil(3) as usize
-                + crate::consts::PROBE_PREFIX_LEN
-        }
-        _ => return Ok(ExcludedCiphertext::Foreign),
-    };
-    let prefix = fsops::read_prefix(abs, window)?;
     Ok(match kind {
-        Probe::Binary => match crate::binmode::authenticate_first_bounded(keys, rel, &prefix) {
-            Ok(idx) => ExcludedCiphertext::FirstUnitOnly(idx),
-            // A valid header whose chunk fails authentication cannot
-            // be told apart from an appended-to single-chunk
-            // ciphertext of this domain: ambiguous, never plain
-            // foreign. Structural failures (bad magic, version,
-            // flags) are decisive.
-            Err(Error::Auth { .. }) => ExcludedCiphertext::Ambiguous,
-            Err(_) => ExcludedCiphertext::Foreign,
-        },
-        // The text checker only inspects the header line and the first
-        // unit line, so a prefix is enough — and it is decisive: text
-        // units carry no last-flag, so any valid first unit either
-        // authenticates or the content is not this domain's.
-        Probe::TextV1 => match crate::textmode::authenticate_first(keys, rel, &prefix) {
-            Ok(idx) => ExcludedCiphertext::FirstUnitOnly(idx),
-            Err(_) => ExcludedCiphertext::Foreign,
-        },
-        _ => unreachable!("handled above"),
+        Probe::Binary => {
+            let window =
+                crate::consts::BIN_HEADER_LEN + crate::consts::CHUNK_SIZE + crate::consts::SIV_LEN;
+            let prefix = fsops::read_prefix(abs, window)?;
+            match crate::binmode::authenticate_first_bounded(keys, rel, &prefix) {
+                Ok(idx) => ExcludedCiphertext::PartiallyAuthentic(idx),
+                // A valid header whose first chunk fails: ambiguous,
+                // which blocks convergence just like a proven hit.
+                Err(Error::Auth { .. }) => ExcludedCiphertext::Ambiguous,
+                // Structural failures (bad magic, version, flags) are
+                // decisive: over-cap junk with a broken header would
+                // need two independent kinds of damage to be ours.
+                Err(_) => ExcludedCiphertext::Foreign,
+            }
+        }
+        // Text units are line-independent with no last-flag, so the
+        // scan is decisive either way: a unit line either survives
+        // somewhere in the cap-sized prefix or the content holds
+        // nothing provably this domain's. A damaged header line
+        // (probing as unrecognized) gets the same scan.
+        Probe::TextV1 | Probe::TextUnrecognized => {
+            let big = fsops::read_prefix(abs, crate::consts::MAX_FILE_SIZE as usize)?;
+            match crate::textmode::authenticate_any(keys, rel, &big) {
+                Some(idx) => ExcludedCiphertext::PartiallyAuthentic(idx),
+                None => ExcludedCiphertext::Foreign,
+            }
+        }
+        Probe::Plain => ExcludedCiphertext::Foreign,
     })
 }
 

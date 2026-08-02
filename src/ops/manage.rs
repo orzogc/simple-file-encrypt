@@ -257,8 +257,10 @@ fn add_excludes(domain: &mut super::Domain, rels: &[String], force: bool) -> Res
                 deferred_warnings.push(format!(
                     "force-excluding `{rel}`: if it (or anything under it) still holds valid \
                      ciphertext of this domain, that ciphertext is hidden from `encrypt` and \
-                     `rekey` — `verify` and `rekey --continue`/`--prune` will flag it, and \
-                     `decrypt` can still recover it"
+                     `rekey` — `verify` and `rekey --continue`/`--prune` will flag it and \
+                     `decrypt` can still recover it, but only while it stays on disk outside \
+                     any nested-repository boundary (deleted or repository-hidden content is \
+                     beyond every guard; decrypt such files first)"
                 ));
             } else {
                 let mut probe_excludes = domain.loaded.config.excludes.clone();

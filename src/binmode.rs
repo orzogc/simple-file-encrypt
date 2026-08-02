@@ -192,6 +192,70 @@ pub fn authenticate_first_bounded(keys: &[DomainKey], path: &str, prefix: &[u8])
     Err(Error::auth(path, crate::textmode::FIRST_UNIT_AUTH_HINT))
 }
 
+/// Scans every chunk for one that authenticates under any ring key:
+/// the arbiter between damaged ciphertext of this domain and foreign
+/// content once full decryption has failed. Any authenticating chunk —
+/// not just the first — proves the content was encrypted here, so a
+/// destroyed first chunk must not let `rekey --prune` drop the key the
+/// surviving chunks still need.
+///
+/// The fixed grid of [`authenticate_grid`] does the bulk of the work;
+/// on top of it, a parseable structure contributes the one thing the
+/// grid cannot know — the last chunk's extent. The structure is never
+/// *trusted* for the other chunks: truncated or appended-to content
+/// can reparse self-consistently with every boundary shifted, while
+/// the grid stays aligned with whatever survived. A hit ends the scan;
+/// the full-scan worst case is reserved for content that authenticates
+/// nowhere.
+pub fn authenticate_any(keys: &[DomainKey], path: &str, ct: &[u8]) -> Option<usize> {
+    let fks: Vec<FileKeys> = keys.iter().map(|k| FileKeys::derive(k, path)).collect();
+    if let Some(k) = authenticate_grid(&fks, ct) {
+        return Some(k);
+    }
+    if let Ok(chunks) = parse_structure(path, ct) {
+        let body = &ct[BIN_HEADER_LEN..];
+        let i = chunks.len() - 1;
+        let plan = &chunks[i];
+        let unit = &body[plan.start..plan.end];
+        for (k, fk) in fks.iter().enumerate() {
+            if fk.unit_decrypt(&ad_bin(i as u64, true), unit).is_some() {
+                return Some(k);
+            }
+        }
+    }
+    None
+}
+
+/// Grid scan over content whose chunk boundaries cannot be trusted: an
+/// in-cap body that was truncated or appended to (with or without
+/// still parsing), or one with a damaged header (the magic was already
+/// probed by the caller; the version and flag bytes are as damageable
+/// as any unit). Every non-last
+/// chunk of a valid ciphertext sits on the fixed `CHUNK_DISK` grid
+/// after the header regardless of what was truncated or appended
+/// behind it, so each full slot is tried with its non-last associated
+/// data — and slot 0 also as a full-and-last chunk, which recognizes a
+/// full single-chunk ciphertext with data appended. Last chunks other
+/// than that one have unrecoverable extents and cannot be tried here:
+/// a short single-chunk ciphertext with data appended stays
+/// unrecognizable from a grid (the documented residual). Returns the
+/// ring index of the first hit.
+fn authenticate_grid(fks: &[FileKeys], ct: &[u8]) -> Option<usize> {
+    let body = ct.get(BIN_HEADER_LEN..)?;
+    for i in 0..body.len() / CHUNK_DISK {
+        let unit = &body[i * CHUNK_DISK..(i + 1) * CHUNK_DISK];
+        for (k, fk) in fks.iter().enumerate() {
+            if fk.unit_decrypt(&ad_bin(i as u64, false), unit).is_some() {
+                return Some(k);
+            }
+            if i == 0 && fk.unit_decrypt(&ad_bin(0, true), unit).is_some() {
+                return Some(k);
+            }
+        }
+    }
+    None
+}
+
 /// Decrypts a binary ciphertext, trying ring keys in order on the first
 /// chunk, requiring every later chunk to authenticate under the same
 /// key, and verifying the whole-file tag in constant time. Returns the
@@ -383,6 +447,63 @@ mod tests {
         crafted.extend_from_slice(&[0u8; FILE_TAG_LEN]);
         let err = decrypt(&ks, "blob", &crafted).unwrap_err();
         assert!(err.to_string().contains("zero-length chunk"), "got: {err}");
+    }
+
+    #[test]
+    fn authenticate_any_finds_surviving_chunks() {
+        let ks = keys(2);
+        let fk = FileKeys::derive(&ks[1], "blob");
+        let two_chunks: Vec<u8> = (0..CHUNK_SIZE + 100).map(|i| i as u8).collect();
+        let ct = encrypt(&fk, "blob", &two_chunks).unwrap();
+
+        // First chunk destroyed: the second still authenticates under
+        // ring entry 1, via the parsed structure's last-chunk extent
+        // (it is too short to be a grid slot).
+        let mut broken = ct.clone();
+        broken[BIN_HEADER_LEN + 10] ^= 1;
+        assert!(authenticate_first(&ks, "blob", &broken).is_err());
+        assert_eq!(authenticate_any(&ks, "blob", &broken), Some(1));
+
+        // Appended data shifts the parsed extents; the intact first
+        // chunk still sits on the grid as a non-last chunk.
+        let mut appended = ct.clone();
+        appended.extend_from_slice(&[0u8; 100]);
+        assert_eq!(authenticate_any(&ks, "blob", &appended), Some(1));
+
+        // Truncation into the middle of a chunk reparses
+        // self-consistently with every boundary shifted (the tail of
+        // chunk 0 reads as a "last chunk"): only the grid, which never
+        // trusts the reparse, still finds the intact first chunk.
+        let truncated = &ct[..BIN_HEADER_LEN + CHUNK_DISK + 7];
+        assert_eq!(authenticate_any(&ks, "blob", truncated), Some(1));
+
+        // A damaged header (bad version) with an intact body: the grid
+        // fallback ignores the header fields.
+        let mut bad_version = ct.clone();
+        bad_version[8] = 0x7f;
+        assert_eq!(authenticate_any(&ks, "blob", &bad_version), Some(1));
+
+        // A full single-chunk ciphertext with appended data: slot 0 is
+        // full and non-last after reparsing, and the extra
+        // full-and-last try recognizes it.
+        let full_single = encrypt(&fk, "blob", &vec![7u8; CHUNK_SIZE]).unwrap();
+        let mut grown = full_single.clone();
+        grown.extend_from_slice(&[0u8; 200]);
+        assert_eq!(authenticate_any(&ks, "blob", &grown), Some(1));
+
+        // A short single-chunk ciphertext with appended data stays
+        // unrecognizable: its chunk extent cannot be recovered (the
+        // documented residual).
+        let short_single = encrypt(&fk, "blob", b"tiny").unwrap();
+        let mut grown_short = short_single.clone();
+        grown_short.extend_from_slice(&[0u8; 200]);
+        assert_eq!(authenticate_any(&ks, "blob", &grown_short), None);
+
+        // Foreign content and wrong paths authenticate nowhere.
+        assert_eq!(authenticate_any(&ks, "moved", &ct), None);
+        let mut junk = header_v1().to_vec();
+        junk.extend_from_slice(&vec![0u8; 3 * CHUNK_DISK]);
+        assert_eq!(authenticate_any(&ks, "blob", &junk), None);
     }
 
     #[test]

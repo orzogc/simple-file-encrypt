@@ -339,10 +339,10 @@ pub fn verify(arg_paths: &[PathBuf], gate: &KdfGate) -> Result<ScanOutcome> {
                     ex.rel, ex.via
                 ));
             }
-            Ok(Some(super::ExcludedCiphertext::FirstUnitOnly(idx))) => {
+            Ok(Some(super::ExcludedCiphertext::PartiallyAuthentic(idx))) => {
                 failures += 1;
                 report::out(format!(
-                    "FAILED {}: excluded path holds this domain's ciphertext (first unit \
+                    "FAILED {}: excluded path holds this domain's ciphertext (a unit \
                      authenticates under ring entry {idx}) but does not fully decrypt — damaged \
                      or mixing key epochs; resolve it manually",
                     ex.rel

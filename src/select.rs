@@ -434,10 +434,13 @@ impl<'a> Expander<'a> {
         // Stored entries — managed and exclusion roots alike — are
         // re-checked for symlinked or replaced ancestors on every run;
         // explicit arguments were checked at minting. A `false` means
-        // an exclusion root became unreachable (an ancestor is now a
-        // regular file or a nested repository): nothing this domain
-        // encrypted can sit at such a path, so it gets the same silent
-        // hands-off treatment as a missing pre-declared exclusion.
+        // an exclusion root became unreachable: an ancestor turned
+        // into a regular file (nothing can sit below it) or into a
+        // nested repository (hands-off by declaration — ciphertext
+        // written there before the boundary appeared is beyond the
+        // guards, the threat model's documented residual). Either way
+        // the entry gets the same silent treatment as a missing
+        // pre-declared exclusion.
         if matches!(origin, Origin::Managed | Origin::Exclusion)
             && !self.check_ancestors(rel, origin)?
         {
@@ -520,11 +523,13 @@ impl<'a> Expander<'a> {
     ///
     /// Returns `false` when the entry should be silently skipped —
     /// only for an exclusion root whose ancestor is now a regular file
-    /// or a nested-repository boundary: the excluded path cannot hold
-    /// anything this domain encrypted there, and a hard error would
-    /// brick every scan over an inert, hands-off entry. Managed entries
-    /// keep their hard errors, and a symlinked ancestor is refused for
-    /// both — a stored entry is never followed out of the domain.
+    /// (nothing can sit below a file) or a nested-repository boundary
+    /// (hands-off by declaration: ciphertext written there before the
+    /// boundary appeared is beyond the guards — the threat model's
+    /// documented residual). A hard error would brick every scan over
+    /// an inert, hands-off entry. Managed entries keep their hard
+    /// errors, and a symlinked ancestor is refused for both — a stored
+    /// entry is never followed out of the domain.
     fn check_ancestors(&self, rel: &str, origin: Origin) -> Result<bool> {
         let mut dir = self.root.to_path_buf();
         let Some((parents, _last)) = rel.rsplit_once('/') else {
