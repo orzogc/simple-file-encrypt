@@ -14,7 +14,7 @@ categories = ["command-line-utilities", "cryptography", "filesystem"]
 include = ["src/", "docs/", "LICENSE", "README.md", "README_zh-CN.md", "CHANGELOG.md", "SECURITY.md"]
 
 [dependencies]
-aes-siv = "0.7.0"
+aes-siv = "0.8.0"
 argon2 = { version = "0.5.3", features = ["zeroize"] }
 base64 = "0.23.0"
 blake3 = "1.8.5"
