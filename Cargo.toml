@@ -15,7 +15,7 @@ include = ["src/", "docs/", "LICENSE", "README.md", "README_zh-CN.md", "CHANGELO
 
 [dependencies]
 aes-siv = "0.7.0"
-argon2 = { version = "0.5.3", features = ["zeroize"] }
+argon2 = { version = "0.6.0", features = ["zeroize"] }
 base64 = "0.23.0"
 blake3 = "1.8.5"
 clap = { version = "4.6.5", features = ["derive"] }
