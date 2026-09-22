@@ -9,6 +9,19 @@ format has its own single version (currently **1**, see
 [docs/format.md](docs/format.md)), covering the config schema, both
 ciphertext layouts, and all derivation strings.
 
+## [Unreleased]
+
+### Changed
+
+- Dependencies: `aes-siv` 0.8 and `argon2` 0.6, with `aes` 0.9 and
+  `cmac` 0.8 moved in lockstep (the RustCrypto generation that
+  replaced `generic-array` with `hybrid-array`). Key derivation, key
+  wrapping, and both ciphertext layouts are byte-for-byte unchanged
+  (the golden fixtures pin them). Key wiping became an opt-in
+  `zeroize` feature in `aes-siv` and is enabled; `argon2`'s unused
+  `password-hash` feature is off; the whole stack now shares one
+  `getrandom`/`rand_core` line with `rand`.
+
 ## [0.2.0] - 2026-08-02
 
 ### Added
@@ -145,5 +158,6 @@ Initial release.
   static Linux binaries (x86_64/aarch64, musl) and macOS (Apple
   silicon) — with SHA-256 checksums and provenance attestations.
 
+[Unreleased]: https://github.com/orzogc/simple-file-encrypt/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/orzogc/simple-file-encrypt/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/orzogc/simple-file-encrypt/releases/tag/v0.1.0

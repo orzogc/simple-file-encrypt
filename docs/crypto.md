@@ -253,13 +253,14 @@ version of the path can be replayed (a whole-file rollback, see
 
 - The password, `kek`, all domain keys, and all derived keys live in
   `Zeroizing` buffers and are wiped on drop. Dependency internals are
-  best-effort: the `zeroize` features of `argon2` and `cmac`/`aes` are
-  enabled (Argon2's intermediate hashes and the CMAC state are wiped on
-  drop), but Argon2's multi-MiB workspace and, on some backends, the
-  AES round keys are not guaranteed to be wiped. The OS, allocator, and
-  swap may copy memory regardless. Memory attacks are out of scope
-  (see [threat-model.md](threat-model.md)); this is hygiene, not a
-  security boundary.
+  best-effort: the `zeroize` features of `argon2`, `aes-siv`, and
+  `cmac`/`aes` are enabled (Argon2's intermediate hashes, the SIV
+  cipher's AES-CTR key, the CMAC state, and the AES round keys are
+  wiped on drop), but Argon2's multi-MiB workspace is not guaranteed
+  to be wiped. The OS, allocator, and swap may copy memory regardless.
+  Memory attacks are out of scope (see
+  [threat-model.md](threat-model.md)); this is hygiene, not a security
+  boundary.
 - All authentication comparisons (SIV verification, file tag) are
   constant-time.
 - Passwords must be valid UTF-8 and non-empty. The Argon2 input is the

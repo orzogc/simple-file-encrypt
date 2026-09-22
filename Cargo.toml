@@ -14,22 +14,26 @@ categories = ["command-line-utilities", "cryptography", "filesystem"]
 include = ["src/", "docs/", "LICENSE", "README.md", "README_zh-CN.md", "CHANGELOG.md", "SECURITY.md"]
 
 [dependencies]
-aes-siv = "0.7.0"
-argon2 = { version = "0.5.3", features = ["zeroize"] }
-base64 = "0.23.0"
-blake3 = "1.8.5"
-clap = { version = "4.6.5", features = ["derive"] }
+# zeroize is opt-in since aes-siv 0.8: it wipes the SIV's copy of the
+# AES-CTR key on drop; aes/cmac below cover the rest of the cipher.
+aes-siv = { version = "0.8.0", features = ["zeroize"] }
+# alloc is what hash_password_into needs; the default password-hash
+# feature (PHC string API) is unused.
+argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "zeroize"] }
+base64 = "0.23.1"
+blake3 = "1.8.7"
+clap = { version = "4.6.7", features = ["derive"] }
 libc = "0.2.189"
-rand = "0.10.2"
+rand = "0.10.3"
 rpassword = "7.5.4"
 serde = { version = "1.0.229", features = ["derive"] }
-toml = "1.1.4"
+toml = "1.1.6"
 zeroize = "1.9.0"
 
-# Not used directly: feature unification makes the CMAC state (and, on
-# aarch64, the AES round keys) inside aes-siv zeroize on drop.
-aes = { version = "0.8", features = ["zeroize"] }
-cmac = { version = "0.7", features = ["zeroize"] }
+# Not used directly: feature unification makes the AES round keys and
+# the CMAC state inside aes-siv zeroize on drop.
+aes = { version = "0.9", features = ["zeroize"] }
+cmac = { version = "0.8", features = ["zeroize"] }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

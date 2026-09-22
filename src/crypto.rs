@@ -31,6 +31,13 @@ pub type Kek = Zeroizing<[u8; KEK_LEN]>;
 /// A 32-byte random domain key (one ring entry's plaintext).
 pub type DomainKey = Zeroizing<[u8; DOMAIN_KEY_LEN]>;
 
+/// Builds the raw (nonce-free) AES-256-SIV cipher over a 64-byte key
+/// (`KEK_LEN == UNIT_KEY_LEN`); the array borrow is length-checked at
+/// compile time.
+fn aes256_siv(key: &[u8; KEK_LEN]) -> Aes256Siv {
+    Aes256Siv::new(key.into())
+}
+
 /// Validated Argon2id parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KdfParams {
@@ -188,7 +195,7 @@ pub fn ad_wrap(n: u64, i: u64) -> Vec<u8> {
 /// entry to the ring length and its position.
 pub fn wrap_ring(kek: &Kek, keys: &[DomainKey]) -> Vec<[u8; WRAPPED_KEY_LEN]> {
     let n = keys.len() as u64;
-    let mut siv = Aes256Siv::new(kek.as_ref().into());
+    let mut siv = aes256_siv(kek);
     keys.iter()
         .enumerate()
         .map(|(i, key)| {
@@ -208,7 +215,7 @@ pub fn wrap_ring(kek: &Kek, keys: &[DomainKey]) -> Vec<[u8; WRAPPED_KEY_LEN]> {
 /// and the config is corrupt ([`Error::RingCorrupt`]).
 pub fn unwrap_ring(kek: &Kek, wrapped: &[[u8; WRAPPED_KEY_LEN]]) -> Result<Vec<DomainKey>> {
     let n = wrapped.len() as u64;
-    let mut siv = Aes256Siv::new(kek.as_ref().into());
+    let mut siv = aes256_siv(kek);
     let mut keys = Vec::with_capacity(wrapped.len());
     for (i, entry) in wrapped.iter().enumerate() {
         let pt = siv
@@ -257,7 +264,7 @@ impl FileKeys {
 
     /// Encrypts one unit: returns `SIV(16) || ciphertext`.
     pub fn unit_encrypt(&self, ad: &[u8], plaintext: &[u8]) -> Vec<u8> {
-        Aes256Siv::new(self.unit_key.as_ref().into())
+        aes256_siv(&self.unit_key)
             .encrypt([ad], plaintext)
             .expect("SIV encryption with one header component cannot fail")
     }
@@ -265,9 +272,7 @@ impl FileKeys {
     /// Decrypts and authenticates one unit; `None` on authentication
     /// failure (the SIV comparison is constant-time inside the cipher).
     pub fn unit_decrypt(&self, ad: &[u8], unit: &[u8]) -> Option<Vec<u8>> {
-        Aes256Siv::new(self.unit_key.as_ref().into())
-            .decrypt([ad], unit)
-            .ok()
+        aes256_siv(&self.unit_key).decrypt([ad], unit).ok()
     }
 
     /// Computes the binary whole-file tag over the header, the plaintext

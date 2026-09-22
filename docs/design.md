@@ -208,12 +208,12 @@ confidentiality for line-level diff and merge.
 - **Dependencies** (intentionally lean): `clap` (derive CLI), `argon2`,
   `aes-siv` (RFC 5297 AEAD), `blake3`, `rand`, `zeroize`, `base64`,
   `serde` + `toml`, `rpassword`, `libc` (Unix open flags). The
-  `zeroize` features of `argon2` and `cmac`/`aes` are enabled via
-  feature unification (see [crypto.md](crypto.md) hygiene). The direct
-  `aes`/`cmac` deps exist only for that unification: a PR bumping
-  `aes-siv` must align them in the same PR (Dependabot ignores them;
-  CI's feature-unification assertion catches a split). Advisory
-  locking uses `std`'s native
+  `zeroize` features of `argon2`, `aes-siv`, and `cmac`/`aes` are
+  enabled, the last two via feature unification (see
+  [crypto.md](crypto.md) hygiene). The direct `aes`/`cmac` deps exist
+  only for that unification: a PR bumping `aes-siv` must align them in
+  the same PR (Dependabot ignores them; CI's feature-unification
+  assertion catches a split). Advisory locking uses `std`'s native
   `File::try_lock` (stable since 1.89); temp files are created by hand
   (`O_EXCL | O_NOFOLLOW`, CSPRNG names) so no temp-file crate is
   needed. Dev: `proptest`, `assert_cmd`, `tempfile`.
