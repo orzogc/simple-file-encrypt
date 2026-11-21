@@ -82,7 +82,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: ${{ matrix.target }}
+        # The cached target/ holds blake3's C objects, and cargo does
+        # not rebuild them when only the C toolchain changes. Keying
+        # the cache on the toolchain definition makes a Zig or
+        # cargo-zigbuild bump test objects that toolchain compiled, as
+        # the cache-free release build ships them.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ${{ hashFiles('.github/actions/setup-zig/action.yml', 'ci/*.sh') }}
       - uses: ./.github/actions/setup-zig
       - name: Test
         run: |
