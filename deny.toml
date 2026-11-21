@@ -4,9 +4,10 @@
 [advisories]
 version = 2
 yanked = "deny"
-# Explicit because cargo-deny 0.22 defaults to "workspace", which only
-# flags unmaintained crates that are direct dependencies.
+# cargo-deny scopes both to "workspace" by default, failing only on
+# advisories against direct dependencies; cover the whole graph.
 unmaintained = "all"
+unsound = "all"
 
 [bans]
 multiple-versions = "warn"
