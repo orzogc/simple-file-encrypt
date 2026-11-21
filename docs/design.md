@@ -259,11 +259,14 @@ confidentiality for line-level diff and merge.
   cargo-zigbuild shims in `ci/`, with the Zig toolchain download
   verified against a SHA-256 pinned in-repo and cargo-zigbuild bound
   to that binary, so a Python `ziglang` module on the runner cannot
-  stand in for it), and a short `cargo fuzz`
+  stand in for it), a short `cargo fuzz`
   smoke over the config parser and both ciphertext decoders (targets
   in `fuzz/`; the corpus is cached between runs, committed seeds in
   `fuzz/seeds/` guarantee format-boundary coverage on a cold cache,
-  and crash inputs are uploaded as artifacts).
+  and crash inputs are uploaded as artifacts), and a fixture test of
+  the release workflow's publishing gate
+  (`ci/test-release-publish.sh`; the workflow itself only runs for
+  tags).
   `unsafe_code` is denied crate-wide.
 - **Release**: pushing a `v*` tag runs the whole CI suite (reused via
   `workflow_call`), then builds stripped release archives
@@ -274,7 +277,11 @@ confidentiality for line-level diff and merge.
   version in `Cargo.toml`. The jobs holding the attestation and
   release credentials run with cache access disabled
   (`cache-mode: none`): cached dependency artifacts and installed
-  tools are input that provenance cannot vouch for.
+  tools are input that provenance cannot vouch for. The publishing
+  job releases only archives whose SHA-256 matches what their build
+  job reported as a job output, and writes the checksum files from
+  those digests: an artifact, unlike a job output, can be replaced by
+  any job of the run.
 
 ## Versioning
 

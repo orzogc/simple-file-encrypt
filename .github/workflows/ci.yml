@@ -89,7 +89,7 @@ jobs:
         # the cache-free release build ships them.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: ${{ hashFiles('.github/actions/setup-zig/action.yml', 'ci/*.sh') }}
+          key: ${{ hashFiles('.github/actions/setup-zig/action.yml', 'ci/zigcc-*.sh') }}
       - uses: ./.github/actions/setup-zig
       - name: Test
         run: |
@@ -103,6 +103,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2
+
+  # release.yml only runs for tags, so its publishing gate — the script
+  # deciding which downloaded archives reach a release — is tested here
+  # against fixtures, on the runner label the release job uses.
+  release-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: ci/test-release-publish.sh
 
   # Short fuzz smoke over the untrusted-input parsers (config and both
   # ciphertext layouts). The corpus is cached between runs so coverage

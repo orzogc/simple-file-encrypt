@@ -50,6 +50,14 @@ jobs:
     # have written it. A tag build cannot reuse another tag's cache in
     # any case.
     cache-mode: none
+    # SHA-256 of each leg's archive for the release job, as job outputs:
+    # those are reported by the job's own runner, while an artifact can
+    # be replaced by any job of the run. One entry per matrix target; a
+    # leg sets only its own.
+    outputs:
+      x86_64-unknown-linux-musl: ${{ steps.package.outputs.x86_64-unknown-linux-musl }}
+      aarch64-unknown-linux-musl: ${{ steps.package.outputs.aarch64-unknown-linux-musl }}
+      aarch64-apple-darwin: ${{ steps.package.outputs.aarch64-apple-darwin }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
@@ -75,6 +83,7 @@ jobs:
           fi
           cargo build --release --locked --target "${{ matrix.target }}"
       - name: Package
+        id: package
         run: |
           set -euo pipefail
           stage="simple-file-encrypt-${GITHUB_REF_NAME}-${{ matrix.target }}"
@@ -85,16 +94,15 @@ jobs:
           cp -r docs "$stage/docs"
           tar -czf "${stage}.tar.gz" "$stage"
           if command -v sha256sum >/dev/null; then
-            sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+            digest=$(sha256sum "${stage}.tar.gz" | cut -d' ' -f1)
           else
-            shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+            digest=$(shasum -a 256 "${stage}.tar.gz" | cut -d' ' -f1)
           fi
+          echo "${{ matrix.target }}=${digest}" >> "${GITHUB_OUTPUT}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: simple-file-encrypt-${{ matrix.target }}
-          path: |
-            simple-file-encrypt-*.tar.gz
-            simple-file-encrypt-*.tar.gz.sha256
+          path: simple-file-encrypt-*.tar.gz
           retention-days: 1
         # Keyless (Sigstore) build provenance: consumers can verify the
         # archives came from this repo's release.yml on this tag.
@@ -111,10 +119,22 @@ jobs:
     # repository and only publishes the archives built above.
     cache-mode: none
     steps:
+        # Into a subdirectory, away from where gh runs: nothing in the
+        # artifacts is trusted before the next step has checked it.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: simple-file-encrypt-*
+          path: dist
           merge-multiple: true
+        # Every job of this run can write artifacts: a CI job can upload
+        # one matching the pattern above, and an existing artifact can
+        # be replaced under its name. Publication therefore takes
+        # nothing on the artifact store's word: each archive must match
+        # the SHA-256 its build leg reported as a job output, dist/ may
+        # hold nothing else, and the checksum files are written from
+        # those digests into a directory of their own, never among the
+        # downloaded files. ci/test-release-publish.sh finds this
+        # script by the step's name and runs it against fixtures in CI.
       - name: Publish to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -122,9 +142,40 @@ jobs:
           # built artifacts), so gh cannot infer the repo from a git
           # remote — point it there explicitly.
           GH_REPO: ${{ github.repository }}
+          DIGESTS: ${{ toJSON(needs.build.outputs) }}
         run: |
           set -euo pipefail
-          gh release create "$GITHUB_REF_NAME" \
+          shopt -s nullglob dotglob
+          downloaded=(dist/*)
+          reported=$(jq -r 'to_entries[] | "\(.key) \(.value)"' <<<"${DIGESTS}")
+          if [ -z "${reported}" ]; then
+            echo "the build legs reported no archive digests" >&2
+            exit 1
+          fi
+          mkdir checksums
+          assets=()
+          verified=0
+          while read -r target digest; do
+            name="simple-file-encrypt-${GITHUB_REF_NAME}-${target}.tar.gz"
+            if [[ ! "${digest}" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "invalid archive digest reported for ${target}: '${digest}'" >&2
+              exit 1
+            fi
+            actual=$(sha256sum "dist/${name}" | cut -d' ' -f1)
+            if [ "${actual}" != "${digest}" ]; then
+              echo "dist/${name} is not the archive its build leg produced" >&2
+              exit 1
+            fi
+            echo "${digest}  ${name}" > "checksums/${name}.sha256"
+            assets+=("dist/${name}" "checksums/${name}.sha256")
+            verified=$((verified + 1))
+          done <<<"${reported}"
+          if [ "${#downloaded[@]}" -ne "${verified}" ]; then
+            echo "dist/ does not hold exactly the archives the build legs reported:" >&2
+            printf '  %q\n' "${downloaded[@]}" >&2
+            exit 1
+          fi
+          gh release create "${GITHUB_REF_NAME}" \
             --verify-tag \
             --generate-notes \
-            simple-file-encrypt-*.tar.gz simple-file-encrypt-*.tar.gz.sha256
+            "${assets[@]}"
