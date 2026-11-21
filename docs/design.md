@@ -271,10 +271,10 @@ confidentiality for line-level diff and merge.
   any distribution — and `aarch64-apple-darwin`) with SHA-256
   checksums and keyless (Sigstore) build-provenance attestations, and
   publishes them to GitHub Releases; the tag must match the crate
-  version in `Cargo.toml`. The build jobs hold the attestation
-  credentials and therefore restore no build cache: cached dependency
-  artifacts and installed tools are input that provenance cannot
-  vouch for.
+  version in `Cargo.toml`. The jobs holding the attestation and
+  release credentials run with cache access disabled
+  (`cache-mode: none`): cached dependency artifacts and installed
+  tools are input that provenance cannot vouch for.
 
 ## Versioning
 

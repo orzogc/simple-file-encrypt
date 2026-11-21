@@ -42,21 +42,22 @@ jobs:
       contents: read
       attestations: write
       id-token: write
+    # No cache access, enforced by the cache service instead of resting
+    # on the absence of cache steps: this job holds attestation
+    # credentials, and a restored cache (dependency artifacts,
+    # ~/.cargo/bin) is input that provenance cannot vouch for — any job
+    # that may save caches on the default branch or on this tag could
+    # have written it. A tag build cannot reuse another tag's cache in
+    # any case.
+    cache-mode: none
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: ${{ matrix.target }}
-        # No build cache in this job: it holds attestation credentials,
-        # and a restored cache (dependency artifacts, ~/.cargo/bin) is
-        # input that provenance cannot vouch for — any job that may
-        # save caches on the default branch or on this tag could have
-        # written it. A tag build cannot reuse another tag's cache in
-        # any case.
-        #
-        # SHA-256-pinned toolchain download for the same reason: a
-        # compromised compiler would be attested like a genuine one (see
-        # the action for the pinning rationale).
+        # SHA-256-pinned toolchain download: this job holds attestation
+        # credentials, and provenance cannot vouch for a compromised
+        # compiler (see the action for the pinning rationale).
       - uses: ./.github/actions/setup-zig
         if: contains(matrix.target, 'linux-musl')
       - name: Tag must match the crate version
@@ -106,6 +107,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # No cache access here either: the job holds write access to the
+    # repository and only publishes the archives built above.
+    cache-mode: none
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
