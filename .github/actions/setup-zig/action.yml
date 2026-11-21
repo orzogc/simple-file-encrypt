@@ -3,8 +3,11 @@
 # ziglang.org/download/index.json at pin time — and verified before
 # unpacking: build provenance can only attest what the workflow built,
 # not that the toolchain itself was authentic, so toolchain integrity
-# must be anchored in the repository. Unpacking stays in the runner's
-# temp directory; no root involved.
+# must be anchored in the repository. cargo-zigbuild is then bound to
+# the verified binary: left alone it runs `python3 -m ziglang` whenever
+# the runner's Python provides that module, and the zig on PATH only
+# otherwise. Unpacking stays in the runner's temp directory; no root
+# involved.
 name: Setup zig and cargo-zigbuild
 description: Install the SHA-256-pinned Zig toolchain and cargo-zigbuild for musl builds
 
@@ -26,7 +29,34 @@ runs:
           "https://ziglang.org/download/${version}/${archive}"
         echo "${sha256}  ${RUNNER_TEMP}/${archive}" | sha256sum -c -
         tar -xJf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
-        echo "${RUNNER_TEMP}/zig-${zarch}-linux-${version}" >> "${GITHUB_PATH}"
+        zig_dir="${RUNNER_TEMP}/zig-${zarch}-linux-${version}"
+        actual="$("${zig_dir}/zig" version)"
+        if [ "${actual}" != "${version}" ]; then
+          echo "unpacked zig reports version ${actual}, expected ${version}" >&2
+          exit 1
+        fi
+        echo "${zig_dir}" >> "${GITHUB_PATH}"
+        # cargo-zigbuild's documented overrides: use exactly this zig,
+        # and point its Python lookup at nothing so the `ziglang` probe
+        # cannot win. A missing zig path is an error, not a fallback.
+        {
+          echo "CARGO_ZIGBUILD_ZIG_PATH=${zig_dir}/zig"
+          echo "CARGO_ZIGBUILD_PYTHON_PATH=/nonexistent"
+        } >> "${GITHUB_ENV}"
     - name: Install cargo-zigbuild
       shell: bash
       run: cargo install cargo-zigbuild --locked --version 0.24.1
+      # Negative control for the binding: with the zig override pointing
+      # nowhere the wrapper must fail. If it succeeds, some other zig is
+      # reachable (say, after a cargo-zigbuild update changed the
+      # lookup) and the SHA-256 pin no longer decides what compiles.
+    - name: cargo-zigbuild resolves only the pinned zig
+      shell: bash
+      run: |
+        set -euo pipefail
+        cargo-zigbuild zig cc -- --version
+        echo "negative control, 'Failed to find zig' is the expected outcome:"
+        if CARGO_ZIGBUILD_ZIG_PATH="${RUNNER_TEMP}/no-such-zig" cargo-zigbuild zig cc -- --version; then
+          echo "cargo-zigbuild found a zig other than the pinned one" >&2
+          exit 1
+        fi

@@ -257,7 +257,9 @@ confidentiality for line-level diff and merge.
   targets (`x86_64` and `aarch64` Linux, statically linked — C
   compilation for blake3's aarch64 NEON goes through the
   cargo-zigbuild shims in `ci/`, with the Zig toolchain download
-  verified against a SHA-256 pinned in-repo), and a short `cargo fuzz`
+  verified against a SHA-256 pinned in-repo and cargo-zigbuild bound
+  to that binary, so a Python `ziglang` module on the runner cannot
+  stand in for it), and a short `cargo fuzz`
   smoke over the config parser and both ciphertext decoders (targets
   in `fuzz/`; the corpus is cached between runs, committed seeds in
   `fuzz/seeds/` guarantee format-boundary coverage on a cold cache,
