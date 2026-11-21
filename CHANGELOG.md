@@ -9,7 +9,7 @@ format has its own single version (currently **1**, see
 [docs/format.md](docs/format.md)), covering the config schema, both
 ciphertext layouts, and all derivation strings.
 
-## [Unreleased]
+## [0.2.1] - 2026-11-21
 
 ### Changed
 
@@ -21,6 +21,18 @@ ciphertext layouts, and all derivation strings.
   `zeroize` feature in `aes-siv` and is enabled; `argon2`'s unused
   `password-hash` feature is off; the whole stack now shares one
   `getrandom`/`rand_core` line with `rand`.
+
+### Fixed
+
+- **A malformed config no longer overflows the stack.** Invalid TOML
+  that nested arrays behind a run of `{}` in key position slipped
+  past the parser's recursion limit, so every command that loads the
+  config aborted with a stack overflow instead of reporting a config
+  error (fixed upstream in `toml_parser` 1.1.6).
+- **Ctrl-C at a password prompt restores the terminal.** The process
+  was interrupted while the terminal still had echo, canonical input,
+  and signal keys switched off, and nothing restored them (fixed
+  upstream in `rpassword` 7.5.5).
 
 ## [0.2.0] - 2026-08-02
 
@@ -158,6 +170,6 @@ Initial release.
   static Linux binaries (x86_64/aarch64, musl) and macOS (Apple
   silicon) — with SHA-256 checksums and provenance attestations.
 
-[Unreleased]: https://github.com/orzogc/simple-file-encrypt/compare/v0.2.0...HEAD
+[0.2.1]: https://github.com/orzogc/simple-file-encrypt/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/orzogc/simple-file-encrypt/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/orzogc/simple-file-encrypt/releases/tag/v0.1.0
