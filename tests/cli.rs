@@ -1021,6 +1021,28 @@ fn config_strictness() {
     assert_contains(&r.stderr, "upgrade simple-file-encrypt");
 }
 
+/// Invalid TOML must fail as a config error however deeply it nests.
+/// Each `{}` in key position used to lower the TOML parser's depth
+/// count (`toml_parser` before 1.1.6), so the arrays behind them nested
+/// past the recursion guard and overflowed the stack.
+#[test]
+fn deeply_nested_invalid_config_fails_cleanly() {
+    // 4 bytes per level: close to the deepest input the 1 MiB config
+    // size cap lets through to the parser. The line breaks keep the
+    // line quoted by the diagnostic short.
+    const LEVELS: usize = 250_000;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let hostile = format!("v={{{}a={}", "{}\n".repeat(LEVELS), "[".repeat(LEVELS));
+    assert!(hostile.len() < 1024 * 1024);
+    fs::write(config_path(root), hostile).unwrap();
+
+    // A stack overflow kills the process with a signal: no exit code.
+    let r = run_nopw(root, &["status"]).expect_code(1);
+    assert_contains(&r.stderr, "invalid TOML");
+}
+
 #[test]
 fn usage_errors_exit_one() {
     let tmp = tempfile::tempdir().unwrap();
