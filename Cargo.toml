@@ -22,13 +22,13 @@ aes-siv = { version = "0.8.0", features = ["zeroize"] }
 argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "zeroize"] }
 base64 = "0.23.1"
 blake3 = "1.8.7"
-clap = { version = "4.6.7", features = ["derive"] }
-libc = "0.2.189"
-rand = "0.10.3"
-rpassword = "7.5.4"
+clap = { version = "4.6.9", features = ["derive"] }
+libc = "0.2.191"
+rand = "0.10.4"
+rpassword = "7.5.5"
 serde = { version = "1.0.229", features = ["derive"] }
-toml = "1.1.6"
-zeroize = "1.9.0"
+toml = "1.2.2"
+zeroize = "1.9.2"
 
 # Not used directly: feature unification makes the AES round keys and
 # the CMAC state inside aes-siv zeroize on drop.
@@ -37,7 +37,7 @@ cmac = { version = "0.8", features = ["zeroize"] }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
-proptest = "1.11.0"
+proptest = "1.12.0"
 tempfile = "3.27.0"
 
 [profile.release]
